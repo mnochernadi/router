@@ -839,6 +839,39 @@ async function memOf() {
       status.counts.ok === 2 && status.counts.dead === 0, JSON.stringify(status.counts));
   }
 
+  // 21. time-boxed account rotation: swap the token every N minutes
+  {
+    const prov = {
+      id: 'window-provider', name: 'Window Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
+      strategy: 'sequential', timeoutMs: 10000, rotateEveryMinutes: 0.02, // 1.2s
+      accounts: [
+        { id: 'w-1', name: 'token-1', apiKey: 'key-window-1', enabled: true },
+        { id: 'w-2', name: 'token-2', apiKey: 'key-window-2', enabled: true },
+      ],
+    };
+    const made = await fetch(routerUrl('/admin/api/providers'), { method: 'POST', headers: ADMIN, body: JSON.stringify({ ...prov, force: true }) });
+    check('window: provider with rotateEveryMinutes is created', made.status === 201 || made.status === 200, String(made.status));
+
+    const seq = [];
+    for (let i = 0; i < 3; i += 1) {
+      const r = await chat({ headers: { 'x-router-provider': 'window-provider' } });
+      seq.push(r.headers.get('x-router-account'));
+      await sleep(1400); // let the 1.2s window close
+    }
+    check('window: the account is swapped once its window closes (token-1 -> token-2 -> token-1)',
+      seq[0] === 'w-1' && seq[1] === 'w-2' && seq[2] === 'w-1', seq.join(' -> '));
+
+    const snap = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const wp = snap.providers.find((p) => p.id === 'window-provider');
+    const wid = wp.accounts.find((a) => a.windowStartedAt);
+    check('window: state exposes the window so the dashboard can count it down',
+      wp.rotateEveryMinutes === 0.02 && !!wid && wid.windowExpiresAt === wid.windowStartedAt + 1200,
+      JSON.stringify({ rotateEvery: wp.rotateEveryMinutes, started: wid && wid.windowStartedAt, expires: wid && wid.windowExpiresAt }));
+
+    const off = await fetch(routerUrl('/admin/api/provider/window-provider'), { method: 'PATCH', headers: ADMIN, body: JSON.stringify({ rotateEveryMinutes: 0 }) });
+    check('window: turning it off keeps the accounts', (await off.json()).provider.accounts.length === 2);
+  }
+
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
   const pastDeadline = await fetch(routerUrl('/admin/api/provider/seq-provider/account/a-limited/reset'), { method: 'POST', headers: ADMIN });
   check('unlock path exercised without restart', pastDeadline.status === 200);

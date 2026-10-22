@@ -255,6 +255,8 @@ function normalizeProvider(p) {
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
     proxy: String(p.proxy || 'direct'),
+    // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
+    rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     accounts,
   };
 }
@@ -415,6 +417,24 @@ function markUnlocked(provider, account, mode) {
 // Account selection: round-robin + sequential, healthy accounts only
 // ---------------------------------------------------------------------------
 
+/**
+ * Time-boxed rotation window for one account, in ms (0 = no window).
+ * Providers such as OpenCode refresh their free quota on a clock, so swapping
+ * the token every N minutes beats waiting for a 429 that costs a 12h cooldown.
+ */
+function windowMs(provider, account) {
+  const mins = Number((account && account.rotateEveryMinutes) || (provider && provider.rotateEveryMinutes) || 0);
+  return mins > 0 ? Math.round(mins * 60_000) : 0;
+}
+
+function windowInfo(provider, account) {
+  const ms = windowMs(provider, account);
+  if (!ms) return { ms: 0, startedAt: 0, expiresAt: 0, open: true };
+  const as = accountState(provider.id, account.id);
+  if (!as.activeSince) return { ms, startedAt: 0, expiresAt: 0, open: true };
+  return { ms, startedAt: as.activeSince, expiresAt: as.activeSince + ms, open: Date.now() - as.activeSince < ms };
+}
+
 function selectAccount(provider, exclude) {
   const ps = providerState(provider.id);
   const list = provider.accounts || [];
@@ -428,19 +448,49 @@ function selectAccount(provider, exclude) {
     return !isLimited(accountState(provider.id, a.id));
   };
 
-  if (provider.strategy === 'sequential') {
-    for (let i = 0; i < n; i += 1) if (eligible(i)) return list[i];
-    return null;
+  const healthy = [];
+  for (let i = 0; i < n; i += 1) if (eligible(i)) healthy.push(i);
+  if (!healthy.length) return null;
+
+  // Windows: stay on the account that is currently inside its window, otherwise
+  // move to one whose window is still open, and only when every window has
+  // closed start the cycle again from the first account.
+  let pool = healthy;
+  const timeBoxed = healthy.some((i) => windowMs(provider, list[i]) > 0);
+  if (timeBoxed) {
+    const open = healthy.filter((i) => windowInfo(provider, list[i]).open);
+    if (open.length) {
+      const started = open.filter((i) => accountState(provider.id, list[i].id).activeSince);
+      pool = started.length ? started : open;
+    } else {
+      for (const i of healthy) accountState(provider.id, list[i].id).activeSince = 0;
+      pushEvent({ kind: 'window-reset', pid: provider.id });
+      persistState();
+      pool = healthy;
+    }
+    if (pool.length === 1) return list[pool[0]];
   }
 
-  for (let k = 0; k < n; k += 1) {
-    const i = (ps.rrIndex + k) % n;
-    if (eligible(i)) {
-      ps.rrIndex = (i + 1) % n;
-      return list[i];
-    }
+  if (provider.strategy === 'sequential') return list[pool[0]];
+
+  for (let k = 0; k < pool.length; k += 1) {
+    const i = pool[(ps.rrIndex + k) % pool.length];
+    ps.rrIndex = (pool.indexOf(i) + 1) % pool.length;
+    return list[i];
   }
   return null;
+}
+
+/** Called when an account is actually handed a request. */
+function openWindow(provider, account) {
+  const ms = windowMs(provider, account);
+  if (!ms) return 0;
+  const as = accountState(provider.id, account.id);
+  if (!as.activeSince) {
+    as.activeSince = Date.now();
+    pushEvent({ kind: 'window-open', pid: provider.id, aid: account.id, mins: Math.round(ms / 60000) });
+  }
+  return as.activeSince + ms;
 }
 
 function accountSummary(provider, account) {
@@ -455,6 +505,8 @@ function accountSummary(provider, account) {
     failures: as.failures || 0,
     limits: as.limits || 0,
     limitedUntil: isLimited(as) ? as.limitedUntil : 0,
+    windowStartedAt: as.activeSince || 0,
+    windowExpiresAt: as.activeSince && windowMs(provider, account) ? as.activeSince + windowMs(provider, account) : 0,
     lastStatus: as.lastStatus || 0,
     lastUsed: as.lastUsed || 0,
   };
@@ -473,6 +525,7 @@ function providerSummary(provider) {
     maxAttempts: provider.maxAttempts || 0,
     hasCustomHeaders: !!provider.headers,
     hasModelStyles: !!provider.modelStyles,
+    rotateEveryMinutes: Number(provider.rotateEveryMinutes) || 0,
     // The dashboard reads this to render the "rotating exits" pill and to seed
     // the edit form; without it an edit silently saved `proxy: 'direct'`.
     proxy: provider.proxy || 'direct',
@@ -1246,6 +1299,7 @@ async function handleProxy(req, res, url) {
     for (;;) {
       as.requests = (as.requests || 0) + 1;
       as.lastUsed = now();
+      openWindow(provider, account);
 
       let upstream;
       let controller;
@@ -1559,7 +1613,7 @@ async function handleAdmin(req, res, url) {
     // value (accounts above all — an "edit provider" must never orphan keys).
     const seeded = {};
     if (existing) {
-      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type', 'proxy']) {
+      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type', 'proxy', 'rotateEveryMinutes']) {
         if (body[key] === undefined) seeded[key] = existing[key];
       }
     }
@@ -1824,7 +1878,11 @@ async function handleAdmin(req, res, url) {
     if (body.cooldownHours != null) config.cooldownHours = clampHours(body.cooldownHours);
     if (body.defaultProvider != null) config.defaultProvider = String(body.defaultProvider);
     if (body.cors != null) config.cors = !!body.cors;
-    if (Array.isArray(body.proxyKeys)) config.proxyKeys = body.proxyKeys.map(String).filter(Boolean);
+    // Clearing inbound auth must be explicit: the dashboard never receives the
+    // stored keys, so an empty list means "nothing typed", not "remove them".
+    if (Array.isArray(body.proxyKeys) && (body.proxyKeys.length || body.clearProxyKeys === true)) {
+      config.proxyKeys = body.proxyKeys.map(String).filter(Boolean);
+    }
     if (body.loggingRequests != null) config.logging = { requests: !!body.loggingRequests };
     if (Array.isArray(body.cooldownStatuses) && body.cooldownStatuses.length) config.cooldownStatuses = body.cooldownStatuses.map(Number);
     await saveConfig();

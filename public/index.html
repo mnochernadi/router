@@ -177,6 +177,7 @@
               <h2 class="truncate text-sm font-semibold text-white" x-text="p.name"></h2>
               <span class="pill bg-ink-800 text-slate-400" x-text="p.type"></span>
               <span x-show="p.id === s.defaultProvider" class="pill bg-violet-500/10 text-violet-300">default</span>
+              <span x-show="p.rotateEveryMinutes > 0" class="pill bg-violet-500/10 text-violet-300" x-text="'swap every ' + p.rotateEveryMinutes + 'm'"></span>
               <span x-show="p.proxy && p.proxy !== 'direct'" class="pill bg-accent/10 text-accent">
                 <i data-lucide="waypoints" class="h-3 w-3"></i><span x-text="p.proxy === 'rotate' ? 'rotating exits' : ('exit ' + p.proxy)"></span>
               </span>
@@ -246,6 +247,7 @@
                     <span x-show="a.limits" x-text="a.limits + ' limit hit(s)'"></span>
                     <span x-show="a.lastStatus" x-text="'last HTTP ' + a.lastStatus"></span>
                     <span x-show="a.lastUsed" x-text="'used ' + ago(a.lastUsed)"></span>
+                    <span x-show="a.windowExpiresAt" class="text-violet-300" x-text="'swap in ' + countdown(a.windowExpiresAt)"></span>
                   </div>
                 </div>
 
@@ -557,6 +559,11 @@
         <input class="input mono" type="number" min="0.05" step="0.5" x-model.number="pf.cooldownHours" />
       </div>
       <div>
+        <label class="fld">Swap account every (minutes)</label>
+        <input class="input mono" type="number" min="0" step="5" x-model.number="pf.rotateEveryMinutes" />
+        <p class="mt-1 text-[11px] text-slate-500">Use one account for this long, then move to the next � for providers whose free quota resets on a clock. 0 = off.</p>
+      </div>
+      <div>
         <label class="fld">Upstream timeout (ms)</label>
         <input class="input mono" type="number" min="1000" step="1000" x-model.number="pf.timeoutMs" />
       </div>
@@ -759,6 +766,10 @@
         No credential needed — save it and start routing. You can still add named accounts later.
       </div>
 
+      <div>
+        <label class="fld">Swap account every (minutes)</label>
+        <input class="input mono" type="number" min="0" step="5" x-model.number="cf.rotateEveryMinutes" placeholder="0 = off" />
+      </div>
       <div>
         <label class="fld">Strategy</label>
         <select class="input" x-model="cf.strategy">
@@ -1028,7 +1039,7 @@ function app() {
     tick: 0,
     timer: null,
 
-    pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', error: '' },
+    pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', rotateEveryMinutes: 0, error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
     sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
     mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
@@ -1170,6 +1181,7 @@ function app() {
         baseUrl: c.baseUrl,
         strategy: c.strategy || 'round-robin',
         proxy: c.proxy || 'direct',
+        rotateEveryMinutes: c.rotateEveryMinutes || 0,
         note: c.note || '',
         apiKey: '',
         models: [],
@@ -1203,6 +1215,7 @@ function app() {
           provider: {
             id: this.cf.id, name: this.cf.name, type: this.cf.type, baseUrl: this.cf.baseUrl,
             strategy: this.cf.strategy, proxy: this.cf.proxy, cooldownHours: this.s.cooldownHours || 12,
+            rotateEveryMinutes: this.cf.rotateEveryMinutes || 0,
           },
           account: this.cf.apiKey || (this.cf.keyMode === 'none' || this.cf.optional) ? { apiKey: this.cf.apiKey || '', name: this.cf.apiKey ? '' : 'keyless' } : null,
         } });
@@ -1224,10 +1237,10 @@ function app() {
       if (p) {
         this.pf = { editing: true, id: p.id, name: p.name, type: p.type, baseUrl: p.baseUrl, strategy: p.strategy,
                     cooldownHours: p.cooldownHours, timeoutMs: p.timeoutMs || 30000, maxAttempts: p.maxAttempts || 0,
-                    headersText: '', hasHeaders: !!p.hasCustomHeaders, proxy: p.proxy || 'direct', error: '' };
+                    headersText: '', hasHeaders: !!p.hasCustomHeaders, proxy: p.proxy || 'direct', rotateEveryMinutes: p.rotateEveryMinutes || 0, error: '' };
       } else {
         this.pf = { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin',
-                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, proxy: 'direct', error: '' };
+                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, proxy: 'direct', rotateEveryMinutes: 0, error: '' };
       }
       this.modal = 'provider';
       this.refreshIcons();
@@ -1247,7 +1260,7 @@ function app() {
       const body = {
         id: (this.pf.id || '').trim(), name: this.pf.name, type: this.pf.type, baseUrl: this.pf.baseUrl,
         strategy: this.pf.strategy, cooldownHours: this.pf.cooldownHours, timeoutMs: this.pf.timeoutMs,
-        maxAttempts: this.pf.maxAttempts, proxy: this.pf.proxy, force: true,
+        maxAttempts: this.pf.maxAttempts, proxy: this.pf.proxy, rotateEveryMinutes: this.pf.rotateEveryMinutes || 0, force: true,
       };
       // Blank field = keep whatever is already stored, never silently wipe it.
       if (headers || !this.pf.hasHeaders) body.headers = headers;

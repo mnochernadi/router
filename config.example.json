@@ -105,11 +105,18 @@
       "cooldownHours": 12,
       "timeoutMs": 120000,
       "maxAttempts": 0,
+      "rotateEveryMinutes": 120,
       "accounts": [
         {
           "id": "acc-opencode-1",
           "name": "opencode-console-key",
           "apiKey": "sk-REPLACE_ME",
+          "enabled": true
+        },
+        {
+          "id": "acc-opencode-2",
+          "name": "opencode-console-key-2",
+          "apiKey": "sk-REPLACE_ME_TOO",
           "enabled": true
         }
       ]
