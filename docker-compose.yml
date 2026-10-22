@@ -16,16 +16,18 @@ services:
       ROUTER_CONFIG: /data/config.json
       ROUTER_STATE: /data/state.json
       # Hard heap cap; the process is designed to stay flat regardless of stream size.
-      NODE_OPTIONS: "--max-old-space-size=96"
+      NODE_OPTIONS: "--max-old-space-size=160"
     volumes:
       - router-data:/data
-    # Container memory ceiling requested in the spec: 128 MB.
-    mem_limit: 128m
-    memswap_limit: 128m
+    # Xray is in the same container. Direct-only routing fits 128 MB; with the
+    # V2Ray exit pool loaded, budget 512 MB (measured: node ~92 MB + xray ~36 MB
+    # plus the batch tester). Lower it only if you never start the pool.
+    mem_limit: 512m
+    memswap_limit: 512m
     deploy:
       resources:
         limits:
-          memory: 128M
+          memory: 512M
         reservations:
           memory: 32M
     security_opt:

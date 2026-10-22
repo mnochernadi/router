@@ -54,6 +54,9 @@ const DEFAULT_SETTINGS = {
 };
 
 const EVENT_LIMIT = 40;
+// Bumped whenever the way we measure an exit changes, so stale telemetry from
+// an older build cannot keep a wrong exitIp in the active pool.
+const TELEMETRY_SCHEMA = 2;
 
 // ---------------------------------------------------------------------------
 // subscription parsing
@@ -332,6 +335,12 @@ class ProxyManager {
       if (Array.isArray(raw.active)) this.state.active = raw.active;
       this.state.updatedAt = raw.updatedAt || 0;
     } catch { /* first boot */ }
+    // Anything measured by an older schema is untested, not 'ok'.
+    for (const e of this.state.exits) if (e.status === 'ok' && e.testedBy !== TELEMETRY_SCHEMA) e.status = 'untested';
+    this.state.active = this.state.active.filter((id) => {
+      const e = this.state.exits.find((x) => x.id === id);
+      return e && e.status === 'ok' && e.testedBy === TELEMETRY_SCHEMA;
+    });
     this.reindex();
   }
 
@@ -533,7 +542,8 @@ class ProxyManager {
 
   activeExits() {
     const ids = new Set(this.state.active);
-    const picked = this.state.exits.filter((e) => ids.has(e.id) && e.status === 'ok');
+    const picked = this.state.exits.filter((e) => ids.has(e.id) && e.status === 'ok'
+      && e.testedBy === TELEMETRY_SCHEMA && e.exitIp && e.exitIp !== this.localIp);
     if (picked.length) return picked;
     // fall back to the best working exits if `active` was never set
     return this.workingExits().slice(0, this.state.settings.maxActive);
@@ -541,7 +551,7 @@ class ProxyManager {
 
   workingExits() {
     return this.state.exits
-      .filter((e) => e.status === 'ok')
+      .filter((e) => e.status === 'ok' && e.testedBy === TELEMETRY_SCHEMA && e.exitIp && e.exitIp !== this.localIp)
       .sort((a, b) => (a.latencyMs || 1e9) - (b.latencyMs || 1e9));
   }
 
@@ -602,6 +612,16 @@ class ProxyManager {
 
   async runTestLoop(candidates) {
     const settings = this.state.settings;
+    // Baseline: our own egress IP, so an exit that does not actually route is
+    // detected instead of being recorded as working.
+    if (!this.localIp) {
+      try {
+        const res = await fetch(settings.testUrl, { headers: { 'user-agent': 'llm-router' }, signal: AbortSignal.timeout(8000) });
+        const text = await res.text();
+        try { this.localIp = JSON.parse(text).ip || ''; } catch { this.localIp = text.trim().slice(0, 64); }
+        this.log(`[proxy] local egress IP baseline: ${this.localIp || 'unknown'}`);
+      } catch { this.localIp = ''; }
+    }
     const size = Math.max(1, settings.testBatchSize);
     for (let start = 0; start < candidates.length; start += size) {
       const batch = candidates.slice(start, start + size);
@@ -674,6 +694,23 @@ class ProxyManager {
   recordTest(exit, ok, latencyMs, exitIp, error) {
     const target = this.byId.get(exit.id) || exit;
     target.lastTested = Date.now();
+    target.testedBy = TELEMETRY_SCHEMA;
+    // Egress on our own public IP means the request never used the exit
+    // (routing miss, or a node that forwards without NAT). That is a leak:
+    // never 'ok', and never admitted to the pool.
+    const leak = ok && this.localIp && exitIp && exitIp === this.localIp;
+    if (leak) {
+      target.status = 'leak';
+      target.exitIp = '';
+      target.latencyMs = 0;
+      target.error = `egress equals this host's public IP (${this.localIp}) - the exit was not used`;
+      target.failures = 0;
+      this.state.active = this.state.active.filter((id) => id !== target.id);
+      this.pushEvent({ kind: 'exit-leak', exit: target.id, ip: this.localIp });
+      this.log(`[proxy] exit ${target.id} egresses as this host (${this.localIp}) - marked leak, kept out of the pool`);
+      this.save();
+      return;
+    }
     if (ok) {
       target.status = 'ok';
       target.latencyMs = latencyMs;
@@ -684,6 +721,7 @@ class ProxyManager {
     } else {
       target.failures = (target.failures || 0) + 1;
       target.error = (error || '').slice(0, 200);
+      target.exitIp = '';
       if (target.failures >= this.state.settings.markDeadAfter) target.status = 'dead';
       this.test.dead += 1;
     }
@@ -721,8 +759,8 @@ class ProxyManager {
     if (!pool.length) return null;
     this.index = (this.index + 1) % pool.length;
     const exit = pool[this.index];
-    this.pushEvent({ kind: 'rotate', reason, exit: exit.id, ip: exit.exitIp });
-    this.log(`[proxy] rotated to ${exit.id} (${exit.exitIp || exit.host}) - ${reason}`);
+    this.pushEvent({ kind: 'rotate', reason, exit: exit.id, host: exit.host, ip: exit.exitIp || '', leak: !!(this.localIp && exit.exitIp === this.localIp) });
+    this.log(`[proxy] rotated to exit=${exit.id} host=${exit.host}${exit.exitIp ? ` egress=${exit.exitIp}` : ' egress=unknown'}${this.localIp && exit.exitIp === this.localIp ? ' [LEAK]' : ''} - ${reason}`);
     return exit;
   }
 
@@ -745,6 +783,7 @@ class ProxyManager {
     for (const e of this.state.exits) {
       if (e.status === 'ok') counts.ok += 1;
       else if (e.status === 'dead') counts.dead += 1;
+      else if (e.status === 'leak') counts.leak = (counts.leak || 0) + 1;
       else counts.untested += 1;
       counts.byProtocol[e.protocol] = (counts.byProtocol[e.protocol] || 0) + 1;
     }
@@ -783,6 +822,7 @@ class ProxyManager {
 
 module.exports = {
   ProxyManager,
+  TELEMETRY_SCHEMA,
   parseSubscriptionText,
   buildXrayConfig,
   DEFAULT_SOURCES,

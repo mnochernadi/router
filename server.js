@@ -150,11 +150,14 @@ function timingSafeEqual(a, b) {
 
 function sendJson(res, status, obj) {
   const payload = JSON.stringify(obj);
+  // Proxy answers are CORS-open (clients call them from browsers); the admin
+  // API is not, unless the operator opts in -- it takes the x-admin-key header.
+  const cors = res.__admin ? !!config.adminCors : !!config.cors;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
     'cache-control': 'no-store',
-    'access-control-allow-origin': '*',
+    ...(cors ? { 'access-control-allow-origin': '*' } : {}),
   });
   res.end(payload);
 }
@@ -220,6 +223,7 @@ function defaultConfig() {
     proxyKeys: [],
     logging: { requests: false },
     respectRetryAfter: true,
+    adminCors: false,
     errorCooldownMinutes: 5,
     providers: [
       { id: 'openai-main', name: 'OpenAI', type: 'openai', strategy: 'round-robin', accounts: [] },
@@ -238,6 +242,8 @@ function normalizeAccount(a, fallbackName = 'account') {
     enabled: a.enabled !== false,
   };
   if (a.note) out.note = String(a.note);
+  if (Number(a.rotateEveryMinutes) > 0) out.rotateEveryMinutes = Number(a.rotateEveryMinutes);
+  if (a.keyless) out.keyless = true;
   return out;
 }
 
@@ -277,6 +283,7 @@ function normalizeConfig(cfg) {
     : DEFAULT_RETRY_STATUSES.slice();
   out.proxyKeys = Array.isArray(out.proxyKeys) ? out.proxyKeys.map(String) : [];
   out.logging = { requests: !!(out.logging && out.logging.requests) };
+  out.adminCors = out.adminCors === true;
   out.respectRetryAfter = out.respectRetryAfter !== false;
   out.errorCooldownMinutes = Number(out.errorCooldownMinutes) > 0 ? Number(out.errorCooldownMinutes) : 5;
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
@@ -291,6 +298,27 @@ let config = defaultConfig();
 let proxies = null;
 let freebuff = null;
 const DATA_DIR = path.dirname(STATE_PATH);
+
+// Fingerprint of what is actually running: a "Frankenstein" checkout (files
+// from different commits) is otherwise invisible until something breaks.
+const buildInfo = (() => {
+  const hash = (f) => {
+    try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(ROOT, f))).digest('hex').slice(0, 10); }
+    catch { return 'missing'; }
+  };
+  let commit = 'unknown';
+  try {
+    const head = fs.readFileSync(path.join(ROOT, '.git', 'HEAD'), 'utf8').trim();
+    commit = head.startsWith('ref:')
+      ? fs.readFileSync(path.join(ROOT, '.git', head.slice(4).trim()), 'utf8').trim().slice(0, 12)
+      : head.slice(0, 12);
+  } catch { /* not a checkout */ }
+  return {
+    commit,
+    files: { server: hash('server.js'), dashboard: hash('public/index.html'), proxies: hash('proxy-manager.js'), freebuff: hash('freebuff-driver.js') },
+    startedAt: Date.now(),
+  };
+})();
 
 function reqLog(...args) {
   if (config.logging && config.logging.requests) console.log(...args);
@@ -318,6 +346,7 @@ async function saveConfig() {
     accounts: (p.accounts || []).map((a) => ({ id: a.id, name: a.name, apiKey: a.apiKey, enabled: a.enabled !== false })),
   }));
   await atomicWrite(CONFIG_PATH, `${JSON.stringify(serializable, null, 2)}\n`);
+  try { await fsp.chmod(CONFIG_PATH, 0o600); } catch { /* best effort (windows) */ }
 }
 
 function findProvider(id) {
@@ -397,6 +426,18 @@ function cooldownMs(provider) {
 }
 
 const QUOTA_HINT = /quota|credit|rate.?limit|too many|exhaust|usage|spend|balance|insufficient|limit reached|out of/i;
+// A client-side policy gate (OpenCode's FreeTierError, a country block, a
+// suspended account) reproduces on every exit: rotating cannot fix it and a
+// long cooldown only hides the real message.
+const POLICY_HINT = /free.?tier|policy|not allowed|country|region|geo|banned|suspended|unavailable in|download it at|client.?required/i;
+
+function classifyFailure(status, message) {
+  const msg = String(message || '');
+  if (POLICY_HINT.test(msg)) return 'policy';
+  if (QUOTA_HINT.test(msg)) return 'quota';
+  if (status === 429 || status === 402) return 'quota';
+  return 'error';
+}
 
 /** Parse retry-after / retry-after-ms; returns ms or 0. */
 function retryAfterMs(headers) {
@@ -451,12 +492,13 @@ function markLimited(provider, account, status, { ms = 0, message = '' } = {}) {
   const configured = cooldownMs(provider);
   let wait = configured;
   if (config.respectRetryAfter !== false && ms > 0) wait = Math.min(configured, ms);
-  const notQuota = (status === 402 || status === 403) && message && !QUOTA_HINT.test(message);
+  const kind = classifyFailure(status, message);
+  const notQuota = kind !== 'quota';
   if (notQuota) wait = Math.min(wait, Math.max(1, Number(config.errorCooldownMinutes) || 5) * 60_000);
   as.limitedUntil = now() + Math.max(1_000, wait);
   as.lastStatus = status;
   as.lastMessage = message.slice(0, 180);
-  as.lastLimitedKind = notQuota ? 'error' : 'quota';
+  as.lastLimitedKind = kind;
   as.limits = (as.limits || 0) + 1;
   state.totals.limitEvents += 1;
   state.totals.failovers += 1;
@@ -567,6 +609,7 @@ function accountSummary(provider, account) {
     limits: as.limits || 0,
     limitedUntil: isLimited(as) ? as.limitedUntil : 0,
     lastMessage: as.lastMessage || '',
+    rotateEveryMinutes: Number(account.rotateEveryMinutes) || 0,
     limitedKind: as.lastLimitedKind || '',
     windowStartedAt: as.activeSince || 0,
     windowExpiresAt: as.activeSince && windowMs(provider, account) ? as.activeSince + windowMs(provider, account) : 0,
@@ -1275,22 +1318,45 @@ function allExhausted(provider, tried, dueToLimit) {
   const rotateHint = provider.proxy === 'rotate'
     ? (proxies && proxies.activeExits().length ? '' : ' Rotation is configured but the exit pool has no working exit - run Test/Apply in the Network tab.')
     : ' Tip: set Outbound proxy to "Rotate the pool" so an IP-bound limit retries on a new exit first.';
+  const enabled = accounts.length;
+  const lastTried = [...tried].pop();
+  const last = detail.find((d) => d.id === lastTried) || detail.find((d) => d.status) || null;
+  const notEnabled = enabled === 0;
+  const policy = last && (last.kind === 'policy' || last.kind === 'error');
   return {
+    status: notEnabled ? 503 : (policy ? last.status : (dueToLimit ? 429 : 503)),
     error: {
-      message: (dueToLimit
-        ? `All accounts for provider "${provider.id}" are rate-limited and cooling down.`
-        : `No healthy account available for provider "${provider.id}".`) + rotateHint,
-      type: 'router_no_healthy_account',
+      message: notEnabled
+        ? `Provider "${provider.id}" has no enabled account. Enable one (or add one) in the dashboard; retrying will not help.`
+        : (policy
+          ? `Provider "${provider.id}" refused the request upstream: HTTP ${last.status} ${last.message || ''}`.trim() + ' This is not an account or exit limit, so nothing was rotated.'
+          : (dueToLimit
+            ? `All accounts for provider "${provider.id}" are rate-limited and cooling down.`
+            : `No healthy account available for provider "${provider.id}".`)) + rotateHint,
+      type: notEnabled ? 'router_no_enabled_accounts' : (policy ? 'upstream_error' : 'router_no_healthy_account'),
+      upstreamStatus: last ? last.status : 0,
       provider: provider.id,
       tried: [...tried],
       accounts: detail,
       reasons,
       healthyRemaining: healthyLeft.length,
-      retryAfterSeconds: nextUnlock ? Math.max(1, Math.round((nextUnlock - now()) / 1000)) : 0,
-      nextUnlockAt: nextUnlock || null,
+      // never advertise 0: a 5xx with retryAfterSeconds 0 invites a hot loop
+      ...(nextUnlock ? { retryAfterSeconds: Math.max(1, Math.round((nextUnlock - now()) / 1000)), nextUnlockAt: nextUnlock } : {}),
       resetHint: `Clear it now: POST /admin/api/reset with x-admin-key, or the "Unlock all" button in the dashboard.`,
     },
   };
+}
+
+/** The router key from any header the real clients use. */
+function inboundKey(req, url) {
+  const header = req.headers['x-api-key']
+    || req.headers['x-goog-api-key']
+    || req.headers['api-key']
+    || '';
+  if (header) return String(header).trim();
+  const auth = String(req.headers.authorization || '').trim();
+  if (auth) return auth.replace(/^Bearer\s+/i, '').trim();
+  try { return String((url && url.searchParams.get('key')) || '').trim(); } catch { return ''; }
 }
 
 async function handleProxy(req, res, url) {
@@ -1298,8 +1364,7 @@ async function handleProxy(req, res, url) {
   state.totals.requests += 1;
 
   if (config.proxyKeys.length) {
-    const auth = String(req.headers.authorization || '');
-    const key = auth.replace(/^Bearer\s+/i, '').trim();
+    const key = inboundKey(req, url);
     if (!config.proxyKeys.includes(key)) {
       state.totals.failed += 1;
       return sendJson(res, 401, { error: { message: 'invalid router API key', type: 'invalid_request_error' } });
@@ -1377,6 +1442,8 @@ async function handleProxy(req, res, url) {
     let rotations = 0;
     let lastExitId = '';
     let relayed = false;
+    let lastFailure = null;
+    let lastFailureKey = '';
 
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
@@ -1413,7 +1480,13 @@ async function handleProxy(req, res, url) {
         // must not cost 12 hours.
         const retryMs = retryAfterMs(upstream.headers);
         const snippet = await peekError(upstream);
-        if (rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
+        const kind = classifyFailure(upstream.status, snippet);
+        lastFailure = { status: upstream.status, kind, message: snippet };
+        // The same answer from a second exit means the condition is not the
+        // exit (policy gate, bad model handle): stop burning the pool.
+        const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
+        lastFailureKey = `${upstream.status}|${snippet}`;
+        if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
           const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`);
           rotations += 1;
@@ -1421,7 +1494,7 @@ async function handleProxy(req, res, url) {
           continue;
         }
         const cooled = markLimited(provider, account, upstream.status, { ms: retryMs, message: snippet });
-        console.warn(`[proxy] ${provider.id}/${account.name} -> HTTP ${upstream.status} ${snippet ? `"${snippet}" ` : ''}cooling down ${Math.round((cooled.limitedUntil - now()) / 60000)}m${retryMs ? ` (retry-after ${Math.round(retryMs / 1000)}s)` : ''}, failing over`);
+        console.warn(`[proxy] ${provider.id}/${account.name} -> HTTP ${upstream.status} [${kind}] ${snippet ? `"${snippet}" ` : ''}cooling down ${Math.round((cooled.limitedUntil - now()) / 60000)}m${retryMs ? ` (retry-after ${Math.round(retryMs / 1000)}s)` : ''}${kind === 'policy' ? ' - not an exit problem, rotation skipped' : ''}, failing over`);
         break;
       }
 
@@ -1482,8 +1555,8 @@ async function handleProxy(req, res, url) {
 
   state.totals.failed += 1;
   if (!res.headersSent) {
-    const { error } = allExhausted(provider, tried, sawLimit);
-    sendJson(res, sawLimit ? 429 : 503, { error });
+    const { error, status } = allExhausted(provider, tried, sawLimit);
+    sendJson(res, status || (sawLimit ? 429 : 503), { error });
   }
 }
 
@@ -1508,6 +1581,7 @@ function snapshot() {
     ok: true,
     version: PKG_VERSION,
     node: process.version,
+    build: buildInfo,
     now: now(),
     uptimeSeconds: Math.round((now() - state.startedAt) / 1000),
     host: config.host,
@@ -1915,6 +1989,10 @@ async function handleAdmin(req, res, url) {
       if (body.name != null) acc.name = String(body.name);
       if (body.apiKey) acc.apiKey = String(body.apiKey);
       if (body.enabled != null) acc.enabled = body.enabled !== false;
+      if (body.rotateEveryMinutes != null) {
+        const mins = Number(body.rotateEveryMinutes);
+        if (mins > 0) acc.rotateEveryMinutes = mins; else delete acc.rotateEveryMinutes;
+      }
       await saveConfig();
       return sendJson(res, 200, { ok: true, account: accountSummary(provider, acc) });
     }
@@ -2117,10 +2195,11 @@ const server = http.createServer(async (req, res) => {
   catch { return sendJson(res, 400, { error: { message: 'bad request url', type: 'bad_request' } }); }
 
   if (req.method === 'OPTIONS') {
+    const clientHeaders = 'authorization,content-type,x-api-key,x-goog-api-key,x-router-provider';
     res.writeHead(204, {
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-      'access-control-allow-headers': 'authorization,content-type,x-admin-key,x-router-provider',
+      'access-control-allow-headers': config.adminCors ? `${clientHeaders},x-admin-key` : clientHeaders,
       'access-control-max-age': '86400',
     });
     return res.end();
@@ -2131,16 +2210,15 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       version: PKG_VERSION,
-      node: process.version,
       uptimeSeconds: Math.round((now() - state.startedAt) / 1000),
       rss: mem.rss,
       requests: state.totals.requests,
-      providers: config.providers.length,
-      accounts: config.providers.reduce((s, p) => s + (p.accounts || []).length, 0),
+      build: buildInfo,
     });
   }
 
   if (url.pathname.startsWith('/admin/api/')) {
+    res.__admin = true;
     handleAdmin(req, res, url).catch((err) => {
       console.error(`[admin] ${err.message}`);
       if (!res.headersSent) sendJson(res, err.statusCode || 500, { error: { message: err.message, type: 'admin_error' } });
@@ -2154,6 +2232,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/v1/models') {
+    if (config.proxyKeys.length && !config.proxyKeys.includes(inboundKey(req, url))) {
+      return sendJson(res, 401, { error: { message: 'invalid router API key', type: 'invalid_request_error' } });
+    }
     let data = [];
     try { data = await routerModelList(); } catch { data = []; }
     if (!data.length) {

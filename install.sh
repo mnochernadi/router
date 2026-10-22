@@ -261,11 +261,18 @@ say "install mode      : $MODE"
 fetch_code() {
   if [ -d "$INSTALL_DIR/.git" ] && [ "$DRY_RUN" = 0 ]; then
     say "updating existing checkout in $INSTALL_DIR"
-    run git -C "$INSTALL_DIR" fetch --quiet origin "$BRANCH"
-    run git -C "$INSTALL_DIR" checkout --quiet "$BRANCH"
-    run git -C "$INSTALL_DIR" pull --quiet --ff-only origin "$BRANCH"
+    if [ -n "$(git -C "$INSTALL_DIR" status --porcelain)" ]; then
+      warn "local edits in $INSTALL_DIR are being replaced by origin/$BRANCH (mixed checkouts are what caused the last bad build)"
+    fi
+    # Hard reset, not pull: a hand-edited file must never leave the box in a
+    # state that matches no commit, which is undebuggable.
+    run git -C "$INSTALL_DIR" fetch --quiet --prune origin "$BRANCH"
+    run git -C "$INSTALL_DIR" checkout --quiet --force "$BRANCH"
+    run git -C "$INSTALL_DIR" reset --quiet --hard "origin/$BRANCH"
+    say "now at $(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
   elif [ -d "$INSTALL_DIR/.git" ]; then
-    run git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
+    run git -C "$INSTALL_DIR" fetch --quiet origin "$BRANCH"
+    run git -C "$INSTALL_DIR" reset --quiet --hard "origin/$BRANCH"
   else
     say "cloning $REPO_URL into $INSTALL_DIR"
     run mkdir -p "$(dirname "$INSTALL_DIR")"
@@ -616,7 +623,9 @@ summary() {
   printf '%s────────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
   printf '\nNext:\n  1. open %s/admin and unlock with the ADMIN_KEY above\n  2. add a provider, then an account (single key or bulk paste)\n  3. point clients at %s/v1\n\n' "$url" "$url"
   if [ -z "$DOMAIN" ]; then
-    printf '%sNote:%s no --domain given, so the dashboard is served over plain HTTP on port %s.\n      Put it behind TLS before exposing it to the internet.\n\n' "$C_WARN" "$C_RESET" "$PORT"
+    printf '%sSECURITY:%s no --domain was given, so the router listens on 0.0.0.0:%s over plain HTTP.\n' "$C_WARN" "$C_RESET" "$PORT"
+    printf '      The admin key and router keys travel in cleartext. Re-run with --domain <host> --email <you@example.com>\n'
+    printf '      to bind loopback and put nginx + Let%ss Encrypt in front.\n\n' "'"
   fi
 }
 

@@ -607,6 +607,10 @@
           <input class="input" x-model="af.name" placeholder="team-key-1" />
         </div>
         <div>
+          <label class="fld">Swap this account after (minutes, 0 = provider default)</label>
+          <input class="input mono" type="number" min="0" step="5" x-model.number="af.rotateEveryMinutes" />
+        </div>
+        <div>
           <label class="fld">API key <span class="text-slate-600">(leave blank to keep current)</span></label>
           <input class="input mono" type="password" x-model="af.apiKey" :placeholder="af.maskedKey || 'sk-—'" />
         </div>
@@ -899,6 +903,12 @@
         </select>
       </div>
       <div class="sm:col-span-2">
+        <label class="flex items-center gap-2 text-xs text-slate-400">
+          <input type="checkbox" x-model="sf.clearProxyKeys" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" />
+          Remove all inbound router keys (send <code class="mono">clearProxyKeys</code>)
+        </label>
+      </div>
+      <div class="sm:col-span-2">
         <label class="fld">Inbound router API keys (one per line, empty = open)</label>
         <textarea class="input mono h-20" x-model="sf.proxyKeysText" placeholder="sk-router-…"></textarea>
       </div>
@@ -1045,7 +1055,7 @@ function app() {
 
     pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', rotateEveryMinutes: 0, error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
-    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
+    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', clearProxyKeys: false, cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
     mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
     cf: { title: '', body: '', run: null },
 
@@ -1298,8 +1308,8 @@ function app() {
     openAccount(p, a) {
       const keyless = p.type === 'opencode-free';
       this.af = a
-        ? { editing: true, pid: p.id, providerName: p.name, aid: a.id, name: a.name, apiKey: '', maskedKey: a.maskedKey, enabled: a.enabled, bulk: '', keyless, error: '' }
-        : { editing: false, pid: p.id, providerName: p.name, aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', keyless, error: '' };
+        ? { editing: true, pid: p.id, providerName: p.name, aid: a.id, name: a.name, apiKey: '', maskedKey: a.maskedKey, enabled: a.enabled, bulk: '', keyless, rotateEveryMinutes: a.rotateEveryMinutes || 0, error: '' }
+        : { editing: false, pid: p.id, providerName: p.name, aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', keyless, rotateEveryMinutes: 0, error: '' };
       this.modal = 'account';
       this.refreshIcons();
     },
@@ -1309,7 +1319,7 @@ function app() {
       const pid = encodeURIComponent(this.af.pid);
       try {
         if (this.af.editing) {
-          const body = { name: this.af.name, enabled: this.af.enabled };
+          const body = { name: this.af.name, enabled: this.af.enabled, rotateEveryMinutes: this.af.rotateEveryMinutes || 0 };
           if (this.af.apiKey.trim()) body.apiKey = this.af.apiKey.trim();
           await this.api(`/provider/${pid}/account/${encodeURIComponent(this.af.aid)}`, { method: 'PATCH', body });
           this.toast('Account updated', 'ok');
@@ -1504,6 +1514,7 @@ function app() {
         cooldownHours: this.s.cooldownHours || 12,
         defaultProvider: this.s.defaultProvider || '',
         proxyKeysText: '',
+        clearProxyKeys: false,
         cooldownStatusesText: (this.s.cooldownStatuses || [429, 402, 403]).join(','),
         cors: !!this.s.cors,
         loggingRequests: !!(this.s.logging && this.s.logging.requests),
@@ -1523,7 +1534,8 @@ function app() {
         cooldownStatuses: this.sf.cooldownStatusesText.split(',').map(x => Number(x.trim())).filter(Number.isFinite),
       };
       const keys = this.sf.proxyKeysText.split('\n').map(x => x.trim()).filter(Boolean);
-      if (keys.length || this.s.hasProxyKeys) body.proxyKeys = keys;
+      if (this.sf.clearProxyKeys) { body.proxyKeys = []; body.clearProxyKeys = true; }
+      else if (keys.length || this.s.hasProxyKeys) body.proxyKeys = keys;
       if (this.sf.adminKey.trim()) body.adminKey = this.sf.adminKey.trim();
       try {
         const r = await this.api('/settings', { method: 'POST', body });

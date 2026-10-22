@@ -126,7 +126,7 @@ The same reason is shown on the account row and in the Activity tab, so you can 
 | `anthropic` | `https://api.anthropic.com/v1` | `x-api-key` + `anthropic-version` | OpenAI ⇄ Anthropic messages, incl. SSE |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | OpenAI ⇄ `generateContent`/`streamGenerateContent` |
 | `opencode` | `https://opencode.ai/inference` | `Authorization: Bearer` (+ `x-api-key`/`x-goog-api-key`) | **per model**: chat ⇄ messages / google / responses |
-| `opencode-free` | `https://opencode.ai/zen/v1` | none (keyless) | passthrough to the free model list |
+| `opencode-free` | `https://opencode.ai/zen/v1` | none (keyless) | passthrough to the free model list. **Not usable from a server**: the free tier answers `403 FreeTierError` ("can only be used from within OpenCode") from any IP, so it is only useful as a model catalogue. Use `opencode` with a Console key instead. |
 | `freebuff` | `https://www.codebuff.com` | Bearer token + **Ed25519 request signature** | OpenAI-shaped, session/run bound (see below) |
 | `custom` | whatever you set | `Authorization: Bearer` | passthrough (Ollama, vLLM, LM Studio, LiteLLM, a gateway…) |
 
@@ -169,6 +169,8 @@ curl http://localhost:8787/v1/chat/completions \
 ## API
 
 ### Proxy (point your clients here)
+
+Auth accepts anything real clients send: `Authorization: Bearer <router key>`, `x-api-key` (the Anthropic SDK / Claude Code), `x-goog-api-key`, or `?key=`. **The inbound surface is OpenAI- and Anthropic-shaped only** — there is no `/v1beta/models/<id>:generateContent` Gemini-shaped inbound; the `gemini` style is an *upstream* adapter.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -353,6 +355,17 @@ your-domain {
 }
 ```
 
+### Verify what is actually running
+
+A checkout that mixes files from different commits is undebuggable, so the running build reports its own fingerprint:
+
+```bash
+curl -s https://your-domain/health | jq .build
+# { "commit": "689c4c4", "files": { "server": "3f9c2ab1d4", "dashboard": "9a11c0ffee", "proxies": "77b0e1c2d3", "freebuff": "1c2d3e4f50" } }
+```
+
+Until 27e2a68 the installer used `git pull --ff-only`, which leaves hand-edited files in place; it now does `git fetch` + `reset --hard origin/main`, warns when it discards local edits, and prints the resulting commit. If `/health` is not reachable (404), stop — that also means an old build, this endpoint used to be `ok/version/node/rss/providers/accounts`.
+
 ### Add accounts and use it
 
 1. Open `https://your-domain/admin` and unlock with `ADMIN_KEY`.
@@ -465,13 +478,18 @@ Per-account freebuff state (device key id, catalog size, fetchId, admitted insta
 | 24 concurrent SSE streams, 5.0 MB relayed | RSS +9.8 MB |
 | 24 concurrent SSE streams, **20.2 MB relayed (4×)** | RSS **+2.8 MB** — i.e. growth does not track bytes |
 | `heapUsed` / `arrayBuffers` during load | 15.7 MB / 1.0 MB |
-| Peak RSS vs. the 128 MB container ceiling | comfortably inside, with headroom |
+| Peak RSS (router) | ~92 MB with the exit pool loaded; xray adds ~36 MB |
+| Container budget | **128 MB for direct-only**, **512 MB once the exit pool is running** — the compose file now ships 512m and `--max-old-space-size=160` |
 
 Consider the 35 MB target honestly: on Node 20+ the V8 isolate alone accounts for roughly 40 MB of RSS before a single byte of your code runs, so ~50 MB idle is the floor on Windows/Node 26 — no amount of application tuning reaches 35 MB there (`--max-old-space-size`, `--max-semi-space-size` and `--jitless` were all measured and none helped; a leaner `node:20-alpine` build, which ships small-icu, is the realistic way to get closer). What the design does guarantee, and what the smoke test verifies, is that **memory is flat with respect to traffic**: upstream bodies are piped, never accumulated, and only numeric counters are retained. The compose file enforces the 128 MB cap regardless.
 
 The deployment budget was raised for this workload: 512 MB RAM and 1 vCPU is comfortable — xray adds roughly 20–40 MB with a 24-exit pool, and the batch tester runs at most `testBatchSize` inbounds at once.
 
 ## Security
+
+* `/v1/models` and `/v1/*` require the router key once `proxyKeys` is set; `/health` reports only `ok/version/uptime/rss/requests/build` and no longer enumerates providers or accounts.
+* The admin API is **not** CORS-exposed by default (`adminCors: false`): it is reached with `x-admin-key` from the dashboard served by the same origin, or from curl. Set `adminCors: true` only for a separate dashboard origin you control.
+* `config.json` (admin key + provider keys) is written `0600`, like `proxies.json` and `xray-config.json`.
 
 * `adminKey` guards every `/admin/api/*` route (compared with `crypto.timingSafeEqual`); `/admin` itself is a static file with no secrets in it.
 * Full API keys are **never** sent to the browser — only `sk-1••••abcd` masks.
@@ -494,10 +512,10 @@ The deployment budget was raised for this workload: 512 MB RAM and 1 vCPU is com
 ## Verification
 
 ```bash
-npm run smoke     # 65 checks, no network, no API keys, all in a temp dir
+npm run smoke     # 92 checks, no network, no API keys, all in a temp dir (SMOKE_STRICT_MEM=1 for tight memory bounds)
 ```
 
-It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; **V2Ray exit rotation retrying an IP-bound 429 through a second CONNECT proxy without cooling the account**; **the freebuff Ed25519 handshake verified against a protocol-enforcing mock**; and the memory behaviour in the table above.
+It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; **a policy `403` that reproduces on every exit: no rotation storm, no 12h ban, the upstream message reaches the client**; **exit telemetry that classifies a self-egress measurement as a leak and keeps it out of the pool**; **inbound auth via `x-api-key`**; **a provider with no enabled account getting its own error type**; **V2Ray exit rotation retrying an IP-bound 429 through a second CONNECT proxy without cooling the account**; **the freebuff Ed25519 handshake verified against a protocol-enforcing mock**; and the memory behaviour in the table above.
 
 ## License
 

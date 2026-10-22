@@ -74,13 +74,19 @@ class FreebuffDriver {
   }
 
   async save() {
-    const tmp = `${this.stateFile}.${process.pid}.tmp`;
-    try {
-      await fsp.writeFile(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-      await fsp.rename(tmp, this.stateFile);
-    } catch (err) {
-      this.log(`[freebuff] state save failed: ${err.message}`);
-    }
+    // One writer at a time: concurrent saves used to share a tmp name and the
+    // second rename failed with ENOENT.
+    this._saveChain = (this._saveChain || Promise.resolve()).then(async () => {
+      const tmp = `${this.stateFile}.${process.pid}.${(this._tmpSeq = (this._tmpSeq || 0) + 1)}.tmp`;
+      try {
+        await fsp.writeFile(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+        await fsp.rename(tmp, this.stateFile);
+      } catch (err) {
+        this.log(`[freebuff] state save failed: ${err.message}`);
+        try { await fsp.unlink(tmp); } catch { /* already gone */ }
+      }
+    });
+    return this._saveChain;
   }
 
   accountState(providerId, accountId) {
