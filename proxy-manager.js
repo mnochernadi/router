@@ -56,7 +56,7 @@ const DEFAULT_SETTINGS = {
 const EVENT_LIMIT = 40;
 // Bumped whenever the way we measure an exit changes, so stale telemetry from
 // an older build cannot keep a wrong exitIp in the active pool.
-const TELEMETRY_SCHEMA = 2;
+const TELEMETRY_SCHEMA = 3;
 
 // ---------------------------------------------------------------------------
 // subscription parsing

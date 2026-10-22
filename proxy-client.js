@@ -5,33 +5,29 @@
  *  proxy-client.js -- HTTP CONNECT tunnelling with zero dependencies
  * ============================================================================
  *
- *  Xray (or any HTTP proxy) listens on 127.0.0.1:<port> and speaks the HTTP
- *  CONNECT method. Node's global fetch cannot be pointed at a per-request
- *  proxy without the `undici` package, so this module does the CONNECT
- *  handshake itself and reuses the resulting socket for a normal
- *  http/https request. The response is returned in the same shape the router
- *  already consumes from fetch:
+ *  Xray (or any HTTP proxy) listens on 127.0.0.1:<port> and speaks HTTP CONNECT.
+ *  Node's global fetch cannot be pointed at a per-request proxy without the
+ *  `undici` package, and http.request() cannot be *forced* onto an existing
+ *  socket: with `agent: false` it ignores createConnection, and even with a
+ *  custom Agent Node may open its own connection, which silently egresses from
+ *  this host instead of the exit. That failure is invisible in a response body
+ *  (the same URL answers either way), so this module writes the HTTP/1.1
+ *  request onto the tunnel socket itself. There is no code path that can fall
+ *  back to a direct connection.
  *
+ *  Returns the same shape the router consumes from fetch:
  *      { status, ok, headers: { get(name) }, body: <web ReadableStream> }
- *
- *  so relay() pipes it unchanged and nothing is buffered.
  */
 
 const http = require('node:http');
-const https = require('node:https');
 const net = require('node:net');
 const tls = require('node:tls');
-const { Readable } = require('node:stream');
+const { Readable, PassThrough, Transform } = require('node:stream');
 
 const CONNECT_HEAD_LIMIT = 32 * 1024;
+const RESPONSE_HEAD_LIMIT = 128 * 1024;
 
-function headersShim(rawHeaders) {
-  const map = new Map();
-  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
-    const k = String(rawHeaders[i]).toLowerCase();
-    const v = String(rawHeaders[i + 1]);
-    map.set(k, map.has(k) ? `${map.get(k)}, ${v}` : v);
-  }
+function headersShim(map) {
   return {
     get: (name) => (map.has(String(name).toLowerCase()) ? map.get(String(name).toLowerCase()) : null),
     has: (name) => map.has(String(name).toLowerCase()),
@@ -40,14 +36,36 @@ function headersShim(rawHeaders) {
   };
 }
 
-function toWebBody(nodeReadable) {
-  try { return Readable.toWeb(nodeReadable); } catch { return null; }
+/** Decode `Transfer-Encoding: chunked` into a plain byte stream. */
+function chunkedDecode() {
+  let buf = Buffer.alloc(0);
+  let done = false;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      if (done) return cb();
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      for (;;) {
+        const nl = buf.indexOf('\r\n');
+        if (nl === -1) return cb();
+        const sizeLine = buf.subarray(0, nl).toString('latin1').split(';')[0].trim();
+        const size = parseInt(sizeLine, 16);
+        if (!Number.isFinite(size)) return cb(new Error(`bad chunk size "${sizeLine}"`));
+        if (size === 0) {
+          done = true;
+          buf = Buffer.alloc(0);
+          this.push(null);
+          return cb();
+        }
+        if (buf.length < nl + 2 + size + 2) return cb();
+        this.push(buf.subarray(nl + 2, nl + 2 + size));
+        buf = buf.subarray(nl + 2 + size + 2);
+      }
+    },
+    flush(cb) { if (!done) { this.push(null); } cb(); },
+  });
 }
 
-/**
- * Open a socket to `proxy` and CONNECT it to `target`.
- * Resolves with a live socket already positioned at the tunnel mouth.
- */
+/** Open a socket to `proxy` and CONNECT it to `target`; resolves with the tunnel. */
 function openTunnel(proxy, target, timeoutMs) {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: proxy.host, port: proxy.port });
@@ -100,9 +118,83 @@ function openTunnel(proxy, target, timeoutMs) {
 }
 
 /**
- * fetch()-shaped request through an HTTP proxy.
- * Returns { status, ok, headers, body, node, cancel() }.
+ * Write one HTTP/1.1 request onto `conn` and resolve the parsed response.
+ * `Connection: close` keeps framing simple (one response per socket).
  */
+function requestOverTunnel(conn, { method, url, headers, body, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let head = Buffer.alloc(0);
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      try { conn.destroy(); } catch { /* noop */ }
+      reject(err);
+    };
+
+    const onData = (chunk) => {
+      head = head.length ? Buffer.concat([head, chunk]) : chunk;
+      const end = head.indexOf('\r\n\r\n');
+      if (end === -1) {
+        if (head.length > RESPONSE_HEAD_LIMIT) fail(new Error('upstream sent an oversized response head'));
+        return;
+      }
+      conn.removeListener('data', onData);
+      settled = true;
+      conn.setTimeout(0);
+
+      const headText = head.subarray(0, end).toString('latin1');
+      const rest = head.subarray(end + 4);
+      const lines = headText.split('\r\n');
+      const m = /^HTTP\/1\.[01]\s+(\d{3})/.exec(lines[0] || '');
+      const status = m ? Number(m[1]) : 0;
+      const map = new Map();
+      for (const line of lines.slice(1)) {
+        const i = line.indexOf(':');
+        if (i > 0) {
+          const k = line.slice(0, i).trim().toLowerCase();
+          const v = line.slice(i + 1).trim();
+          map.set(k, map.has(k) ? `${map.get(k)}, ${v}` : v);
+        }
+      }
+
+      // `close` framing: everything after the head is the body, until EOF.
+      const out = new PassThrough();
+      if (rest.length) out.write(rest);
+      conn.pipe(out);
+      conn.once('error', (err) => out.destroy(err));
+
+      const chunked = /\bchunked\b/i.test(map.get('transfer-encoding') || '');
+      const bodyStream = chunked ? out.pipe(chunkedDecode()) : out;
+
+      resolve({
+        status,
+        ok: status >= 200 && status < 300,
+        headers: headersShim(map),
+        body: Readable.toWeb(bodyStream),
+        node: bodyStream,
+        tunnelled: true,
+        cancel: () => { try { out.destroy(); } catch { /* noop */ } try { conn.destroy(); } catch { /* noop */ } },
+      });
+    };
+
+    conn.setTimeout(timeoutMs, () => fail(new Error(`proxy upstream timeout (${timeoutMs}ms)`)));
+    conn.once('error', fail);
+    conn.on('data', onData);
+
+    const lines = [`${method} ${url.pathname}${url.search || ''} HTTP/1.1`, `Host: ${url.host}`];
+    for (const [k, v] of Object.entries(headers || {})) {
+      if (v == null || k.toLowerCase() === 'host' || k.toLowerCase() === 'connection' || k.toLowerCase() === 'content-length') continue;
+      if (Array.isArray(v)) for (const vv of v) lines.push(`${k}: ${vv}`);
+      else lines.push(`${k}: ${v}`);
+    }
+    if (body != null) lines.push(`Content-Length: ${Buffer.byteLength(body)}`);
+    lines.push('Connection: close', '', '');
+    conn.write(lines.join('\r\n'));
+    if (body != null) conn.write(body);
+  });
+}
+
 async function proxiedRequest(targetUrl, options = {}) {
   const {
     method = 'POST',
@@ -120,86 +212,26 @@ async function proxiedRequest(targetUrl, options = {}) {
   const isTls = url.protocol === 'https:';
   const port = Number(url.port || (isTls ? 443 : 80));
 
-  const raw = await openTunnel(proxy, { host: url.hostname, port }, timeoutMs);
-
-  let conn = raw;
+  let conn = await openTunnel(proxy, { host: url.hostname, port }, timeoutMs);
   if (isTls) {
     conn = await new Promise((resolve, reject) => {
       const t = tls.connect(
-        { socket: raw, servername: url.hostname, rejectUnauthorized: !insecure, ALPNProtocols: ['http/1.1'] },
+        { socket: conn, servername: url.hostname, rejectUnauthorized: !insecure, ALPNProtocols: ['http/1.1'] },
         () => resolve(t),
       );
       t.once('error', reject);
     });
   }
 
-  const mod = isTls ? https : http;
-  const requestHeaders = { ...headers, host: url.host };
+  if (signal) {
+    if (signal.aborted) { try { conn.destroy(); } catch { /* noop */ } throw new Error('aborted'); }
+    signal.addEventListener('abort', () => { try { conn.destroy(); } catch { /* noop */ } }, { once: true });
+  }
 
-  return await new Promise((resolve, reject) => {
-    // NOTE: `agent: false` makes Node ignore createConnection and dial
-    // localhost:80 instead, so the agent is always explicit here. One socket
-    // per request, no pooling (providers like freebuff reset pooled sockets).
-    const agent = isTls
-      ? new https.Agent({ keepAlive: false, maxSockets: 1, createConnection: () => conn })
-      : new http.Agent({ keepAlive: false, maxSockets: 1, createConnection: () => conn });
-
-    const req = mod.request({
-      host: url.hostname,
-      port,
-      method,
-      path: `${url.pathname}${url.search || ''}`,
-      headers: requestHeaders,
-      agent,
-      servername: isTls ? url.hostname : undefined,
-    });
-
-    let done = false;
-    const abort = () => {
-      if (done) return;
-      done = true;
-      try { req.destroy(new Error('aborted')); } catch { /* noop */ }
-      try { conn.destroy(); } catch { /* noop */ }
-      try { agent.destroy(); } catch { /* noop */ }
-    };
-    if (signal) {
-      if (signal.aborted) return abort();
-      signal.addEventListener('abort', abort, { once: true });
-    }
-
-    req.setTimeout(timeoutMs, () => {
-      if (!done) { done = true; req.destroy(new Error(`proxy upstream timeout (${timeoutMs}ms)`)); }
-    });
-    req.once('error', (err) => {
-      if (done) return;
-      done = true;
-      try { agent.destroy(); } catch { /* noop */ }
-      reject(err);
-    });
-
-    req.once('response', (res) => {
-      done = true;
-      req.setTimeout(0);
-      resolve({
-        status: res.statusCode,
-        ok: res.statusCode >= 200 && res.statusCode < 300,
-        headers: headersShim(res.rawHeaders),
-        body: toWebBody(res),
-        node: res,
-        cancel: () => {
-          try { res.destroy(); } catch { /* noop */ }
-          try { conn.destroy(); } catch { /* noop */ }
-          try { agent.destroy(); } catch { /* noop */ }
-        },
-      });
-    });
-
-    if (body != null) req.write(body);
-    req.end();
-  });
+  return requestOverTunnel(conn, { method, url, headers, body, timeoutMs });
 }
 
-/** Small helper for the proxy tester: GET a URL through a proxy and read a bounded body. */
+/** GET a URL through a proxy and read a bounded body (used by the proxy tester). */
 async function proxiedGet(targetUrl, proxy, { timeoutMs = 8000, insecure = false, maxBytes = 64 * 1024 } = {}) {
   const started = Date.now();
   const res = await proxiedRequest(targetUrl, { method: 'GET', headers: { accept: '*/*' }, proxy, timeoutMs, insecure });
@@ -212,7 +244,7 @@ async function proxiedGet(targetUrl, proxy, { timeoutMs = 8000, insecure = false
     }
     try { reader.destroy(); } catch { /* noop */ }
   }
-  return { status: res.status, ok: res.ok, text, ms: Date.now() - started, headers: res.headers };
+  return { status: res.status, ok: res.ok, text, ms: Date.now() - started, headers: res.headers, tunnelled: res.tunnelled === true };
 }
 
-module.exports = { proxiedRequest, proxiedGet, openTunnel, headersShim };
+module.exports = { proxiedRequest, proxiedGet, openTunnel, headersShim, chunkedDecode };

@@ -27,6 +27,7 @@ let pass = 0, fail = 0;
 let ipLimitedLeft = 1;
 const proxyHits = [];
 const PROXY_BASE_PORT = 21000 + Math.floor(Math.random() * 5000);
+const { TELEMETRY_SCHEMA } = require(path.join(REPO, 'proxy-manager.js'));
 const results = [];
 function check(name, cond, detail = '') {
   if (cond) { pass++; results.push(`  PASS  ${name}`); console.log(`  PASS  ${name}`); }
@@ -419,6 +420,7 @@ async function handleFreebuff(req, res, url, rawBody, jsonBody) {
 /** Minimal HTTP CONNECT proxy: the router's proxiedRequest talks to this. */
 function startConnectProxy(onConnect) {
   const srv = http.createServer((req, res) => { res.writeHead(405); res.end(); });
+  srv.innerRequests = [];
   srv.on('connect', (req, clientSocket, head) => {
     const [host, port] = String(req.url).split(':');
     if (onConnect) onConnect(req.url);
@@ -426,6 +428,13 @@ function startConnectProxy(onConnect) {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) upstream.write(head);
       upstream.pipe(clientSocket);
+      // Count the requests that actually travel through the tunnel: a client
+      // that opens its own connection instead egresses from this host and
+      // every exit measurement becomes fiction.
+      clientSocket.on('data', (chunk) => {
+        const first = chunk.toString('latin1').split('\r\n')[0];
+        if (/^(GET|POST|PUT|PATCH|DELETE) /.test(first)) srv.innerRequests.push(first);
+      });
       clientSocket.pipe(upstream);
     });
     upstream.on('error', () => clientSocket.destroy());
@@ -488,8 +497,8 @@ async function memOf() {
     },
     sources: [{ id: 's1', url: 'http://127.0.0.1:1/sub', enabled: false, lastFetched: 0, count: 0, error: '' }],
     exits: [
-      { id: 'x1', name: 'exit one', protocol: 'vless', host: '10.0.0.1', port: 443, uri: 'vless://x1', status: 'ok', latencyMs: 120, exitIp: '10.0.0.1', failures: 0, testedBy: 2, outbound: { protocol: 'freedom' } },
-      { id: 'x2', name: 'exit two', protocol: 'vless', host: '10.0.0.2', port: 443, uri: 'vless://x2', status: 'ok', latencyMs: 240, exitIp: '10.0.0.2', failures: 0, testedBy: 2, outbound: { protocol: 'freedom' } },
+      { id: 'x1', name: 'exit one', protocol: 'vless', host: '10.0.0.1', port: 443, uri: 'vless://x1', status: 'ok', latencyMs: 120, exitIp: '10.0.0.1', failures: 0, testedBy: TELEMETRY_SCHEMA, outbound: { protocol: 'freedom' } },
+      { id: 'x2', name: 'exit two', protocol: 'vless', host: '10.0.0.2', port: 443, uri: 'vless://x2', status: 'ok', latencyMs: 240, exitIp: '10.0.0.2', failures: 0, testedBy: TELEMETRY_SCHEMA, outbound: { protocol: 'freedom' } },
     ],
     active: ['x1', 'x2'],
   }));
@@ -784,17 +793,26 @@ async function memOf() {
     check('proxy rotate: IP-bound 429 is retried through the next exit and succeeds',
       r.status === 200 && r.headers.get('x-router-rotations') === '1' && r.headers.get('x-router-exit') === 'x2',
       `status=${r.status} exit=${r.headers.get('x-router-exit')} rotations=${r.headers.get('x-router-rotations')}`);
-    check('proxy rotate: the request really travelled over both CONNECT proxies',
+    check('proxy rotate: both exits were CONNECTed',
       proxyHits.length === 2 && proxyHits[0].startsWith('a:127.0.0.1:') && proxyHits[1].startsWith('b:127.0.0.1:'),
       JSON.stringify(proxyHits));
+    // The blind spot that shipped a proxy path which silently egressed
+    // directly: the CONNECT succeeded, but was the request inside it?
+    check('proxy rotate: the HTTP requests really travelled inside those tunnels',
+      proxyA.innerRequests.length === 1 && proxyB.innerRequests.length === 1,
+      `a=${JSON.stringify(proxyA.innerRequests)} b=${JSON.stringify(proxyB.innerRequests)}`);
 
     await sleep(700);
     const st = JSON.parse(fs.readFileSync(STATE, 'utf8'));
     const pt = st.providers['proxy-test'].accounts['pt-1'];
     check('proxy rotate: the account was NOT put on a 12h cooldown', !pt.limitedUntil, JSON.stringify(pt));
 
+    const beforeDirect = proxyA.innerRequests.length + proxyB.innerRequests.length;
     const direct = await chat({ headers: { 'x-router-provider': 'rr-provider' } });
     check('providers without a proxy still go direct', direct.headers.get('x-router-exit') === 'direct', direct.headers.get('x-router-exit'));
+    check('a direct provider never opens a tunnel',
+      proxyA.innerRequests.length + proxyB.innerRequests.length === beforeDirect,
+      'a tunnel was opened for a direct provider');
 
     const before = (await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json()).index;
     const rot = await (await fetch(routerUrl('/admin/api/proxies/rotate'), { method: 'POST', headers: ADMIN })).json();
