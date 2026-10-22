@@ -247,6 +247,8 @@
                     <span x-show="a.limits" x-text="a.limits + ' limit hit(s)'"></span>
                     <span x-show="a.lastStatus" x-text="'last HTTP ' + a.lastStatus"></span>
                     <span x-show="a.lastUsed" x-text="'used ' + ago(a.lastUsed)"></span>
+                    <span x-show="a.limitedUntil > 0 && a.lastMessage" class="max-w-[320px] truncate text-rose-300/80" :title="a.lastMessage"
+                          x-text="(a.limitedKind === 'error' ? 'error: ' : 'limit: ') + a.lastMessage"></span>
                     <span x-show="a.windowExpiresAt" class="text-violet-300" x-text="'swap in ' + countdown(a.windowExpiresAt)"></span>
                   </div>
                 </div>
@@ -471,6 +473,7 @@
           <span class="mono truncate text-slate-300" x-text="e.pid + (e.aid ? '/' + acctName(e.pid, e.aid) : '')"></span>
           <span class="mono text-slate-500" x-show="e.st" x-text="'HTTP ' + e.st"></span>
           <span class="mono text-slate-500" x-show="e.ms" x-text="e.ms + 'ms'"></span>
+          <span class="truncate text-rose-300/80" x-show="e.msg" x-text="e.msg"></span>
           <span class="mono ml-auto text-slate-600" x-show="e.s">stream</span>
         </div>
       </template>
@@ -857,6 +860,7 @@
               <span x-text="a.maskedKey || 'no credential'"></span>
               <span x-text="num(a.requests) + ' req'"></span>
               <span x-show="a.limitedUntil > 0" x-text="countdown(a.limitedUntil)"></span>
+              <span x-show="a.limitedUntil > 0 && a.lastMessage" class="max-w-[260px] truncate text-rose-300/80" :title="a.lastMessage" x-text="a.lastMessage"></span>
             </div>
           </div>
           <button class="btn" x-show="a.limitedUntil > 0" @click="resetAccount(pd, a)"><i data-lucide="zap" class="h-3.5 w-3.5"></i>Reset</button>

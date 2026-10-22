@@ -219,6 +219,8 @@ function defaultConfig() {
     cors: true,
     proxyKeys: [],
     logging: { requests: false },
+    respectRetryAfter: true,
+    errorCooldownMinutes: 5,
     providers: [
       { id: 'openai-main', name: 'OpenAI', type: 'openai', strategy: 'round-robin', accounts: [] },
       { id: 'openrouter-main', name: 'OpenRouter', type: 'openrouter', strategy: 'round-robin', accounts: [] },
@@ -275,6 +277,8 @@ function normalizeConfig(cfg) {
     : DEFAULT_RETRY_STATUSES.slice();
   out.proxyKeys = Array.isArray(out.proxyKeys) ? out.proxyKeys.map(String) : [];
   out.logging = { requests: !!(out.logging && out.logging.requests) };
+  out.respectRetryAfter = out.respectRetryAfter !== false;
+  out.errorCooldownMinutes = Number(out.errorCooldownMinutes) > 0 ? Number(out.errorCooldownMinutes) : 5;
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
   if (process.env.ADMIN_KEY) out.adminKey = process.env.ADMIN_KEY;
   return out;
@@ -392,14 +396,71 @@ function cooldownMs(provider) {
   return Math.round(clampHours(provider?.cooldownHours ?? config.cooldownHours) * 3600 * 1000);
 }
 
-function markLimited(provider, account, status) {
+const QUOTA_HINT = /quota|credit|rate.?limit|too many|exhaust|usage|spend|balance|insufficient|limit reached|out of/i;
+
+/** Parse retry-after / retry-after-ms; returns ms or 0. */
+function retryAfterMs(headers) {
+  try {
+    const ms = Number(headers.get('retry-after-ms'));
+    if (Number.isFinite(ms) && ms > 0) return Math.round(ms);
+    const raw = headers.get('retry-after');
+    if (!raw) return 0;
+    const secs = Number(raw);
+    if (Number.isFinite(secs) && secs >= 0) return Math.round(secs * 1000);
+    const at = Date.parse(raw);
+    if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+  } catch { /* noop */ }
+  return 0;
+}
+
+/**
+ * Read at most `maxBytes` of an error body so the reason can be reported, then
+ * release the stream. Nothing is retained beyond a short message.
+ */
+async function peekError(upstream, maxBytes = 1024) {
+  if (!upstream || !upstream.body || typeof upstream.body.getReader !== 'function') return '';
+  try {
+    const reader = upstream.body.getReader();
+    let text = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += Buffer.from(value).toString('utf8');
+      if (text.length >= maxBytes) break;
+    }
+    try { await reader.cancel(); } catch { /* noop */ }
+    const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"|"error"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(text);
+    const raw = (m && (m[1] || m[2])) || text;
+    return String(raw).replace(/\\[nrt]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+  } catch {
+    try { await upstream.body.cancel(); } catch { /* noop */ }
+    return '';
+  }
+}
+
+/**
+ * Cool an account down.
+ *  - a provider-supplied retry-after shortens the wait (freebuff answers 60s,
+ *    OpenCode often minutes) instead of burning the full cooldownHours;
+ *  - a 402/403 whose body is not quota-related is not a rate limit at all
+ *    (wrong model handle, mode required, suspended account), so it gets the
+ *    short errorCooldownMinutes and keeps its real message for the dashboard.
+ */
+function markLimited(provider, account, status, { ms = 0, message = '' } = {}) {
   const as = accountState(provider.id, account.id);
-  as.limitedUntil = now() + cooldownMs(provider);
+  const configured = cooldownMs(provider);
+  let wait = configured;
+  if (config.respectRetryAfter !== false && ms > 0) wait = Math.min(configured, ms);
+  const notQuota = (status === 402 || status === 403) && message && !QUOTA_HINT.test(message);
+  if (notQuota) wait = Math.min(wait, Math.max(1, Number(config.errorCooldownMinutes) || 5) * 60_000);
+  as.limitedUntil = now() + Math.max(1_000, wait);
   as.lastStatus = status;
+  as.lastMessage = message.slice(0, 180);
+  as.lastLimitedKind = notQuota ? 'error' : 'quota';
   as.limits = (as.limits || 0) + 1;
   state.totals.limitEvents += 1;
   state.totals.failovers += 1;
-  pushEvent({ kind: 'limited', pid: provider.id, aid: account.id, st: status });
+  pushEvent({ kind: 'limited', pid: provider.id, aid: account.id, st: status, mins: Math.round(Math.max(1_000, wait) / 60000), msg: as.lastMessage.slice(0, 80) });
   persistState();
   return as;
 }
@@ -505,6 +566,8 @@ function accountSummary(provider, account) {
     failures: as.failures || 0,
     limits: as.limits || 0,
     limitedUntil: isLimited(as) ? as.limitedUntil : 0,
+    lastMessage: as.lastMessage || '',
+    limitedKind: as.lastLimitedKind || '',
     windowStartedAt: as.activeSince || 0,
     windowExpiresAt: as.activeSince && windowMs(provider, account) ? as.activeSince + windowMs(provider, account) : 0,
     lastStatus: as.lastStatus || 0,
@@ -1194,17 +1257,38 @@ function allExhausted(provider, tried, dueToLimit) {
     .map((a) => accountState(provider.id, a.id).limitedUntil)
     .filter((t) => t > now())
     .sort((a, b) => a - b)[0] || 0;
+  // Say which account answered what, and when it frees up: without this the
+  // client only sees "all accounts are limited" and cannot tell an IP limit
+  // from a bad model handle or a suspended account.
+  const detail = accounts.map((a) => {
+    const as = accountState(provider.id, a.id);
+    return {
+      id: a.id,
+      name: a.name,
+      status: as.lastStatus || 0,
+      kind: as.lastLimitedKind || '',
+      message: as.lastMessage || '',
+      unlocksInSeconds: as.limitedUntil > now() ? Math.round((as.limitedUntil - now()) / 1000) : 0,
+    };
+  });
+  const reasons = detail.filter((d) => d.message).map((d) => `${d.name}: HTTP ${d.status} ${d.message}`);
+  const rotateHint = provider.proxy === 'rotate'
+    ? (proxies && proxies.activeExits().length ? '' : ' Rotation is configured but the exit pool has no working exit - run Test/Apply in the Network tab.')
+    : ' Tip: set Outbound proxy to "Rotate the pool" so an IP-bound limit retries on a new exit first.';
   return {
     error: {
-      message: dueToLimit
-        ? `All accounts for provider "${provider.id}" are rate-limited (429/402/403) and cooling down.`
-        : `No healthy account available for provider "${provider.id}".`,
+      message: (dueToLimit
+        ? `All accounts for provider "${provider.id}" are rate-limited and cooling down.`
+        : `No healthy account available for provider "${provider.id}".`) + rotateHint,
       type: 'router_no_healthy_account',
       provider: provider.id,
       tried: [...tried],
+      accounts: detail,
+      reasons,
       healthyRemaining: healthyLeft.length,
       retryAfterSeconds: nextUnlock ? Math.max(1, Math.round((nextUnlock - now()) / 1000)) : 0,
       nextUnlockAt: nextUnlock || null,
+      resetHint: `Clear it now: POST /admin/api/reset with x-admin-key, or the "Unlock all" button in the dashboard.`,
     },
   };
 }
@@ -1324,16 +1408,20 @@ async function handleProxy(req, res, url) {
 
       if (cooldownStatuses.includes(upstream.status)) {
         sawLimit = true;
-        try { upstream.body && upstream.body.cancel && await upstream.body.cancel(); } catch { /* noop */ }
+        // Read a bounded reason + retry-after BEFORE touching the body: a 403
+        // saying "mode required" is not a rate limit, and a 60s retry-after
+        // must not cost 12 hours.
+        const retryMs = retryAfterMs(upstream.headers);
+        const snippet = await peekError(upstream);
         if (rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
           const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`);
           rotations += 1;
-          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; rotating exit to ${next ? next.id : '?'} and retrying (${rotations}/${rotateMax})`);
+          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}${snippet ? ` (${snippet.slice(0, 80)})` : ''}; rotating exit to ${next ? next.id : '?'} and retrying (${rotations}/${rotateMax})`);
           continue;
         }
-        markLimited(provider, account, upstream.status);
-        console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}, cooling down ${clampHours(provider.cooldownHours ?? config.cooldownHours)}h, failing over`);
+        const cooled = markLimited(provider, account, upstream.status, { ms: retryMs, message: snippet });
+        console.warn(`[proxy] ${provider.id}/${account.name} -> HTTP ${upstream.status} ${snippet ? `"${snippet}" ` : ''}cooling down ${Math.round((cooled.limitedUntil - now()) / 60000)}m${retryMs ? ` (retry-after ${Math.round(retryMs / 1000)}s)` : ''}, failing over`);
         break;
       }
 
@@ -1884,6 +1972,8 @@ async function handleAdmin(req, res, url) {
       config.proxyKeys = body.proxyKeys.map(String).filter(Boolean);
     }
     if (body.loggingRequests != null) config.logging = { requests: !!body.loggingRequests };
+    if (body.respectRetryAfter != null) config.respectRetryAfter = !!body.respectRetryAfter;
+    if (body.errorCooldownMinutes != null) config.errorCooldownMinutes = Math.max(1, Number(body.errorCooldownMinutes) || 5);
     if (Array.isArray(body.cooldownStatuses) && body.cooldownStatuses.length) config.cooldownStatuses = body.cooldownStatuses.map(Number);
     await saveConfig();
     return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });

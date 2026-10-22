@@ -101,6 +101,22 @@ An account is **healthy** when `enabled !== false` and `limitedUntil <= now`.
 
 `5xx` responses are retried across accounts too (`retryStatuses`) but never trigger a cooldown; if the last attempt is still a `5xx` it is relayed to the client as-is rather than dressed up as a success.
 
+**Why an account is cooling, and for how long.** A `429` carrying `retry-after: 60` cools for 60 seconds, not 12 hours. A `402`/`403` whose body is not quota-related (`free_mode_cli_required`, `model not found`, `account suspended`) gets `errorCooldownMinutes` (default 5) and keeps its real message. The exhausted-provider response reports all of it:
+
+```json
+{ "error": {
+  "message": "All accounts for provider \"opencode-main\" are rate-limited and cooling down. Tip: set Outbound proxy to \"Rotate the pool\" …",
+  "provider": "opencode-main",
+  "accounts": [{ "id": "acc-1", "name": "token-1", "status": 429, "kind": "quota",
+                 "message": "rate limit exceeded, try again in 2 hours", "unlocksInSeconds": 7150 }],
+  "reasons": ["token-1: HTTP 429 rate limit exceeded, try again in 2 hours"],
+  "retryAfterSeconds": 7150,
+  "resetHint": "Clear it now: POST /admin/api/reset with x-admin-key, or the \"Unlock all\" button in the dashboard."
+} }
+```
+
+The same reason is shown on the account row and in the Activity tab, so you can tell an IP limit from a bad model handle without reading the provider's docs.
+
 ## Provider types
 
 | `type` | Upstream base URL | Auth | Wire style |
@@ -199,6 +215,8 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `cors` | `true` | Send permissive CORS headers to proxy clients. |
 | `logging.requests` | `false` | Routing lines in the process log. Off by default — counters live in the dashboard. |
 | `rotateEveryMinutes` | `0` | Time-boxed rotation: keep one account for N minutes, then move to the next. Use it when a provider's free quota resets on a clock — OpenCode: `120` for two-hour tokens. Per-account override allowed. `0` = off. |
+| `respectRetryAfter` | `true` | When an upstream answers `429` with `retry-after`, cool the account for that long instead of the full `cooldownHours`. |
+| `errorCooldownMinutes` | `5` | Cooldown for a `402`/`403` whose body is **not** quota-related (wrong model handle, mode required, suspended account) — so a protocol error no longer locks an account for 12 hours. |
 | `proxyKeys` | `[]` | Inbound `Bearer` keys the router requires. Empty = open. |
 | `providers[]` | — | `id`, `name`, `type`, `baseUrl`, `strategy`, `cooldownHours`, `timeoutMs`, `maxAttempts`, `headers`, `modelStyles`, `accounts[]`. |
 

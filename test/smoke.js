@@ -74,6 +74,9 @@ const mock = http.createServer(async (req, res) => {
   const nChunks = Number(json.n ?? req.headers['x-test-chunks'] ?? 4);
 
   if (key === 'key-limited') { res.writeHead(429, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"rate limited"}}'); }
+  if (key === 'key-retry-after') { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '2' }); return res.end('{"error":{"message":"slow down, retry shortly"}}'); }
+  if (key === 'key-mode-403') { res.writeHead(403, { 'content-type': 'application/json' }); return res.end('{"error":"free_mode_cli_required"}'); }
+  if (key === 'key-credits-402') { res.writeHead(402, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"Out of credits."}}'); }
   if (key === 'key-payment') { res.writeHead(402, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"payment required"}}'); }
   if (key === 'key-forbidden') { res.writeHead(403, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"forbidden"}}'); }
   if (key === 'key-broken') { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"boom"}}'); }
@@ -218,6 +221,21 @@ function writeConfig() {
           { id: 'p-402', name: 'payment-402', apiKey: 'key-payment', enabled: true },
           { id: 'p-403', name: 'forbidden-403', apiKey: 'key-forbidden', enabled: true },
           { id: 'p-429', name: 'limited-429', apiKey: 'key-limited', enabled: true },
+        ],
+      },
+      {
+        id: 'cooldown-provider', name: 'Cooldown Semantics', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
+        strategy: 'sequential', cooldownHours: 12, timeoutMs: 10000, maxAttempts: 0,
+        accounts: [
+          { id: 'c-retry', name: 'retry-after-key', apiKey: 'key-retry-after', enabled: true },
+        ],
+      },
+      {
+        id: 'error-provider', name: 'Non Quota Error', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
+        strategy: 'sequential', cooldownHours: 12, timeoutMs: 10000, maxAttempts: 0,
+        accounts: [
+          { id: 'e-403', name: 'mode-403-key', apiKey: 'key-mode-403', enabled: true },
+          { id: 'e-402', name: 'credits-402-key', apiKey: 'key-credits-402', enabled: true },
         ],
       },
       {
@@ -870,6 +888,31 @@ async function memOf() {
 
     const off = await fetch(routerUrl('/admin/api/provider/window-provider'), { method: 'PATCH', headers: ADMIN, body: JSON.stringify({ rotateEveryMinutes: 0 }) });
     check('window: turning it off keeps the accounts', (await off.json()).provider.accounts.length === 2);
+  }
+
+  // 22. cooldown semantics: honour retry-after, and do not treat a protocol
+  //     error as a 12-hour rate limit
+  {
+    const r = await chat({ headers: { 'x-router-provider': 'cooldown-provider' } });
+    check('cooldown: all accounts limited still answers 429', r.status === 429, String(r.status));
+    const body = JSON.parse(r.text);
+    check('cooldown: the upstream message and unlock time are reported back',
+      Array.isArray(body.error.accounts) && /retry shortly/i.test(body.error.accounts[0].message) && body.error.accounts[0].unlocksInSeconds > 0,
+      JSON.stringify(body.error).slice(0, 240));
+    await sleep(700);
+    const st = JSON.parse(fs.readFileSync(STATE, 'utf8')).providers['cooldown-provider'].accounts['c-retry'];
+    const waitS = Math.round((st.limitedUntil - Date.now()) / 1000);
+    check('cooldown: retry-after 2s beats the 12h default', waitS <= 3 && waitS >= 0, `wait=${waitS}s`);
+
+    const err = await chat({ headers: { 'x-router-provider': 'error-provider' } });
+    check('cooldown: a non-quota 403 falls through to the next account, then 429 with reasons',
+      err.status === 429 && JSON.parse(err.text).error.reasons.some((x) => /free_mode_cli_required/i.test(x)), err.text.slice(0, 240));
+    await sleep(700);
+    const est = JSON.parse(fs.readFileSync(STATE, 'utf8')).providers['error-provider'].accounts;
+    const wait403 = Math.round((est['e-403'].limitedUntil - Date.now()) / 60000);
+    const wait402 = Math.round((est['e-402'].limitedUntil - Date.now()) / 60000);
+    check('cooldown: the protocol 403 gets minutes, not 12 hours', wait403 <= 6 && est['e-403'].lastLimitedKind === 'error', `403=${wait403}m kind=${est['e-403'].lastLimitedKind}`);
+    check('cooldown: a credit 402 keeps the long quota cooldown', wait402 >= 700 && est['e-402'].lastLimitedKind === 'quota', `402=${wait402}m kind=${est['e-402'].lastLimitedKind}`);
   }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
