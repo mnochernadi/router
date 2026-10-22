@@ -364,6 +364,8 @@ install_systemd() {
     else
       ok "keeping existing $STATE_DIR/config.json"
     fi
+    # It holds the admin key and every provider key: 0600 like the other secrets.
+    run chmod 600 "$STATE_DIR/config.json"
     run chown -R "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR" "$INSTALL_DIR"
   else
     run cp "$INSTALL_DIR/config.example.json" "$STATE_DIR/config.json"
