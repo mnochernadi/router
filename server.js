@@ -1430,6 +1430,9 @@ function inboundKey(req, url) {
 // router drops it, mints a new one and retries - the operator never adds an
 // account and never waits for a cooldown.
 const MANAGED_MAX_RENEWALS = 4;
+// Minimum spacing between identity replacements for a managed provider.
+const MANAGED_RENEW_GAP_MS = 10 * 60_000;
+const MANAGED_BACKOFF_MS = 60_000;
 
 function isManagedProvider(provider) {
   return !!(PROVIDER_TYPES[provider && provider.type] || {}).manageAccounts;
@@ -1574,6 +1577,7 @@ async function handleProxy(req, res, url) {
     let relayed = false;
     let lastFailure = null;
     let lastFailureKey = '';
+    let netRetries = 0;
 
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
@@ -1597,6 +1601,13 @@ async function handleProxy(req, res, url) {
         persistState();
         console.warn(`[proxy] ${provider.id}/${account.name} network error: ${err.message}`);
         if (call && call.exit && proxies) proxies.noteResult(call.exit.id, false);
+        // Transient socket drops (TLS reset, upstream idle close) are worth one
+        // retry on the same identity before the provider is called unhealthy.
+        if (netRetries < 2) {
+          netRetries += 1;
+          await new Promise((r) => setTimeout(r, 400 * netRetries));
+          continue;
+        }
         break;
       }
 
@@ -1617,14 +1628,23 @@ async function handleProxy(req, res, url) {
         // exit (policy gate, bad model handle): stop burning the pool.
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
-        if (isManagedProvider(provider) && renewals < MANAGED_MAX_RENEWALS) {
-          // Exhausted identity: drop it, mint a new one (fresh session) and move
-          // this provider to a new exit. No cooldown is applied at all.
-          const fresh = renewManagedIdentity(provider, account, `HTTP ${upstream.status}`);
-          renewals += 1;
-          if (proxies && proxies.activeExits().length > 1) proxies.rotate(`renewal after ${upstream.status}`, provider.id);
-          account = fresh;
-          continue;
+        if (isManagedProvider(provider) && renewals < 1) {
+          // One renewal per request, and not more often than every 10 minutes:
+          // minting an identity on every 429 looked like abuse upstream and got
+          // our TLS handshakes dropped. Between renewals the provider backs off.
+          const rt = accountState(provider.id, account.id);
+          const since = Date.now() - (rt.lastRenewAt || 0);
+          if (since > MANAGED_RENEW_GAP_MS) {
+            const fresh = renewManagedIdentity(provider, account, `HTTP ${upstream.status}`);
+            accountState(provider.id, fresh.id).lastRenewAt = Date.now();
+            renewals += 1;
+            // Only a provider that opted into the pool follows the exit rotation.
+            if (provider.proxy === 'rotate' && proxies && proxies.activeExits().length > 1) {
+              proxies.rotate(`renewal after ${upstream.status}`, provider.id);
+            }
+            account = fresh;
+            continue;
+          }
         }
         const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
         if (freeTier && kind === 'quota' && rotations < Math.max(1, rotateMax)) {
