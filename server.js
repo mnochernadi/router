@@ -2210,7 +2210,9 @@ async function handleAdmin(req, res, url) {
     }
   }
 
-  if (method === 'GET' && a === 'freebuff') {
+  // Exact path only: /freebuff/login/:id is the polling endpoint below, and the
+  // snapshot route used to swallow it (the dashboard never saw an approval).
+  if (method === 'GET' && a === 'freebuff' && !b) {
     return sendJson(res, 200, { ok: true, accounts: freebuff.snapshot() });
   }
 
