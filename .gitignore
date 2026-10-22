@@ -15,6 +15,9 @@ router-backup-*.json
 # local tooling that must not be published
 .tools/
 
+# patch files another tool keeps dropping into the checkout
+*.patch
+
 # node / editor noise
 node_modules/
 npm-debug.log*
