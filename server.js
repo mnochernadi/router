@@ -473,6 +473,9 @@ function providerSummary(provider) {
     maxAttempts: provider.maxAttempts || 0,
     hasCustomHeaders: !!provider.headers,
     hasModelStyles: !!provider.modelStyles,
+    // The dashboard reads this to render the "rotating exits" pill and to seed
+    // the edit form; without it an edit silently saved `proxy: 'direct'`.
+    proxy: provider.proxy || 'direct',
     accounts,
     accountCount: accounts.length,
     activeCount: accounts.filter((a) => a.limitedUntil === 0 && a.enabled).length,
@@ -1556,7 +1559,7 @@ async function handleAdmin(req, res, url) {
     // value (accounts above all — an "edit provider" must never orphan keys).
     const seeded = {};
     if (existing) {
-      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type']) {
+      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type', 'proxy']) {
         if (body[key] === undefined) seeded[key] = existing[key];
       }
     }

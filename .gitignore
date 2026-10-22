@@ -12,6 +12,9 @@ xray-test-config.json
 llm-router-backup-*.json
 router-backup-*.json
 
+# local tooling that must not be published
+.tools/
+
 # node / editor noise
 node_modules/
 npm-debug.log*
