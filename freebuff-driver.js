@@ -39,6 +39,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const API_HOST = process.env.FB_API_HOST || 'https://www.codebuff.com';
+const LOGIN_HOST = process.env.FB_LOGIN_HOST || 'https://freebuff.com';
 const CATALOG_CLIENT = { 'x-freebuff-client': 'cli', 'x-freebuff-client-version': '0.2.32' };
 const SESSION_CLIENT_VERSION = '0.0.183';
 const RUN_AGENT_ID = 'freebuff-desktop-thread-local-v3';
@@ -305,6 +306,51 @@ class FreebuffDriver {
     await this.save();
   }
 
+  // ---- device login (no key to paste) -------------------------------------
+  // freebuff.com mints a code, the operator approves it in a browser, and the
+  // resulting authToken is the account credential.
+  async startLogin() {
+    const fingerprintId = crypto.randomUUID();
+    const res = await fetch(`${LOGIN_HOST}/api/auth/cli/code`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'llm-router' },
+      body: JSON.stringify({ fingerprintId }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* keep text */ }
+    if (!res.ok || !json) throw new Error(`login start failed: HTTP ${res.status} ${text.slice(0, 160)}`);
+    this.logins = this.logins || new Map();
+    const session = {
+      id: fingerprintId,
+      fingerprintId,
+      fingerprintHash: json.fingerprintHash || json.hash || '',
+      expiresAt: json.expiresAt || Date.now() + 3_600_000,
+      loginUrl: json.loginUrl || json.url || '',
+      startedAt: Date.now(),
+    };
+    this.logins.set(fingerprintId, session);
+    return session;
+  }
+
+  async pollLogin(session) {
+    const q = new URLSearchParams({
+      fingerprintId: session.fingerprintId,
+      fingerprintHash: session.fingerprintHash,
+      expiresAt: String(session.expiresAt),
+    });
+    const res = await fetch(`${LOGIN_HOST}/api/auth/cli/status?${q}`, {
+      headers: { 'user-agent': 'llm-router' },
+      signal: AbortSignal.timeout(20_000),
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* keep text */ }
+    const token = (json && (json.user?.authToken || json.authToken || json.token)) || '';
+    return { status: res.status, ok: res.ok, token, pending: !token, raw: token ? undefined : text.slice(0, 200) };
+  }
+
   /** First message must be the Buffy preamble or the service answers 403. */
   withPreamble(messages) {
     const list = Array.isArray(messages) ? messages.slice() : [];
@@ -421,4 +467,4 @@ class FreebuffDriver {
   }
 }
 
-module.exports = { FreebuffDriver, canonical, API_HOST, BUFFY_PREAMBLE };
+module.exports = { FreebuffDriver, canonical, API_HOST, LOGIN_HOST, BUFFY_PREAMBLE };

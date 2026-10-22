@@ -14,10 +14,10 @@
       extend: {
         colors: {
           ink: { 950: '#070a12', 900: '#0b0f1a', 850: '#0f1422', 800: '#141a2b', 700: '#1d2438', 600: '#2a3350' },
-          accent: { DEFAULT: '#38bdf8', soft: '#0ea5e9', violet: '#8b5cf6' },
+          accent: { DEFAULT: '#8b5cf6', soft: '#7c3aed', violet: '#a78bfa', cyan: '#22d3ee' },
         },
         fontFamily: { sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'], mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'] },
-        boxShadow: { glow: '0 0 0 1px rgba(56,189,248,.18), 0 12px 40px -12px rgba(56,189,248,.35)' },
+        boxShadow: { glow: '0 0 0 1px rgba(139,92,246,.22), 0 12px 44px -12px rgba(139,92,246,.45)' },
       },
     },
   };
@@ -27,9 +27,10 @@
 <style>
   :root { color-scheme: dark; }
   body { background:
-      radial-gradient(1200px 600px at 12% -8%, rgba(56,189,248,.10), transparent 60%),
-      radial-gradient(900px 500px at 92% 4%, rgba(139,92,246,.10), transparent 55%),
-      #070a12; }
+      radial-gradient(1100px 600px at 10% -10%, rgba(139,92,246,.18), transparent 60%),
+      radial-gradient(900px 520px at 95% 0%, rgba(34,211,238,.10), transparent 55%),
+      radial-gradient(700px 500px at 50% 110%, rgba(124,58,237,.12), transparent 60%),
+      #08070f; }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: #0b0f1a; }
   ::-webkit-scrollbar-thumb { background: #1d2438; border-radius: 999px; border: 2px solid #0b0f1a; }
@@ -39,15 +40,15 @@
   .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.15rem .5rem; border-radius:999px; font-size:.7rem; font-weight:600; letter-spacing:.01em; }
   .seg { position: relative; display:grid; grid-template-columns:1fr 1fr; gap:.25rem; padding:.2rem; border-radius:.6rem; background:#0b0f1a; border:1px solid #1d2438; }
   .seg button { position:relative; z-index:1; padding:.3rem .6rem; border-radius:.45rem; font-size:.72rem; font-weight:600; color:#8b95ad; transition:all .15s ease; }
-  .seg button.on { background:linear-gradient(180deg,#1d2438,#141a2b); color:#e6ecf7; box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 6px 16px -10px rgba(56,189,248,.8); }
+  .seg button.on { background:linear-gradient(180deg,#2a2140,#1b1630); color:#efe9ff; box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 6px 18px -10px rgba(139,92,246,.9); }
   .btn { display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .7rem; border-radius:.55rem; font-size:.78rem; font-weight:600; border:1px solid #1d2438; background:#0f1422; color:#c7d2e4; transition:all .15s ease; }
   .btn:hover { background:#141a2b; border-color:#2a3350; color:#fff; }
-  .btn-primary { background:linear-gradient(180deg,#0ea5e9,#0284c7); border-color:#0ea5e9; color:#fff; }
-  .btn-primary:hover { background:linear-gradient(180deg,#38bdf8,#0ea5e9); }
+  .btn-primary { background:linear-gradient(180deg,#8b5cf6,#6d28d9); border-color:#7c3aed; color:#fff; box-shadow:0 8px 24px -14px rgba(139,92,246,.9); }
+  .btn-primary:hover { background:linear-gradient(180deg,#a78bfa,#7c3aed); }
   .btn-danger { color:#fca5a5; border-color:#3f1d24; }
   .btn-danger:hover { background:#2a1319; border-color:#7f1d1d; color:#fecaca; }
   .input { width:100%; padding:.5rem .65rem; border-radius:.55rem; background:#0b0f1a; border:1px solid #1d2438; color:#e6ecf7; font-size:.82rem; }
-  .input:focus { outline:none; border-color:#0ea5e9; box-shadow:0 0 0 3px rgba(14,165,233,.15); }
+  .input:focus { outline:none; border-color:#8b5cf6; box-shadow:0 0 0 3px rgba(139,92,246,.18); }
   label.fld { display:block; font-size:.7rem; font-weight:600; color:#8b95ad; text-transform:uppercase; letter-spacing:.06em; margin-bottom:.3rem; }
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   [x-cloak] { display:none !important; }
@@ -192,6 +193,8 @@
           </div>
 
           <div class="flex items-center gap-1.5" @click.stop>
+            <button class="btn" x-show="p.proxy === 'rotate'" @click="nextExit(p)" title="Switch this provider to the next exit now">
+              <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Next IP</button>
             <button class="btn" @click="openModels(p)" title="List the models this provider serves"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
             <button class="btn" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
             <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
@@ -438,6 +441,11 @@
                   <span x-show="e.active" class="pill bg-accent/10 text-accent">in pool</span>
                 </td>
                 <td class="px-2 py-1.5 text-right">
+                  <select class="input mono !w-36 !py-0.5 !text-[10px]" @change="assignProxyById(e, $event.target.value); $event.target.value = ''">
+                    <option value="">use for…</option>
+                    <option value="rotate">rotate pool</option>
+                    <template x-for="p in (s.providers || [])" :key="p.id"><option :value="p.id" x-text="p.id"></option></template>
+                  </select>
                   <button class="btn !px-2 !py-0.5" title="Remove" @click="deleteExit(e)"><i data-lucide="x" class="h-3 w-3"></i></button>
                 </td>
               </tr>
@@ -844,7 +852,10 @@
 
     <div class="mb-2 flex flex-wrap items-center gap-2">
       <span class="text-[11px] uppercase tracking-wider text-slate-500">Accounts</span>
-      <button class="btn ml-auto" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
+      <button class="btn" x-show="pd && pd.proxy === 'rotate'" @click="nextExit(pd)"><i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Next IP</button>
+      <button class="btn btn-primary ml-auto" x-show="pd && (pd.type === 'freebuff' || pd.type === 'opencode-free')" @click="startFreebuffLogin(pd)">
+        <i data-lucide="log-in" class="h-3.5 w-3.5"></i><span x-text="pd && pd.type === 'freebuff' ? 'Authorize freebuff' : 'Get a Console key'"></span></button>
+      <button class="btn" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
       <button class="btn" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
       <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
       <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -879,6 +890,36 @@
         </div>
       </template>
     </div>
+  </div>
+</div>
+
+<!-- ===================== AUTHORIZE (freebuff device login) ===================== -->
+<div x-show="modal === 'login'" class="fixed inset-0 z-[60] grid place-items-center bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card w-full max-w-md rounded-2xl p-5 fade-in">
+    <div class="mb-3 flex items-center gap-2">
+      <i data-lucide="log-in" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white" x-text="lf.providerType === 'opencode-free' ? 'OpenCode Console key' : 'Authorize freebuff'"></h3>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+    <template x-if="lf.providerType === 'opencode-free'">
+      <div class="space-y-3 text-[12px] text-slate-300">
+        <p>OpenCode's free tier refuses every non-OpenCode client (<code class="mono">403 FreeTierError</code>) — verified from this server across 7 header sets and both endpoints. It cannot be fixed with a proxy or an account.</p>
+        <p>The working path is a Console key: create one at <a class="text-accent underline" href="https://opencode.ai/console" target="_blank">opencode.ai/console</a>, then paste it as the account key. The <code class="mono">*-free</code> models there still cost nothing.</p>
+        <p class="text-slate-500">Until then this provider is a model catalogue only.</p>
+      </div>
+    </template>
+    <template x-if="lf.providerType === 'freebuff'">
+      <div class="space-y-3">
+        <p class="text-[12px] text-slate-300">freebuff has no API key. Open this link, sign in, approve the device, and this page finishes by itself.</p>
+        <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2">
+          <code class="mono min-w-0 flex-1 truncate text-[11px] text-accent" x-text="lf.url || 'asking freebuff…'"></code>
+          <button class="btn !px-2 !py-1" @click="copy(lf.url)" x-show="lf.url"><i data-lucide="copy" class="h-3 w-3"></i></button>
+        </div>
+        <p class="text-[11px]" :class="lf.error ? 'text-rose-400' : 'text-slate-500'" x-text="lf.error || lf.status"></p>
+        <button class="btn btn-primary w-full justify-center" @click="pollFreebuffLogin()" x-show="lf.session && !lf.done">
+          <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>I approved it — check now</button>
+      </div>
+    </template>
   </div>
 </div>
 
@@ -982,12 +1023,12 @@ const TYPES = {
 // optional = works without one (local servers, or paste it later).
 const CATALOG = [
   { group: 'Free', key: 'opencode-free', type: 'opencode-free', label: 'OpenCode Free', icon: 'terminal',
-    blurb: '80+ models at opencode.ai, no signup and no key', keyMode: 'none',
+    blurb: 'model catalogue only — the free API refuses non-OpenCode clients from any IP', keyMode: 'none',
     baseUrl: 'https://opencode.ai/zen/v1', strategy: 'round-robin', proxy: 'rotate',
     note: 'The free list changes over time — use Models to see what is live right now. Rotating exits help if you hit per-IP limits.' },
 
   { group: 'Free with account', key: 'freebuff', type: 'freebuff', label: 'freebuff (Codebuff)', icon: 'bird',
-    blurb: 'Free coding models from the freebuff desktop app', keyMode: 'token', optional: true,
+    blurb: 'free coding models — authorize with a device login, no key to paste', keyMode: 'token', optional: true,
     baseUrl: 'https://www.codebuff.com', strategy: 'round-robin', proxy: 'rotate',
     keyHint: 'Paste the 36-character account token from the freebuff app. You can add it later — calls start once it is set.',
     note: 'Blocked-country egress (IR included) is reset by the service. Assign "Rotate the exit pool" so requests leave from a working IP.' },
@@ -1039,6 +1080,7 @@ function app() {
     srcText: '',
     busySub: false,
     pollTimer: null,
+    pollTimer2: null,
     catFilter: '',
     cf: { key: '', type: '', label: '', blurb: '', icon: 'plug', keyMode: 'key', optional: false, keyHint: '', id: '', name: '', baseUrl: '', strategy: 'round-robin', proxy: 'direct', note: '', apiKey: '', models: [], testing: false, error: '' },
     pd: null,
@@ -1395,6 +1437,46 @@ function app() {
 
     switchTab(id) { this.tab = id; this.refreshIcons(); if (id === 'network') this.loadProxies(); },
 
+    lf: { providerType: '', provider: '', account: '', session: '', url: '', status: '', error: '', done: false },
+    async startFreebuffLogin(p) {
+      this.lf = { providerType: p.type, provider: p.id, account: (p.accounts[0] || {}).id || '', session: '', url: '', status: '', error: '', done: false };
+      this.modal = 'login';
+      this.refreshIcons();
+      if (p.type !== 'freebuff') return;
+      try {
+        const r = await this.api('/freebuff/login', { method: 'POST', body: {} });
+        this.lf.session = r.session.id;
+        this.lf.url = r.session.loginUrl;
+        this.lf.status = 'waiting for approval…';
+        this.pollTimer2 = setInterval(() => this.pollFreebuffLogin(true), 4000);
+      } catch (err) { this.lf.error = err.message; }
+    },
+    async pollFreebuffLogin(silent) {
+      if (!this.lf.session) return;
+      try {
+        const q = `?provider=${encodeURIComponent(this.lf.provider)}&account=${encodeURIComponent(this.lf.account)}`;
+        const r = await this.api('/freebuff/login/' + encodeURIComponent(this.lf.session) + q);
+        if (r.authorized) {
+          this.lf.done = true;
+          this.lf.status = 'authorized';
+          if (this.pollTimer2) { clearInterval(this.pollTimer2); this.pollTimer2 = null; }
+          this.toast('freebuff authorized', 'ok');
+          await this.load(true);
+          setTimeout(() => { this.modal = null; }, 900);
+        } else if (!silent) {
+          this.lf.status = 'still waiting — approve the link, then check again';
+        }
+      } catch (err) { this.lf.error = err.message; if (!silent) this.lf.status = ''; }
+    },
+    async nextExit(p) {
+      try {
+        const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/rotate-exit', { method: 'POST', body: {} });
+        this.toast(r.exit ? `${p.id} → ${r.exit.exitIp || r.exit.host || r.exit.id}` : 'No working exit to switch to', r.exit ? 'ok' : 'warn');
+        await this.loadProxies(true);
+        await this.load();
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+
     // ---------- network / exit pool ----------
     async loadProxies(force) {
       if (!force && this.tab !== 'network' && this.np) return this.np;
@@ -1486,6 +1568,13 @@ function app() {
         await this.api('/proxies/settings', { method: 'POST', body: { ...this.nps } });
         this.toast('Pool settings saved', 'ok');
       } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async assignProxyById(exit, providerId) {
+      if (!providerId) return;
+      const p = (this.s.providers || []).find((x) => x.id === providerId);
+      if (!p) return;
+      await this.assignProxy(p, providerId === 'rotate' ? 'rotate' : exit.id);
+      await this.load();
     },
     async purgeDead() {
       try {

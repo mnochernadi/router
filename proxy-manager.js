@@ -319,6 +319,9 @@ class ProxyManager {
     this.test = { running: false, total: 0, done: 0, ok: 0, dead: 0, startedAt: 0, finishedAt: 0, batch: 0, batches: 0, error: '' };
     this.events = [];
     this.index = 0;
+    // One cursor per provider: a limit hit on OpenCode must not move the exit
+    // that OpenAI is using.
+    this.cursors = new Map();
     this.byId = new Map();
     this._saveTimer = null;
     this._dirty = false;
@@ -734,6 +737,7 @@ class ProxyManager {
     const best = this.workingExits().slice(0, this.state.settings.maxActive);
     this.state.active = best.map((e) => e.id);
     this.index = 0;
+    this.cursors.clear();
     this.save();
     this.pushEvent({ kind: 'apply', active: best.length });
     return this.startMain();
@@ -746,17 +750,28 @@ class ProxyManager {
     const pool = this.activeExits();
     if (!pool.length) return null;
     if (mode === 'rotate') {
-      const exit = pool[this.index % pool.length];
-      return { mode, exit, proxy: { host: '127.0.0.1', port: this.portForExit(exit) } };
+      const key = (provider && provider.id) || 'default';
+      const at = this.cursors.get(key) || 0;
+      const exit = pool[at % pool.length];
+      return { mode, exit, index: at % pool.length, proxy: { host: '127.0.0.1', port: this.portForExit(exit) } };
     }
     const exit = this.byId.get(mode);
     if (!exit || exit.status !== 'ok') return null;
     return { mode: 'fixed', exit, proxy: { host: '127.0.0.1', port: this.portForExit(exit) } };
   }
 
-  rotate(reason = 'manual') {
+  rotate(reason = 'manual', providerId = null) {
     const pool = this.activeExits();
     if (!pool.length) return null;
+    if (providerId) {
+      const key = providerId || 'default';
+      const at = ((this.cursors.get(key) || 0) + 1) % pool.length;
+      this.cursors.set(key, at);
+      const picked = pool[at];
+      this.pushEvent({ kind: 'rotate', reason, exit: picked.id, host: picked.host, ip: picked.exitIp || '', leak: !!(this.localIp && picked.exitIp === this.localIp), provider: providerId });
+      this.log(`[proxy] ${providerId} switched to exit=${picked.id} host=${picked.host}${picked.exitIp ? ` egress=${picked.exitIp}` : ' egress=unknown'} - ${reason}`);
+      return picked;
+    }
     this.index = (this.index + 1) % pool.length;
     const exit = pool[this.index];
     this.pushEvent({ kind: 'rotate', reason, exit: exit.id, host: exit.host, ip: exit.exitIp || '', leak: !!(this.localIp && exit.exitIp === this.localIp) });
@@ -795,6 +810,7 @@ class ProxyManager {
       counts,
       active: this.state.active.length,
       index: this.index,
+      cursors: Object.fromEntries(this.cursors),
       xray: { running: this.xray.running, pid: this.xray.pid, version: this.xray.version, error: this.xray.error, ports: this.xray.ports.length },
       test: this.testStatus(),
       events: this.events.slice(0, 20),

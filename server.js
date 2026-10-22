@@ -1488,7 +1488,7 @@ async function handleProxy(req, res, url) {
         lastFailureKey = `${upstream.status}|${snippet}`;
         if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
-          const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`);
+          const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`, provider.id);
           rotations += 1;
           console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}${snippet ? ` (${snippet.slice(0, 80)})` : ''}; rotating exit to ${next ? next.id : '?'} and retrying (${rotations}/${rotateMax})`);
           continue;
@@ -1901,6 +1901,14 @@ async function handleAdmin(req, res, url) {
       const res2 = await proxies.apply();
       return sendJson(res, 200, { ok: true, ...res2, snapshot: proxies.snapshot() });
     }
+    if (method === 'POST' && b === 'provider' && c && d === 'rotate-exit') {
+      const provider = findProvider(c);
+      if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+      if (provider.proxy !== 'rotate') return sendJson(res, 409, { error: { message: `provider "${provider.id}" is not using the rotating pool (proxy=${provider.proxy})`, type: 'not_rotating' } });
+      const exit = proxies.rotate('manual (dashboard)', provider.id);
+      return sendJson(res, 200, { ok: !!exit, exit: exit ? { id: exit.id, host: exit.host, exitIp: exit.exitIp, latencyMs: exit.latencyMs } : null });
+    }
+
     if (method === 'POST' && b === 'rotate') {
       const exit = proxies.rotate('manual');
       return sendJson(res, 200, { ok: true, exit: exit ? { id: exit.id, host: exit.host, exitIp: exit.exitIp, latencyMs: exit.latencyMs } : null, index: proxies.index });
@@ -1942,6 +1950,49 @@ async function handleAdmin(req, res, url) {
 
   if (method === 'GET' && a === 'freebuff') {
     return sendJson(res, 200, { ok: true, accounts: freebuff.snapshot() });
+  }
+
+  // freebuff has no API key to paste: the operator approves a device code.
+  if (method === 'POST' && a === 'freebuff' && b === 'login') {
+    const body = await readJsonBody(req);
+    try {
+      const session = await freebuff.startLogin();
+      return sendJson(res, 200, { ok: true, session: { id: session.id, loginUrl: session.loginUrl, expiresAt: session.expiresAt } });
+    } catch (err) {
+      return sendJson(res, 502, { error: { message: err.message, type: 'login_failed' } });
+    }
+  }
+
+  if (method === 'GET' && a === 'freebuff' && b === 'login' && c) {
+    const session = freebuff.logins && freebuff.logins.get(c);
+    if (!session) return sendJson(res, 404, { error: { message: 'login session not found (restart the flow)', type: 'not_found' } });
+    try {
+      const r = await freebuff.pollLogin(session);
+      if (r.token) {
+        const providerId = url.searchParams.get('provider') || '';
+        const accountId = url.searchParams.get('account') || '';
+        const provider = findProvider(providerId);
+        const account = provider && (provider.accounts.find((x) => x.id === accountId) || provider.accounts[0]);
+        if (!provider) return sendJson(res, 400, { error: { message: 'provider query parameter is required', type: 'bad_request' } });
+        if (account) {
+          account.apiKey = r.token;
+          delete account.keyless;
+        } else {
+          provider.accounts.push(normalizeAccount({ name: 'freebuff-login', apiKey: r.token }));
+        }
+        const st = freebuff.accountState(provider.id, (account || provider.accounts[provider.accounts.length - 1]).id);
+        st.needsReauth = false;
+        st.lastError = '';
+        freebuff.logins.delete(c);
+        await saveConfig();
+        await freebuff.save();
+        pushEvent({ kind: 'freebuff-login', pid: provider.id, s: 1 });
+        return sendJson(res, 200, { ok: true, authorized: true, provider: providerSummary(provider) });
+      }
+      return sendJson(res, 200, { ok: true, authorized: false, pending: true, status: r.status, raw: r.raw });
+    } catch (err) {
+      return sendJson(res, 502, { error: { message: err.message, type: 'login_poll_failed' } });
+    }
   }
 
   // One-shot connect flow for the dashboard catalogue: create/update the
