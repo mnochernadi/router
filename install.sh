@@ -266,11 +266,15 @@ fetch_code() {
     fi
     # Hard reset, not pull: a hand-edited file must never leave the box in a
     # state that matches no commit, which is undebuggable.
+    # git refuses a working tree it does not consider ours (root + a checkout
+    # owned by the service user), and the update would silently do nothing.
+    run git config --global --add safe.directory "$INSTALL_DIR"
     run git -C "$INSTALL_DIR" fetch --quiet --prune origin "$BRANCH"
     run git -C "$INSTALL_DIR" checkout --quiet --force "$BRANCH"
     run git -C "$INSTALL_DIR" reset --quiet --hard "origin/$BRANCH"
     say "now at $(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
   elif [ -d "$INSTALL_DIR/.git" ]; then
+    run git config --global --add safe.directory "$INSTALL_DIR"
     run git -C "$INSTALL_DIR" fetch --quiet origin "$BRANCH"
     run git -C "$INSTALL_DIR" reset --quiet --hard "origin/$BRANCH"
   else
