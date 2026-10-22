@@ -1436,18 +1436,28 @@ function isManagedProvider(provider) {
 }
 
 function newManagedAccount(provider) {
-  const n = (state.totals.renewals || 0) + provider.accounts.length + 1;
-  const acc = normalizeAccount({ name: `auto-${n}`, apiKey: '' });
+  const n = (state.totals.renewals || 0) + 1;
+  const acc = normalizeAccount({ name: `identity-${n}`, apiKey: '' });
   acc.keyless = true;
   return acc;
 }
 
 function ensureManagedAccount(provider) {
   if (!isManagedProvider(provider)) return null;
-  const live = (provider.accounts || []).find((a) => a.enabled !== false);
+  provider.accounts = provider.accounts || [];
+  // One identity is the model: it is replaced, not accumulated. Extra rows
+  // from an older build are pruned so the provider page stays honest.
+  if (provider.accounts.length > 1) {
+    const keep = provider.accounts.find((a) => a.enabled !== false) || provider.accounts[0];
+    const ps = providerState(provider.id);
+    for (const a of provider.accounts) if (a.id !== keep.id && ps.accounts) delete ps.accounts[a.id];
+    provider.accounts = [keep];
+    saveConfig().catch(() => {});
+  }
+  const live = provider.accounts.find((a) => a.enabled !== false);
   if (live) return live;
-  const created = (provider.accounts || [])[0] || newManagedAccount(provider);
-  if (!(provider.accounts || []).length) provider.accounts.push(created);
+  const created = provider.accounts[0] || newManagedAccount(provider);
+  if (!provider.accounts.length) provider.accounts.push(created);
   created.enabled = true;
   saveConfig().catch(() => {});
   pushEvent({ kind: 'identity-created', pid: provider.id, aid: created.id });
