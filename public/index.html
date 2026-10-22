@@ -894,22 +894,19 @@
 </div>
 
 <!-- ===================== AUTHORIZE (freebuff device login) ===================== -->
-<div x-show="modal === 'login'" class="fixed inset-0 z-[60] grid place-items-center bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
+<div x-show="modal === 'authorize'" class="fixed inset-0 z-[60] grid place-items-center bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
   <div class="card w-full max-w-md rounded-2xl p-5 fade-in">
     <div class="mb-3 flex items-center gap-2">
       <i data-lucide="log-in" class="h-4 w-4 text-accent"></i>
       <h3 class="text-sm font-semibold text-white" x-text="lf.providerType === 'opencode-free' ? 'OpenCode Console key' : 'Authorize freebuff'"></h3>
       <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
     </div>
-    <template x-if="lf.providerType === 'opencode-free'">
-      <div class="space-y-3 text-[12px] text-slate-300">
+    <div class="space-y-3 text-[12px] text-slate-300" x-show="lf.providerType === 'opencode-free'">
         <p>OpenCode's free tier refuses every non-OpenCode client (<code class="mono">403 FreeTierError</code>) — verified from this server across 7 header sets and both endpoints. It cannot be fixed with a proxy or an account.</p>
         <p>The working path is a Console key: create one at <a class="text-accent underline" href="https://opencode.ai/console" target="_blank">opencode.ai/console</a>, then paste it as the account key. The <code class="mono">*-free</code> models there still cost nothing.</p>
         <p class="text-slate-500">Until then this provider is a model catalogue only.</p>
-      </div>
-    </template>
-    <template x-if="lf.providerType === 'freebuff'">
-      <div class="space-y-3">
+    </div>
+    <div class="space-y-3" x-show="lf.providerType === 'freebuff'">
         <p class="text-[12px] text-slate-300">freebuff has no API key. Open this link, sign in, approve the device, and this page finishes by itself.</p>
         <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2">
           <code class="mono min-w-0 flex-1 truncate text-[11px] text-accent" x-text="lf.url || 'asking freebuff…'"></code>
@@ -918,8 +915,11 @@
         <p class="text-[11px]" :class="lf.error ? 'text-rose-400' : 'text-slate-500'" x-text="lf.error || lf.status"></p>
         <button class="btn btn-primary w-full justify-center" @click="pollFreebuffLogin()" x-show="lf.session && !lf.done">
           <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>I approved it — check now</button>
-      </div>
-    </template>
+      <p class="text-[11px] text-slate-500" x-show="!lf.url && !lf.error">Asking freebuff for a login link…</p>
+    </div>
+    <div class="space-y-3" x-show="!lf.providerType">
+      <p class="text-[12px] text-slate-300">Open a provider page and press its authorize button.</p>
+    </div>
   </div>
 </div>
 
@@ -1440,7 +1440,7 @@ function app() {
     lf: { providerType: '', provider: '', account: '', session: '', url: '', status: '', error: '', done: false },
     async startFreebuffLogin(p) {
       this.lf = { providerType: p.type, provider: p.id, account: (p.accounts[0] || {}).id || '', session: '', url: '', status: '', error: '', done: false };
-      this.modal = 'login';
+      this.modal = 'authorize';
       this.refreshIcons();
       if (p.type !== 'freebuff') return;
       try {
@@ -1452,6 +1452,10 @@ function app() {
       } catch (err) { this.lf.error = err.message; }
     },
     async pollFreebuffLogin(silent) {
+      if (this.modal !== 'authorize') {
+        if (this.pollTimer2) { clearInterval(this.pollTimer2); this.pollTimer2 = null; }
+        return;
+      }
       if (!this.lf.session) return;
       try {
         const q = `?provider=${encodeURIComponent(this.lf.provider)}&account=${encodeURIComponent(this.lf.account)}`;
@@ -1462,7 +1466,8 @@ function app() {
           if (this.pollTimer2) { clearInterval(this.pollTimer2); this.pollTimer2 = null; }
           this.toast('freebuff authorized', 'ok');
           await this.load(true);
-          setTimeout(() => { this.modal = null; }, 900);
+          if (this.pollTimer2) { clearInterval(this.pollTimer2); this.pollTimer2 = null; }
+          setTimeout(() => { this.modal = null; }, 1200);
         } else if (!silent) {
           this.lf.status = 'still waiting — approve the link, then check again';
         }
