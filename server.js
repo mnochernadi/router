@@ -71,7 +71,15 @@ const PROVIDER_TYPES = {
   // Free tier lives on /inference/v1 (v2). It needs the attested client
   // identity: Bearer public, the v2 UA, x-opencode-session and the built-in
   // tool quartet -- see the adapter below, ported from 9Router's opencode.js.
-  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/inference/v1', style: 'opencode-free', keyless: true },
+  'opencode-free': {
+    label: 'OpenCode Free (no key)',
+    baseUrl: 'https://opencode.ai/inference/v1',
+    style: 'opencode-free',
+    keyless: true,
+    // Accounts here are identities, not credentials: the router creates,
+    // replaces and deletes them itself. Manual add is refused.
+    manageAccounts: true,
+  },
   // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
   // The driver owns the whole handshake, so this style always wants a proxy exit.
   freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff', keyOptional: true },
@@ -363,7 +371,7 @@ function findProvider(id) {
 let state = {
   version: 1,
   startedAt: now(),
-  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0 },
+  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0 },
   providers: {},
   events: [],
   mem: { rss: 0, heapUsed: 0, samples: [] },
@@ -635,6 +643,7 @@ function providerSummary(provider) {
     hasCustomHeaders: !!provider.headers,
     hasModelStyles: !!provider.modelStyles,
     rotateEveryMinutes: Number(provider.rotateEveryMinutes) || 0,
+    managed: isManagedProvider(provider),
     // The dashboard reads this to render the "rotating exits" pill and to seed
     // the edit form; without it an edit silently saved `proxy: 'direct'`.
     proxy: provider.proxy || 'direct',
@@ -1413,6 +1422,57 @@ function inboundKey(req, url) {
   try { return String((url && url.searchParams.get('key')) || '').trim(); } catch { return ''; }
 }
 
+// ---------------------------------------------------------------------------
+// Self-managed provider identities (opencode-free)
+// ---------------------------------------------------------------------------
+// The free tier has no credential: an "account" is an identity holder whose
+// quota lives in its session id and its source IP. When one is exhausted the
+// router drops it, mints a new one and retries - the operator never adds an
+// account and never waits for a cooldown.
+const MANAGED_MAX_RENEWALS = 4;
+
+function isManagedProvider(provider) {
+  return !!(PROVIDER_TYPES[provider && provider.type] || {}).manageAccounts;
+}
+
+function newManagedAccount(provider) {
+  const n = (state.totals.renewals || 0) + provider.accounts.length + 1;
+  const acc = normalizeAccount({ name: `auto-${n}`, apiKey: '' });
+  acc.keyless = true;
+  return acc;
+}
+
+function ensureManagedAccount(provider) {
+  if (!isManagedProvider(provider)) return null;
+  const live = (provider.accounts || []).find((a) => a.enabled !== false);
+  if (live) return live;
+  const created = (provider.accounts || [])[0] || newManagedAccount(provider);
+  if (!(provider.accounts || []).length) provider.accounts.push(created);
+  created.enabled = true;
+  saveConfig().catch(() => {});
+  pushEvent({ kind: 'identity-created', pid: provider.id, aid: created.id });
+  return created;
+}
+
+/** Drop an exhausted identity and mint a replacement (new session, new exit). */
+function renewManagedIdentity(provider, oldAccount, reason) {
+  const idx = (provider.accounts || []).findIndex((a) => a.id === oldAccount.id);
+  if (idx !== -1) provider.accounts.splice(idx, 1);
+  const ps = providerState(provider.id);
+  if (ps.accounts) delete ps.accounts[oldAccount.id];
+  const fresh = newManagedAccount(provider);
+  provider.accounts.push(fresh);
+  state.totals.renewals = (state.totals.renewals || 0) + 1;
+  // the old session is gone with its account, so the next request signs with a new one
+  const as = accountState(provider.id, fresh.id);
+  as.sessionId = '';
+  pushEvent({ kind: 'renew', pid: provider.id, aid: fresh.id, reason });
+  console.warn(`[proxy] ${provider.id}: identity ${oldAccount.name} exhausted (${reason}); replaced with ${fresh.name}, session and exit reset`);
+  saveConfig().catch(() => {});
+  persistState();
+  return fresh;
+}
+
 async function handleProxy(req, res, url) {
   const t0 = now();
   state.totals.requests += 1;
@@ -1486,16 +1546,17 @@ async function handleProxy(req, res, url) {
     ctx.responseStyle = 'openai';
   }
 
+  if (isManagedProvider(provider)) ensureManagedAccount(provider);
   const tried = new Set();
   const maxAttempts = provider.maxAttempts > 0 ? provider.maxAttempts : Math.max(1, (provider.accounts || []).length);
   let sawLimit = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const account = selectAccount(provider, tried);
+    let account = selectAccount(provider, tried);
     if (!account) break;
     tried.add(account.id);
+    let renewals = 0;
 
-    const as = accountState(provider.id, account.id);
     const rotateWanted = provider.proxy === 'rotate' && !!proxies && proxies.state.settings.enabled;
     const rotateMax = rotateWanted ? Math.max(0, Number(proxies.state.settings.rotateAttempts) || 0) : 0;
     let rotations = 0;
@@ -1507,6 +1568,7 @@ async function handleProxy(req, res, url) {
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
     for (;;) {
+      const as = accountState(provider.id, account.id);
       as.requests = (as.requests || 0) + 1;
       as.lastUsed = now();
       openWindow(provider, account);
@@ -1545,6 +1607,15 @@ async function handleProxy(req, res, url) {
         // exit (policy gate, bad model handle): stop burning the pool.
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
+        if (isManagedProvider(provider) && renewals < MANAGED_MAX_RENEWALS) {
+          // Exhausted identity: drop it, mint a new one (fresh session) and move
+          // this provider to a new exit. No cooldown is applied at all.
+          const fresh = renewManagedIdentity(provider, account, `HTTP ${upstream.status}`);
+          renewals += 1;
+          if (proxies && proxies.activeExits().length > 1) proxies.rotate(`renewal after ${upstream.status}`, provider.id);
+          account = fresh;
+          continue;
+        }
         const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
         if (freeTier && kind === 'quota' && rotations < Math.max(1, rotateMax)) {
           // The free tier accounts quota per session, so a new session is a new
@@ -1970,6 +2041,9 @@ async function handleAdmin(req, res, url) {
   if (method === 'POST' && a === 'provider' && b && c === 'accounts') {
     const provider = findProvider(b);
     if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+    if (isManagedProvider(provider)) {
+      return sendJson(res, 409, { error: { message: `provider "${provider.id}" manages its own identities; it replaces them automatically when one is exhausted`, type: 'accounts_managed' } });
+    }
     const body = await readJsonBody(req);
     const incoming = Array.isArray(body.accounts) ? body.accounts : [body];
     // Keyless providers (OpenCode Free, freebuff before its token is pasted,
@@ -2069,6 +2143,16 @@ async function handleAdmin(req, res, url) {
       const res2 = await proxies.apply();
       return sendJson(res, 200, { ok: true, ...res2, snapshot: proxies.snapshot() });
     }
+    if (method === 'POST' && b === 'provider' && c && d === 'renew') {
+      const provider = findProvider(c);
+      if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+      if (!isManagedProvider(provider)) return sendJson(res, 409, { error: { message: `provider "${provider.id}" does not manage its identities`, type: 'not_managed' } });
+      const old = (provider.accounts || [])[0];
+      const fresh = old ? renewManagedIdentity(provider, old, 'manual') : ensureManagedAccount(provider);
+      await saveConfig();
+      return sendJson(res, 200, { ok: true, account: fresh ? accountSummary(provider, fresh) : null });
+    }
+
     if (method === 'POST' && b === 'provider' && c && d === 'rotate-exit') {
       const provider = findProvider(c);
       if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
@@ -2172,6 +2256,11 @@ async function handleAdmin(req, res, url) {
     const p = normalizeProvider(existing ? { ...existing, ...incoming, accounts: existing.accounts, id: existing.id } : incoming);
     touchProvider(p);
     const def = PROVIDER_TYPES[p.type] || PROVIDER_TYPES.custom;
+    if (def.manageAccounts) {
+      if (!(p.accounts || []).length) { const acc = newManagedAccount(p); p.accounts.push(acc); }
+      await saveConfig();
+      return sendJson(res, existing ? 200 : 201, { ok: true, provider: providerSummary(p), account: p.accounts[0] ? accountSummary(p, p.accounts[0]) : null });
+    }
     const cred = String((body.account && body.account.apiKey) || '').trim();
     const givenName = String((body.account && body.account.name) || '').trim();
     let account = null;

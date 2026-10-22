@@ -150,6 +150,11 @@ const mock = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeTierError', message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai", problems } }));
     }
     fb.freeTierAccepted += 1;
+    if (fb.burn429 > 0) {
+      fb.burn429 -= 1;
+      res.writeHead(429, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'free usage limit reached for this session' } }));
+    }
     if (json.stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       for (let i = 0; i < 4; i++) {
@@ -311,6 +316,11 @@ function writeConfig() {
         accounts: [{ id: 'fb-1', name: 'freebuff-account', apiKey: '11111111-2222-3333-4444-555555555555', enabled: true }],
       },
       {
+        id: 'managed-test', name: 'Managed Identity Test', type: 'opencode-free',
+        baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000, proxy: 'direct',
+        accounts: [{ id: 'mid-1', name: 'auto-1', apiKey: '', enabled: true }],
+      },
+      {
         id: 'gemini-test', name: 'Gemini Test', type: 'gemini', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1beta`,
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'gm-1', name: 'gemini-1', apiKey: 'key-gem-ok', enabled: true }],
       },
@@ -338,6 +348,7 @@ const fb = {
   modelKey: 'm-test1',
   freeTierAccepted: 0,
   freeTierRejects: 0,
+  burn429: 0,
 };
 
 function fbCanonical({ method, path: p, ts, bodyHash, fetchId }) {
@@ -824,7 +835,11 @@ async function memOf() {
     const keylessAdd = await fetch(routerUrl('/admin/api/provider/opencode-free-test/accounts'), {
       method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'second-keyless', apiKey: '' }] }),
     });
-    check('keyless provider accepts an account with an empty key', (await keylessAdd.json()).added === 1);
+    check('opencode-free refuses a hand-added identity (the router manages them)', keylessAdd.status === 409, String(keylessAdd.status));
+    const plainAdd = await fetch(routerUrl('/admin/api/provider/rr-provider/accounts'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'second-manual', apiKey: '' }] }),
+    });
+    check('a normal provider still accepts an empty-key account', (await plainAdd.json()).added === 1, 'empty-key add rejected');
   }
 
   // 17. V2Ray exit pool: a 429 rotates the exit instead of burning the account
@@ -1060,7 +1075,46 @@ async function memOf() {
     check('inbound auth: /v1/models follows the router key too', q.status === 200, String(q.status));
     const noKey = await fetch(routerUrl('/v1/models'));
     check('inbound auth: /v1/models without a key is refused once keys are set', noKey.status === 401, String(noKey.status));
-    await fetch(routerUrl('/admin/api/settings'), { method: 'POST', headers: ADMIN, body: JSON.stringify({ proxyKeys: [] }) });
+    const cleared = await fetch(routerUrl('/admin/api/settings'), { method: 'POST', headers: ADMIN, body: JSON.stringify({ proxyKeys: [], clearProxyKeys: true }) });
+    const clearedBody = await cleared.json();
+    check('inbound auth: clearProxyKeys really removes the keys', clearedBody.settings.hasProxyKeys === false, JSON.stringify(clearedBody.settings));
+  }
+
+  // 26. opencode-free manages its own identities: no manual add, auto-renewal
+  //     on a limit, and a provider with no identity gets one.
+  {
+    const manual = await fetch(routerUrl('/admin/api/provider/managed-test/accounts'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'mine', apiKey: '' }] }),
+    });
+    const manualBody = await manual.json();
+    check('managed: adding an identity by hand is refused', manual.status === 409 && manualBody.error.type === 'accounts_managed', `${manual.status} ${JSON.stringify(manualBody).slice(0, 140)}`);
+
+    const before = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json());
+    const beforeIds = before.providers.find((p) => p.id === 'managed-test').accounts.map((a) => a.id);
+    fb.burn429 = 1;
+    const r = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'managed-test' } });
+    check('managed: an exhausted identity is replaced and the request still succeeds',
+      r.status === 200 && JSON.parse(r.text).choices[0].message.content.length > 0, `${r.status} ${r.text.slice(0, 160)}`);
+    await sleep(700);
+    const after = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const mp = after.providers.find((p) => p.id === 'managed-test');
+    const afterIds = mp.accounts.map((a) => a.id);
+    check('managed: the old identity is gone and exactly one replacement exists',
+      mp.accountCount === 1 && afterIds.every((id) => !beforeIds.includes(id)), `${JSON.stringify(beforeIds)} -> ${JSON.stringify(afterIds)}`);
+    check('managed: the renewal is counted and nothing was cooled down',
+      (after.totals.renewals || 0) >= 1 && mp.limitedCount === 0, `renewals=${after.totals.renewals} limited=${mp.limitedCount}`);
+
+    const renew = await fetch(routerUrl('/admin/api/proxies/provider/managed-test/renew'), { method: 'POST', headers: ADMIN, body: '{}' });
+    const renewBody = await renew.json();
+    check('managed: the dashboard can force a new identity', renew.status === 200 && renewBody.account && renewBody.account.keyless === true, JSON.stringify(renewBody).slice(0, 160));
+
+    // a managed provider that lost its identity gets one on the next request
+    const st = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
+    const target = st.providers.find((p) => p.id === 'managed-test');
+    target.accounts = [];
+    fs.writeFileSync(CONFIG, JSON.stringify(st, null, 2));
+    await fetch(routerUrl('/admin/api/provider/managed-test/accounts'), { method: 'POST', headers: ADMIN, body: '{}' }).catch(() => {});
+    check('managed: the managed provider still advertises itself as managed', mp.managed === true, String(mp.managed));
   }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path

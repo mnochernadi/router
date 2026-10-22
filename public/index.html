@@ -178,6 +178,8 @@
               <h2 class="truncate text-sm font-semibold text-white" x-text="p.name"></h2>
               <span class="pill bg-ink-800 text-slate-400" x-text="p.type"></span>
               <span x-show="p.id === s.defaultProvider" class="pill bg-violet-500/10 text-violet-300">default</span>
+              <span x-show="p.managed" class="pill bg-emerald-500/10 text-emerald-300" title="The router creates, replaces and deletes this provider's identities itself">
+                <i data-lucide="dna" class="h-3 w-3"></i>auto-managed</span>
               <span x-show="p.rotateEveryMinutes > 0" class="pill bg-violet-500/10 text-violet-300" x-text="'swap every ' + p.rotateEveryMinutes + 'm'"></span>
               <span x-show="p.proxy && p.proxy !== 'direct'" class="pill bg-accent/10 text-accent">
                 <i data-lucide="waypoints" class="h-3 w-3"></i><span x-text="p.proxy === 'rotate' ? 'rotating exits' : ('exit ' + p.proxy)"></span>
@@ -196,7 +198,9 @@
             <button class="btn" x-show="p.proxy === 'rotate'" @click="nextExit(p)" title="Switch this provider to the next exit now">
               <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Next IP</button>
             <button class="btn" @click="openModels(p)" title="List the models this provider serves"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
-            <button class="btn" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
+            <button class="btn" x-show="p.managed" @click="renewIdentity(p)" title="Replace the identity now (new session + new exit)">
+              <i data-lucide="dna" class="h-3.5 w-3.5"></i>New identity</button>
+            <button class="btn" x-show="!p.managed" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
             <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
             <button class="btn btn-danger" @click="deleteProvider(p)" title="Delete provider"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
           </div>
@@ -856,7 +860,8 @@
       <button class="btn btn-primary ml-auto" x-show="pd && (pd.type === 'freebuff' || pd.type === 'opencode-free')" @click="startFreebuffLogin(pd)">
         <i data-lucide="log-in" class="h-3.5 w-3.5"></i><span x-text="pd && pd.type === 'freebuff' ? 'Authorize freebuff' : 'Get a Console key'"></span></button>
       <button class="btn" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
-      <button class="btn" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
+      <button class="btn" x-show="pd && pd.managed" @click="renewIdentity(pd)"><i data-lucide="dna" class="h-3.5 w-3.5"></i>New identity</button>
+      <button class="btn" x-show="pd && !pd.managed" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
       <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
       <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
     </div>
@@ -885,7 +890,8 @@
       </template>
       <template x-if="pd && !pd.accounts.length">
         <div class="rounded-xl border border-dashed border-ink-600 px-3 py-6 text-center text-xs text-slate-500">
-          <span x-show="pd.type === 'opencode-free' || pd.type === 'freebuff'">This provider works without a credential — nothing to add.</span>
+          <span x-show="pd.type === 'opencode-free'">This provider manages its own identity: accounts are created and replaced automatically, you cannot add one.</span>
+          <span x-show="pd.type === 'freebuff'">This provider works without a credential — authorize it instead of adding an account.</span>
           <span x-show="pd.type !== 'opencode-free' && pd.type !== 'freebuff'">No accounts yet — click <span class="text-slate-300">Add account</span>.</span>
         </div>
       </template>
@@ -1023,7 +1029,7 @@ const TYPES = {
 // optional = works without one (local servers, or paste it later).
 const CATALOG = [
   { group: 'Free', key: 'opencode-free', type: 'opencode-free', label: 'OpenCode Free', icon: 'terminal',
-    blurb: 'model catalogue only — the free API refuses non-OpenCode clients from any IP', keyMode: 'none',
+    blurb: 'free models, no key — the router mints and replaces the identity itself', keyMode: 'none',
     baseUrl: 'https://opencode.ai/zen/v1', strategy: 'round-robin', proxy: 'rotate',
     note: 'The free list changes over time — use Models to see what is live right now. Rotating exits help if you hit per-IP limits.' },
 
@@ -1472,6 +1478,14 @@ function app() {
           this.lf.status = 'still waiting — approve the link, then check again';
         }
       } catch (err) { this.lf.error = err.message; if (!silent) this.lf.status = ''; }
+    },
+    async renewIdentity(p) {
+      try {
+        const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/renew', { method: 'POST', body: {} });
+        this.toast(r.account ? `${p.id}: new identity ${r.account.name}` : 'No identity to renew', r.account ? 'ok' : 'warn');
+        await this.load(true);
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
     },
     async nextExit(p) {
       try {
