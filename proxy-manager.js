@@ -339,7 +339,9 @@ class ProxyManager {
       this.state.updatedAt = raw.updatedAt || 0;
     } catch { /* first boot */ }
     // Anything measured by an older schema is untested, not 'ok'.
-    for (const e of this.state.exits) if (e.status === 'ok' && e.testedBy !== TELEMETRY_SCHEMA) e.status = 'untested';
+    for (const e of this.state.exits) {
+      if ((e.status === 'ok' || e.status === 'leak') && e.testedBy !== TELEMETRY_SCHEMA) e.status = 'untested';
+    }
     this.state.active = this.state.active.filter((id) => {
       const e = this.state.exits.find((x) => x.id === id);
       return e && e.status === 'ok' && e.testedBy === TELEMETRY_SCHEMA;
