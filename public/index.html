@@ -120,7 +120,7 @@
       </div>
       <button class="btn" @click="load(true)" title="Refresh now"><i data-lucide="refresh-cw" class="h-3.5 w-3.5" :class="busy && 'animate-spin'"></i></button>
       <button class="btn" @click="openSettings()" title="Router settings"><i data-lucide="settings" class="h-3.5 w-3.5"></i></button>
-      <button class="btn btn-primary" @click="openProvider(null)"><i data-lucide="plus" class="h-3.5 w-3.5"></i>Provider</button>
+      <button class="btn btn-primary" @click="openCatalog()"><i data-lucide="layout-grid" class="h-3.5 w-3.5"></i>Connect provider</button>
     </div>
   </div>
 </header>
@@ -167,8 +167,8 @@
   <div class="grid grid-cols-1 gap-5 xl:grid-cols-2">
     <template x-for="p in (s.providers || [])" :key="p.id">
       <section class="card fade-in rounded-2xl p-4">
-        <!-- provider header -->
-        <div class="flex flex-wrap items-start gap-3">
+        <!-- provider header: clicking opens this provider's page -->
+        <div class="flex cursor-pointer flex-wrap items-start gap-3 rounded-xl transition-colors hover:bg-ink-850/40" @click="openProviderDetail(p)" title="Open provider page">
           <div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-ink-600 bg-ink-850">
             <i :data-lucide="providerIcon(p.type)" class="h-4.5 w-4.5 text-accent"></i>
           </div>
@@ -190,7 +190,7 @@
             <button :class="p.strategy === 'sequential' && 'on'" @click="setStrategy(p, 'sequential')">Sequential</button>
           </div>
 
-          <div class="flex items-center gap-1.5">
+          <div class="flex items-center gap-1.5" @click.stop>
             <button class="btn" @click="openModels(p)" title="List the models this provider serves"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
             <button class="btn" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
             <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
@@ -677,6 +677,192 @@
   </div>
 </div>
 
+<!-- ===================== PROVIDER CATALOGUE (click a provider → its page) ===================== -->
+<div x-show="modal === 'catalog'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-6 w-full max-w-3xl rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-2">
+      <i data-lucide="layout-grid" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white">Connect a provider</h3>
+      <span class="pill bg-ink-800 text-slate-400" x-text="(s.providers || []).length + ' connected'"></span>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+    <input class="input mono mb-4" x-model="catFilter" placeholder="search providers…" />
+    <div class="max-h-[70vh] space-y-5 overflow-y-auto pr-1">
+      <template x-for="g in catalogGroups()" :key="g.name">
+        <div>
+          <div class="mb-2 flex items-center gap-2">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-500" x-text="g.name"></span>
+            <span class="h-px flex-1 bg-ink-700"></span>
+          </div>
+          <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
+            <template x-for="c in g.items" :key="c.key">
+              <button class="group flex items-start gap-3 rounded-xl border border-ink-700 bg-ink-900/60 p-3 text-left transition-colors hover:border-accent/60 hover:bg-ink-850"
+                      @click="chooseProvider(c)">
+                <span class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-ink-600 bg-ink-850 group-hover:border-accent/40">
+                  <i :data-lucide="c.icon" class="h-4 w-4 text-accent"></i>
+                </span>
+                <span class="min-w-0 flex-1">
+                  <span class="flex items-center gap-1.5">
+                    <span class="truncate text-[13px] font-medium text-white" x-text="c.label"></span>
+                    <span class="pill shrink-0" :class="keyBadgeClass(c)" x-text="keyBadge(c)"></span>
+                  </span>
+                  <span class="mt-0.5 block text-[11px] leading-snug text-slate-500" x-text="c.blurb"></span>
+                </span>
+              </button>
+            </template>
+          </div>
+        </div>
+      </template>
+      <template x-if="!catalogGroups().length">
+        <p class="px-2 py-8 text-center text-xs text-slate-500">No provider matches that search.</p>
+      </template>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== PROVIDER SETUP PAGE ===================== -->
+<div x-show="modal === 'connect'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-6 w-full max-w-xl rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-3">
+      <span class="grid h-10 w-10 place-items-center rounded-xl border border-accent/30 bg-accent/10">
+        <i :data-lucide="cf.icon" class="h-5 w-5 text-accent"></i>
+      </span>
+      <div class="mr-auto min-w-0">
+        <h3 class="truncate text-sm font-semibold text-white" x-text="'Connect ' + cf.label"></h3>
+        <p class="text-[11px] text-slate-500" x-text="cf.blurb"></p>
+      </div>
+      <span class="pill" :class="keyBadgeClass(cf)" x-text="keyBadge(cf)"></span>
+      <button class="text-slate-500 hover:text-white" @click="modal = 'catalog'"><i data-lucide="arrow-left" class="h-4 w-4"></i></button>
+    </div>
+
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div>
+        <label class="fld">Name</label>
+        <input class="input" x-model="cf.name" />
+      </div>
+      <div>
+        <label class="fld">Provider ID</label>
+        <input class="input mono" x-model="cf.id" />
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Base URL</label>
+        <input class="input mono" x-model="cf.baseUrl" />
+      </div>
+
+      <div class="sm:col-span-2" x-show="cf.keyMode !== 'none'">
+        <label class="fld" x-text="cf.keyMode === 'token' ? 'Account token' : 'API key'"></label>
+        <input class="input mono" type="password" x-model="cf.apiKey"
+               :placeholder="cf.keyMode === 'token' ? 'paste the token now, or leave empty and add it later' : 'sk-… (leave empty to add later)'" />
+        <p class="mt-1 text-[11px] text-slate-500" x-show="cf.keyHint" x-text="cf.keyHint"></p>
+      </div>
+      <div class="sm:col-span-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-[11px] text-accent" x-show="cf.keyMode === 'none'">
+        No credential needed — save it and start routing. You can still add named accounts later.
+      </div>
+
+      <div>
+        <label class="fld">Strategy</label>
+        <select class="input" x-model="cf.strategy">
+          <option value="round-robin">Round-robin</option>
+          <option value="sequential">Sequential</option>
+        </select>
+      </div>
+      <div>
+        <label class="fld">Outbound proxy</label>
+        <select class="input" x-model="cf.proxy">
+          <option value="direct">Direct</option>
+          <option value="rotate">Rotate the exit pool</option>
+          <template x-for="e in (np ? np.exits.filter(x => x.status === 'ok') : [])" :key="e.id">
+            <option :value="e.id" x-text="'exit ' + e.id + ' · ' + (e.exitIp || e.host)"></option>
+          </template>
+        </select>
+      </div>
+      <div class="sm:col-span-2" x-show="cf.note">
+        <div class="rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-200" x-text="cf.note"></div>
+      </div>
+    </div>
+
+    <p class="mt-3 text-[11px] text-rose-400" x-show="cf.error" x-text="cf.error"></p>
+
+    <div class="mt-5 flex flex-wrap items-center gap-2">
+      <button class="btn" @click="modal = 'catalog'"><i data-lucide="arrow-left" class="h-3.5 w-3.5"></i>Back</button>
+      <button class="btn ml-auto" @click="testConnectModels()" :disabled="cf.testing">
+        <i data-lucide="list" class="h-3.5 w-3.5"></i><span x-text="cf.testing ? 'Checking…' : 'Check models'"></span></button>
+      <button class="btn btn-primary" @click="saveConnect()"><i data-lucide="plug" class="h-3.5 w-3.5"></i>Connect</button>
+    </div>
+    <p class="mt-2 text-[11px] text-slate-500" x-show="cf.models.length" x-text="cf.models.length + ' models: ' + cf.models.slice(0, 6).join(', ') + (cf.models.length > 6 ? ' …' : '')"></p>
+  </div>
+</div>
+
+<!-- ===================== PROVIDER DETAIL PAGE ===================== -->
+<div x-show="modal === 'pdetail'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/85 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-6 w-full max-w-2xl rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex flex-wrap items-center gap-3">
+      <span class="grid h-10 w-10 place-items-center rounded-xl border border-ink-600 bg-ink-850">
+        <i :data-lucide="providerIcon(pd && pd.type)" class="h-5 w-5 text-accent"></i>
+      </span>
+      <div class="mr-auto min-w-0">
+        <h3 class="truncate text-sm font-semibold text-white" x-text="pd && pd.name"></h3>
+        <p class="mono truncate text-[11px] text-slate-500" x-text="pd && (pd.id + ' · ' + pd.type + ' · ' + pd.baseUrl)"></p>
+      </div>
+      <span class="pill bg-ink-800 text-slate-400" x-text="pd ? pd.strategy : ''"></span>
+      <span class="pill bg-accent/10 text-accent" x-show="pd && pd.proxy && pd.proxy !== 'direct'" x-text="pd && (pd.proxy === 'rotate' ? 'rotating exits' : 'exit ' + pd.proxy)"></span>
+      <button class="text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+
+    <div class="mb-4 grid grid-cols-3 gap-2 text-center">
+      <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-2">
+        <div class="mono text-sm font-semibold text-white" x-text="pd ? pd.accountCount : 0"></div>
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">accounts</div>
+      </div>
+      <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-2">
+        <div class="mono text-sm font-semibold text-emerald-300" x-text="pd ? pd.activeCount : 0"></div>
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">healthy</div>
+      </div>
+      <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-2">
+        <div class="mono text-sm font-semibold text-rose-300" x-text="pd ? pd.limitedCount : 0"></div>
+        <div class="text-[10px] uppercase tracking-wider text-slate-500">cooling</div>
+      </div>
+    </div>
+
+    <div class="mb-2 flex flex-wrap items-center gap-2">
+      <span class="text-[11px] uppercase tracking-wider text-slate-500">Accounts</span>
+      <button class="btn ml-auto" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
+      <button class="btn" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
+      <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
+      <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
+    </div>
+
+    <div class="max-h-72 space-y-2 overflow-y-auto pr-1">
+      <template x-for="a in (pd ? pd.accounts : [])" :key="a.id">
+        <div class="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-ink-700 bg-ink-900/50 p-2.5">
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center gap-2">
+              <span class="truncate text-[13px] text-slate-100" x-text="a.name"></span>
+              <span x-show="a.limitedUntil > 0" class="pill bg-rose-500/10 text-rose-300">limited</span>
+              <span x-show="a.limitedUntil === 0 && a.enabled" class="pill bg-emerald-500/10 text-emerald-300">active</span>
+              <span x-show="a.keyless" class="pill bg-amber-500/10 text-amber-300">no key</span>
+            </div>
+            <div class="mono mt-0.5 flex flex-wrap gap-x-3 text-[11px] text-slate-500">
+              <span x-text="a.maskedKey || 'no credential'"></span>
+              <span x-text="num(a.requests) + ' req'"></span>
+              <span x-show="a.limitedUntil > 0" x-text="countdown(a.limitedUntil)"></span>
+            </div>
+          </div>
+          <button class="btn" x-show="a.limitedUntil > 0" @click="resetAccount(pd, a)"><i data-lucide="zap" class="h-3.5 w-3.5"></i>Reset</button>
+          <button class="btn" @click="openAccount(pd, a)"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
+          <button class="btn btn-danger" @click="deleteAccount(pd, a)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
+        </div>
+      </template>
+      <template x-if="pd && !pd.accounts.length">
+        <div class="rounded-xl border border-dashed border-ink-600 px-3 py-6 text-center text-xs text-slate-500">
+          <span x-show="pd.type === 'opencode-free' || pd.type === 'freebuff'">This provider works without a credential — nothing to add.</span>
+          <span x-show="pd.type !== 'opencode-free' && pd.type !== 'freebuff'">No accounts yet — click <span class="text-slate-300">Add account</span>.</span>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== SETTINGS MODAL ===================== -->
 <div x-show="modal === 'settings'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
   <div class="card my-8 w-full max-w-lg rounded-2xl p-5 fade-in">
@@ -766,6 +952,57 @@ const TYPES = {
   custom:     { label: 'OpenAI-compatible',      baseUrl: '',                                              style: 'openai',    icon: 'plug' },
 };
 
+// Provider catalogue: what the dashboard offers, grouped the way 9Router does.
+// keyMode: none = no credential at all, key = API key, token = account token,
+// optional = works without one (local servers, or paste it later).
+const CATALOG = [
+  { group: 'Free', key: 'opencode-free', type: 'opencode-free', label: 'OpenCode Free', icon: 'terminal',
+    blurb: '80+ models at opencode.ai, no signup and no key', keyMode: 'none',
+    baseUrl: 'https://opencode.ai/zen/v1', strategy: 'round-robin', proxy: 'rotate',
+    note: 'The free list changes over time — use Models to see what is live right now. Rotating exits help if you hit per-IP limits.' },
+
+  { group: 'Free with account', key: 'freebuff', type: 'freebuff', label: 'freebuff (Codebuff)', icon: 'bird',
+    blurb: 'Free coding models from the freebuff desktop app', keyMode: 'token', optional: true,
+    baseUrl: 'https://www.codebuff.com', strategy: 'round-robin', proxy: 'rotate',
+    keyHint: 'Paste the 36-character account token from the freebuff app. You can add it later — calls start once it is set.',
+    note: 'Blocked-country egress (IR included) is reset by the service. Assign "Rotate the exit pool" so requests leave from a working IP.' },
+
+  { group: 'API key', key: 'openai', type: 'openai', label: 'OpenAI', icon: 'sparkles',
+    blurb: 'gpt-4o, gpt-4.1, o-series', keyMode: 'key', baseUrl: 'https://api.openai.com/v1' },
+  { group: 'API key', key: 'openrouter', type: 'openrouter', label: 'OpenRouter', icon: 'shuffle',
+    blurb: 'hundreds of models behind one key', keyMode: 'key', baseUrl: 'https://openrouter.ai/api/v1' },
+  { group: 'API key', key: 'anthropic', type: 'anthropic', label: 'Anthropic', icon: 'brain',
+    blurb: 'Claude models, messages API', keyMode: 'key', baseUrl: 'https://api.anthropic.com/v1' },
+  { group: 'API key', key: 'gemini', type: 'gemini', label: 'Google Gemini', icon: 'gem',
+    blurb: 'Gemini via the Google AI API', keyMode: 'key', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' },
+  { group: 'API key', key: 'opencode', type: 'opencode', label: 'OpenCode Console', icon: 'terminal',
+    blurb: 'Paid + free OpenCode models, one account, four wire formats', keyMode: 'key',
+    baseUrl: 'https://opencode.ai/inference',
+    note: 'Each model family is routed to the right OpenCode endpoint automatically (messages / google / responses / chat).' },
+  { group: 'API key', key: 'groq', type: 'custom', id: 'groq', label: 'Groq', icon: 'zap',
+    blurb: 'very fast Llama / Kimi / GPT-OSS', keyMode: 'key', baseUrl: 'https://api.groq.com/openai/v1' },
+  { group: 'API key', key: 'deepseek', type: 'custom', id: 'deepseek', label: 'DeepSeek', icon: 'waves',
+    blurb: 'deepseek-chat / reasoner', keyMode: 'key', baseUrl: 'https://api.deepseek.com/v1' },
+  { group: 'API key', key: 'xai', type: 'custom', id: 'xai', label: 'xAI Grok', icon: 'rocket',
+    blurb: 'grok models', keyMode: 'key', baseUrl: 'https://api.x.ai/v1' },
+  { group: 'API key', key: 'mistral', type: 'custom', id: 'mistral', label: 'Mistral', icon: 'wind',
+    blurb: 'mistral-large, codestral', keyMode: 'key', baseUrl: 'https://api.mistral.ai/v1' },
+  { group: 'API key', key: 'together', type: 'custom', id: 'together', label: 'Together AI', icon: 'boxes',
+    blurb: 'open models, OpenAI-compatible', keyMode: 'key', baseUrl: 'https://api.together.xyz/v1' },
+
+  { group: 'Local / custom', key: 'ollama', type: 'custom', id: 'ollama-local', label: 'Ollama (local)', icon: 'hard-drive',
+    blurb: 'http://127.0.0.1:11434/v1 — no key', keyMode: 'none', baseUrl: 'http://127.0.0.1:11434/v1', strategy: 'sequential' },
+  { group: 'Local / custom', key: 'lmstudio', type: 'custom', id: 'lmstudio-local', label: 'LM Studio (local)', icon: 'monitor',
+    blurb: 'http://127.0.0.1:1234/v1 — no key', keyMode: 'none', baseUrl: 'http://127.0.0.1:1234/v1', strategy: 'sequential' },
+  { group: 'Local / custom', key: 'vllm', type: 'custom', id: 'vllm-local', label: 'vLLM / llama.cpp (local)', icon: 'server',
+    blurb: 'http://127.0.0.1:8000/v1 — no key', keyMode: 'none', baseUrl: 'http://127.0.0.1:8000/v1', strategy: 'sequential' },
+  { group: 'Local / custom', key: 'custom', type: 'custom', label: 'Any OpenAI-compatible endpoint', icon: 'plug',
+    blurb: 'a gateway, a proxy, your own box', keyMode: 'optional',
+    baseUrl: 'http://127.0.0.1:8080/v1', keyHint: 'Leave empty if the endpoint does not check a key.' },
+];
+
+
+
 function app() {
   return {
     s: { providers: [], totals: {}, memory: { samples: [] }, events: [], proxies: {} },
@@ -777,6 +1014,9 @@ function app() {
     srcText: '',
     busySub: false,
     pollTimer: null,
+    catFilter: '',
+    cf: { key: '', type: '', label: '', blurb: '', icon: 'plug', keyMode: 'key', optional: false, keyHint: '', id: '', name: '', baseUrl: '', strategy: 'round-robin', proxy: 'direct', note: '', apiKey: '', models: [], testing: false, error: '' },
+    pd: null,
     modal: null,
     key: localStorage.getItem('routerAdminKey') || '',
     keyInput: '',
@@ -894,6 +1134,88 @@ function app() {
         localStorage.removeItem('routerAdminKey');
         this.loginError = 'Invalid or expired admin key.';
       }
+      this.refreshIcons();
+    },
+
+    // ---------- providers ----------
+    // ---------- provider catalogue (click a provider -> its own page) ----------
+    catalogGroups() {
+      const f = (this.catFilter || '').trim().toLowerCase();
+      const items = CATALOG.filter((c) => !f || `${c.label} ${c.blurb} ${c.type}`.toLowerCase().includes(f));
+      const order = ['Free', 'Free with account', 'API key', 'Local / custom'];
+      const groups = [];
+      for (const name of order) {
+        const g = items.filter((c) => c.group === name);
+        if (g.length) groups.push({ name, items: g });
+      }
+      return groups;
+    },
+    openCatalog() { this.catFilter = ''; this.modal = 'catalog'; this.refreshIcons(); },
+    keyBadge(c) {
+      if (c.keyMode === 'none') return 'no key';
+      if (c.keyMode === 'token') return c.optional ? 'token (later)' : 'token';
+      return c.keyMode === 'optional' ? 'key optional' : 'api key';
+    },
+    keyBadgeClass(c) {
+      if (c.keyMode === 'none') return 'bg-emerald-500/10 text-emerald-300';
+      if (c.optional) return 'bg-amber-500/10 text-amber-300';
+      return 'bg-ink-800 text-slate-400';
+    },
+    chooseProvider(c) {
+      this.cf = {
+        key: c.key, type: c.type, label: c.label, blurb: c.blurb, icon: c.icon,
+        keyMode: c.keyMode, optional: !!c.optional, keyHint: c.keyHint || '',
+        id: c.id || (c.type + '-' + Math.random().toString(36).slice(2, 6)),
+        name: c.label,
+        baseUrl: c.baseUrl,
+        strategy: c.strategy || 'round-robin',
+        proxy: c.proxy || 'direct',
+        note: c.note || '',
+        apiKey: '',
+        models: [],
+        testing: false,
+        error: '',
+      };
+      this.modal = 'connect';
+      this.refreshIcons();
+    },
+    async testConnectModels() {
+      this.cf.testing = true;
+      this.cf.error = '';
+      try {
+        // Probe the upstream list through a throwaway provider entry, so the
+        // user sees the real model ids before committing.
+        const r = await this.api('/probe-models', { method: 'POST', body: {
+          provider: { id: this.cf.id, type: this.cf.type, baseUrl: this.cf.baseUrl },
+          account: { apiKey: this.cf.apiKey || '' },
+        } });
+        this.cf.models = r.models || [];
+        if (!r.ok) this.cf.error = 'upstream answered HTTP ' + r.status + (r.raw ? ' — ' + String(r.raw).slice(0, 120) : '');
+        else this.toast(`${this.cf.models.length} models reachable`, 'ok');
+      } catch (err) { this.cf.error = err.message; }
+      this.cf.testing = false;
+      this.refreshIcons();
+    },
+    async saveConnect() {
+      this.cf.error = '';
+      try {
+        const r = await this.api('/connect', { method: 'POST', body: {
+          provider: {
+            id: this.cf.id, name: this.cf.name, type: this.cf.type, baseUrl: this.cf.baseUrl,
+            strategy: this.cf.strategy, proxy: this.cf.proxy, cooldownHours: this.s.cooldownHours || 12,
+          },
+          account: this.cf.apiKey || (this.cf.keyMode === 'none' || this.cf.optional) ? { apiKey: this.cf.apiKey || '', name: this.cf.apiKey ? '' : 'keyless' } : null,
+        } });
+        this.toast(`${r.provider.name} connected${r.account ? (r.account.keyless ? ' (no credential)' : ' with 1 account') : ''}`, 'ok');
+        this.modal = null;
+        await this.load(true);
+        const fresh = (this.s.providers || []).find((p) => p.id === r.provider.id);
+        if (fresh) this.openProviderDetail(fresh);
+      } catch (err) { this.cf.error = err.message; }
+    },
+    openProviderDetail(p) {
+      this.pd = p;
+      this.modal = 'pdetail';
       this.refreshIcons();
     },
 

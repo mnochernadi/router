@@ -68,10 +68,10 @@ const PROVIDER_TYPES = {
   // OpenCode (opencode.ai): one account fronts four wire formats. The router
   // picks the right sub-endpoint per model id -- see openCodeKind().
   opencode: { label: 'OpenCode (Console)', baseUrl: 'https://opencode.ai/inference', style: 'opencode' },
-  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1', style: 'opencode-free' },
+  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1', style: 'opencode-free', keyless: true },
   // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
   // The driver owns the whole handshake, so this style always wants a proxy exit.
-  freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff' },
+  freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff', keyOptional: true },
   custom: { label: 'OpenAI-compatible', baseUrl: '', style: 'openai' },
 };
 
@@ -449,6 +449,7 @@ function accountSummary(provider, account) {
     id: account.id,
     name: account.name,
     maskedKey: maskKey(account.apiKey),
+    keyless: !usableKey(account.apiKey),
     enabled: account.enabled !== false,
     requests: as.requests || 0,
     failures: as.failures || 0,
@@ -1447,6 +1448,76 @@ function extractModelIds(json) {
     .filter(Boolean))].sort();
 }
 
+/**
+ * /v1/models: ask each usable provider what it serves and expose the ids as
+ * `providerId/modelId`, which is exactly the form the router accepts back and
+ * what a client model picker needs. Cached, because a picker refresh must not
+ * hammer every upstream; discovery failures degrade to `providerId/*` instead
+ * of making the endpoint empty or slow.
+ */
+const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
+const modelCache = new Map();
+
+function providerIsReachable(provider, def) {
+  // Same condition the dispatcher uses: only an enabled account can serve a
+  // request, so advertising models from a provider with none is a lie. The
+  // keyless styles just need no key for discovery.
+  return (provider.accounts || []).some((a) => a.enabled !== false);
+}
+
+async function providerModelIds(provider) {
+  const def = PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom;
+  if (!providerIsReachable(provider, def)) return null;
+  const hit = modelCache.get(provider.id);
+  if (hit && Date.now() - hit.at < MODEL_CACHE_TTL_MS) return hit.ids;
+  const account = (provider.accounts || []).find((a) => a.enabled !== false) || { apiKey: '' };
+  let ids = null;
+  try {
+    if (provider.type === 'freebuff') {
+      ids = (await freebuff.listModels({ provider, account })).map(String);
+    } else {
+      const spec = modelListRequest(provider, account);
+      const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(6000) });
+      const text = await upstream.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* non-JSON body: no ids */ }
+      ids = extractModelIds(json);
+    }
+  } catch { ids = null; }
+  if (ids && !ids.length) ids = null;
+  modelCache.set(provider.id, { at: Date.now(), ids });
+  return ids;
+}
+
+async function routerModelList() {
+  const per = await Promise.all(config.providers.map(async (p) => {
+    const ids = await providerModelIds(p);
+    if (ids) return ids.map((m) => ({ id: `${p.id}/${m}`, object: 'model', owned_by: p.id, provider: p.id, type: p.type }));
+    const def = PROVIDER_TYPES[p.type] || PROVIDER_TYPES.custom;
+    if (!providerIsReachable(p, def)) return [];
+    return [{ id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type }];
+  }));
+  return per.flat();
+}
+
+async function fetchModelList(provider, account) {
+  const spec = modelListRequest(provider, account);
+  const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(15_000) });
+  const text = await upstream.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* non-JSON: report the raw head */ }
+  const models = extractModelIds(json);
+  return {
+    ok: upstream.ok,
+    status: upstream.status,
+    source: spec.url,
+    provider: provider.id,
+    count: models.length,
+    models: models.length ? models : undefined,
+    raw: models.length ? undefined : text.slice(0, 2000),
+  };
+}
+
 async function handleAdmin(req, res, url) {
   if (url.pathname === '/admin/api/ping') return sendJson(res, 200, { ok: true, version: PKG_VERSION });
   if (!requireAdmin(req, res)) return;
@@ -1514,13 +1585,19 @@ async function handleAdmin(req, res, url) {
     if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
     const body = await readJsonBody(req);
     const incoming = Array.isArray(body.accounts) ? body.accounts : [body];
-    // Keyless providers (OpenCode Free, local servers) legitimately store no key.
+    // Keyless providers (OpenCode Free, freebuff before its token is pasted,
+    // local servers) legitimately store an account without a credential, and
+    // the connect flow is allowed to save first and ask for the key later.
     const keyless = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style === 'opencode-free'
-      || (PROVIDER_TYPES[provider.type] || {}).keyless === true;
+      || (PROVIDER_TYPES[provider.type] || {}).keyless === true
+      || body.allowEmptyKey === true;
     const added = [];
     for (const raw of incoming) {
       const acc = typeof raw === 'string' ? parseAccountLine(raw) : normalizeAccount(raw, `account-${provider.accounts.length + 1}`);
-      if (!acc.apiKey && !keyless) continue;
+      const genericName = /^account-\d+$/.test(acc.name || '');
+      if (!acc.apiKey && !keyless && genericName) continue;
+      if (!acc.name || genericName) acc.name = acc.apiKey ? acc.name : (keyless ? 'keyless' : `account-${provider.accounts.length + 1}`);
+      if (!acc.apiKey) acc.keyless = true;
       provider.accounts.push(acc);
       added.push(accountSummary(provider, acc));
     }
@@ -1543,20 +1620,32 @@ async function handleAdmin(req, res, url) {
     }
     const spec = modelListRequest(provider, account);
     try {
-      const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(15_000) });
-      const text = await upstream.text();
-      let json = null;
-      try { json = JSON.parse(text); } catch { /* non-JSON: report the raw head */ }
-      const models = extractModelIds(json);
+      return sendJson(res, 200, await fetchModelList(provider, account));
+    } catch (err) {
+      return sendJson(res, 502, { error: { message: `model list fetch failed: ${err.message}`, type: 'upstream_error' } });
+    }
+  }
+
+  // "Check models" in the connect flow: probe a provider that is not saved yet.
+  if (method === 'POST' && a === 'probe-models') {
+    const body = await readJsonBody(req);
+    const incoming = body.provider || {};
+    const provider = normalizeProvider({
+      id: String(incoming.id || 'probe'),
+      name: String(incoming.name || 'probe'),
+      type: incoming.type,
+      baseUrl: incoming.baseUrl,
+      accounts: [],
+    });
+    const account = { apiKey: String((body.account && body.account.apiKey) || ''), id: 'probe', name: 'probe' };
+    if (provider.type === 'freebuff') {
       return sendJson(res, 200, {
-        ok: upstream.ok,
-        status: upstream.status,
-        source: spec.url,
-        provider: provider.id,
-        count: models.length,
-        models: models.length ? models : undefined,
-        raw: models.length ? undefined : text.slice(0, 2000),
+        ok: true, status: 200, source: 'freebuff catalog (signed, needs a saved account)', provider: provider.id,
+        count: 0, models: [], raw: 'Connect first: the freebuff catalog needs a registered device key, then press Models.',
       });
+    }
+    try {
+      return sendJson(res, 200, await fetchModelList(provider, account));
     } catch (err) {
       return sendJson(res, 502, { error: { message: `model list fetch failed: ${err.message}`, type: 'upstream_error' } });
     }
@@ -1634,6 +1723,35 @@ async function handleAdmin(req, res, url) {
 
   if (method === 'GET' && a === 'freebuff') {
     return sendJson(res, 200, { ok: true, accounts: freebuff.snapshot() });
+  }
+
+  // One-shot connect flow for the dashboard catalogue: create/update the
+  // provider and (optionally) its first account in a single call.
+  if (method === 'POST' && a === 'connect') {
+    const body = await readJsonBody(req);
+    const incoming = body.provider && typeof body.provider === 'object' ? body.provider : {};
+    const existing = findProvider(String(incoming.id || ''));
+    const p = normalizeProvider(existing ? { ...existing, ...incoming, accounts: existing.accounts, id: existing.id } : incoming);
+    touchProvider(p);
+    const def = PROVIDER_TYPES[p.type] || PROVIDER_TYPES.custom;
+    const cred = String((body.account && body.account.apiKey) || '').trim();
+    const givenName = String((body.account && body.account.name) || '').trim();
+    let account = null;
+    // The catalogue always sends an account object (with an empty key when the
+    // provider needs no credential), so its presence is the intent to create one.
+    if (body.account && typeof body.account === 'object') {
+      const acc = normalizeAccount({
+        name: givenName || (cred ? `${p.id}-1` : 'keyless'),
+        apiKey: cred,
+      });
+      if (!cred) acc.keyless = true;
+      p.accounts.push(acc);
+      account = accountSummary(p, acc);
+    }
+    await saveConfig();
+    persistState();
+    pushEvent({ kind: 'connect', pid: p.id, s: 1 });
+    return sendJson(res, existing ? 200 : 201, { ok: true, provider: providerSummary(p), account });
   }
 
   if (a === 'provider' && b && c === 'account' && d) {
@@ -1842,7 +1960,7 @@ function serveStatic(req, res, url) {
 // Server
 // ---------------------------------------------------------------------------
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   let url;
   try { url = new URL(req.url, 'http://localhost'); }
   catch { return sendJson(res, 400, { error: { message: 'bad request url', type: 'bad_request' } }); }
@@ -1885,9 +2003,13 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/v1/models') {
-    const data = config.providers.flatMap((p) => (p.accounts || []).filter((a) => a.enabled !== false).map((a) => ({
-      id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type,
-    })));
+    let data = [];
+    try { data = await routerModelList(); } catch { data = []; }
+    if (!data.length) {
+      data = config.providers.flatMap((p) => (p.accounts || []).filter((a) => a.enabled !== false).map((a) => ({
+        id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type,
+      })));
+    }
     return sendJson(res, 200, { object: 'list', data });
   }
 

@@ -787,6 +787,41 @@ async function memOf() {
       JSON.stringify(fbs).slice(0, 240));
   }
 
+  // 19. connect flow: a provider can be added without any credential, and the
+  //     key can be attached later from the same page
+  {
+    const conn = await fetch(routerUrl('/admin/api/connect'), {
+      method: 'POST', headers: ADMIN,
+      body: JSON.stringify({
+        provider: { id: 'connect-test', name: 'Connect Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`, strategy: 'round-robin', proxy: 'direct' },
+        account: { name: '', apiKey: '' },
+      }),
+    });
+    const connBody = await conn.json();
+    check('connect: a provider is created with a keyless account in one call',
+      conn.status === 201 && connBody.provider.id === 'connect-test' && connBody.account && connBody.account.keyless === true,
+      JSON.stringify(connBody).slice(0, 220));
+
+    const later = await fetch(routerUrl('/admin/api/provider/connect-test/account/' + connBody.account.id), {
+      method: 'PATCH', headers: ADMIN, body: JSON.stringify({ apiKey: 'sk-added-later' }),
+    });
+    const laterBody = await later.json();
+    check('connect: the credential can be attached later', later.status === 200 && laterBody.account.maskedKey.includes('•'), JSON.stringify(laterBody).slice(0, 160));
+
+    const emptyAdd = await fetch(routerUrl('/admin/api/provider/rr-provider/accounts'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'paste-key-later' }] }),
+    });
+    check('accounts: a named account with no key is accepted (key can come later)',
+      (await emptyAdd.json()).added === 1, 'empty-key add rejected');
+
+    const probe = await fetch(routerUrl('/admin/api/probe-models'), {
+      method: 'POST', headers: ADMIN,
+      body: JSON.stringify({ provider: { id: 'probe', type: 'opencode', baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference` }, account: { apiKey: 'probe-key' } }),
+    });
+    const probeBody = await probe.json();
+    check('connect: "check models" probes an unsaved provider', probe.status === 200 && probeBody.ok === true && probeBody.count === 5, JSON.stringify(probeBody).slice(0, 200));
+  }
+
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
   const pastDeadline = await fetch(routerUrl('/admin/api/provider/seq-provider/account/a-limited/reset'), { method: 'POST', headers: ADMIN });
   check('unlock path exercised without restart', pastDeadline.status === 200);

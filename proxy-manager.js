@@ -482,8 +482,11 @@ class ProxyManager {
       }
     });
     const ports = exits.map((_, i) => (basePort || settings.inboundBasePort) + i);
-    const ready = await Promise.all(ports.map((p) => waitPort(p, 8000)));
-    const up = ready.some(Boolean) && !exited;
+    // A config xray refuses to load exits within milliseconds; don't sit out the
+    // full port timeout for it, or a poisoned batch costs 8s per attempt.
+    const died = new Promise((resolve) => child.once('exit', () => resolve(null)));
+    const ready = await Promise.race([Promise.all(ports.map((p) => waitPort(p, 8000))), died]);
+    const up = Array.isArray(ready) && ready.some(Boolean) && !exited;
     return { child, ports, up, stderr, exited };
   }
 
@@ -588,32 +591,52 @@ class ProxyManager {
     for (let start = 0; start < candidates.length; start += size) {
       const batch = candidates.slice(start, start + size);
       this.test.batch += 1;
-      const { child, up, stderr } = await this.startProcess(batch, settings, { basePort: settings.testBasePort, tag: 'test' });
-      this.tester.child = child;
-      if (!up) {
-        this.test.error = `test instance failed to start: ${(stderr || '').split('\n').filter(Boolean).pop() || 'unknown'}`;
-        for (const exit of batch) { this.recordTest(exit, false, 0, '', this.test.error); }
-        try { child.kill(); } catch { /* noop */ }
-        continue;
-      }
-      const queue = batch.map((exit, i) => ({ exit, port: settings.testBasePort + i }));
-      const workers = Array.from({ length: Math.min(Math.max(1, settings.testConcurrency), queue.length) }, async () => {
-        for (;;) {
-          const job = queue.shift();
-          if (!job) return;
-          await this.testOne(job.exit, job.port);
-          this.test.done += 1;
-        }
-      });
-      await Promise.all(workers);
-      try { child.kill('SIGTERM'); } catch { /* noop */ }
-      await new Promise((r) => setTimeout(r, 200));
+      await this.testBatch(batch, settings);
     }
     this.test.running = false;
     this.test.finishedAt = Date.now();
     this.save();
     this.pushEvent({ kind: 'test-done', ok: this.test.ok, dead: this.test.dead });
     await this.apply();
+  }
+
+  /**
+   * Test one batch. Xray validates the whole file before it opens a single
+   * inbound, so one unusable exit (`vless without TLS ... is prohibited`,
+   * `unknown transport protocol: xhttp`, a bad REALITY key) rejects all 40.
+   * Halve the batch until the offender stands alone instead of condemning it.
+   */
+  async testBatch(batch, settings) {
+    if (!batch.length) return;
+    const { child, up, stderr } = await this.startProcess(batch, settings, { basePort: settings.testBasePort, tag: 'test' });
+    this.tester.child = child;
+    if (!up) {
+      try { child.kill(); } catch { /* noop */ }
+      const reason = `test instance failed to start: ${(stderr || '').split('\n').filter(Boolean).pop() || 'unknown'}`;
+      if (batch.length > 1) {
+        const mid = Math.ceil(batch.length / 2);
+        this.pushEvent({ kind: 'test-split', size: batch.length, error: reason.slice(0, 160) });
+        await this.testBatch(batch.slice(0, mid), settings);
+        await this.testBatch(batch.slice(mid), settings);
+        return;
+      }
+      this.test.error = reason;
+      this.recordTest(batch[0], false, 0, '', reason);
+      this.test.done += 1;
+      return;
+    }
+    const queue = batch.map((exit, i) => ({ exit, port: settings.testBasePort + i }));
+    const workers = Array.from({ length: Math.min(Math.max(1, settings.testConcurrency), queue.length) }, async () => {
+      for (;;) {
+        const job = queue.shift();
+        if (!job) return;
+        await this.testOne(job.exit, job.port);
+        this.test.done += 1;
+      }
+    });
+    await Promise.all(workers);
+    try { child.kill('SIGTERM'); } catch { /* noop */ }
+    await new Promise((r) => setTimeout(r, 200));
   }
 
   async testOne(exit, port) {

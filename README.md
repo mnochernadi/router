@@ -58,6 +58,8 @@ curl http://localhost:8787/v1/chat/completions \
 
 ## Dashboard (`/admin`)
 
+* **Connect provider** opens a catalogue of 16 presets grouped Free / Free with account / API key / Local. Clicking one opens that provider's own setup page with the credential field it actually needs — or none at all — plus **Check models**, which probes the upstream before you commit. Clicking a provider card opens its detail page (accounts, models, strategy, proxy, delete).
+* **Keyless and deferred credentials.** OpenCode Free, Ollama, LM Studio, vLLM and any custom endpoint save with no credential at all; freebuff saves with an empty token and asks for it later. An empty-key account shows a `no key` badge until a credential is attached, and `POST /admin/api/connect` creates the provider plus its first account in one call.
 * **Three tabs** — Providers (cards, accounts, strategies, per-provider outbound proxy), Network (exit pool, subscriptions, testing, assignment), Activity (routing events).
 * **Top status bar** — live RSS (`process.memoryUsage().rss`) with an inline sparkline, uptime, routed-request counter, active vs. rate-limited account counts, failover counter, and a copy button for the router API base URL.
 * **Provider cards** — type badge, base URL, 1-click **Round-Robin ⇄ Sequential** toggle, per-provider totals, plus *Add Account*, *Edit Provider* and *Delete Provider*.

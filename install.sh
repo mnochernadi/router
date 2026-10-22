@@ -33,6 +33,13 @@ MODE="auto"          # auto | docker | systemd
 WITH_NGINX="auto"    # auto | yes | no
 WITH_FIREWALL=1
 WITH_XRAY=0
+# Xray 25.9.10 added VLESS Encryption and now refuses a plain (no-TLS) VLESS
+# outbound whose server is a bare public IP, which is exactly what most public
+# V2Ray subscriptions hand out. One rejected outbound aborts the whole config,
+# so the pool is unusable on 25.9.10+ until those exits are filtered. Pin the
+# last release that accepts them; override with --xray-version or
+# ROUTER_XRAY_VERSION=latest.
+XRAY_VERSION="${ROUTER_XRAY_VERSION:-v25.9.5}"
 DRY_RUN=0
 ASSUME_YES=0
 UNINSTALL=0
@@ -81,6 +88,7 @@ Options:
   --no-nginx           Never touch nginx/certbot.
   --no-firewall        Never touch ufw/firewalld.
   --with-xray          Download Xray-core into the install dir (enables the V2Ray exit pool).
+  --xray-version <tag> Xray release tag (default v25.9.5; "latest" follows upstream).
   --uninstall          Stop and remove the service and unit files.
   --purge              With --uninstall: also delete install and state dirs.
   --dry-run            Print every action without executing it.
@@ -117,6 +125,8 @@ while [ $# -gt 0 ]; do
     --no-nginx)    WITH_NGINX="no"; shift ;;
     --no-firewall) WITH_FIREWALL=0; shift ;;
     --with-xray)   WITH_XRAY=1; shift ;;
+    --xray-version) XRAY_VERSION="${2:-}"; shift 2 ;;
+    --xray-version=*) XRAY_VERSION="${1#*=}"; shift ;;
     --uninstall)   UNINSTALL=1; shift ;;
     --purge)       PURGE=1; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
@@ -526,16 +536,22 @@ install_xray() {
     *)             xa=64 ;;
   esac
   if have xray; then XRAY_BIN="$(command -v xray)"; ok "xray already installed at $XRAY_BIN"; return 0; fi
-  say "downloading Xray-core ($xa)"
+  local xray_url
+  if [ "$XRAY_VERSION" = "latest" ]; then
+    xray_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip"
+  else
+    xray_url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${xa}.zip"
+  fi
+  say "downloading Xray-core $XRAY_VERSION ($xa)"
   run mkdir -p "$INSTALL_DIR/bin"
   if [ "$DRY_RUN" = 1 ]; then
-    run sh -c "curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip"
+    run sh -c "curl -fsSL -o /tmp/xray.zip $xray_url"
     run sh -c "unzip -o -q /tmp/xray.zip -d $INSTALL_DIR/bin"
     XRAY_BIN="$INSTALL_DIR/bin/xray"
     return 0
   fi
   have unzip || pkg_install unzip
-  curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip" || die "could not download Xray-core"
+  curl -fsSL -o /tmp/xray.zip "$xray_url" || die "could not download Xray-core $XRAY_VERSION"
   mkdir -p "$INSTALL_DIR/bin"
   unzip -o -q /tmp/xray.zip -d "$INSTALL_DIR/bin"
   chmod +x "$INSTALL_DIR/bin/xray"
