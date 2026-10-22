@@ -32,6 +32,7 @@ ADMIN_KEY=""
 MODE="auto"          # auto | docker | systemd
 WITH_NGINX="auto"    # auto | yes | no
 WITH_FIREWALL=1
+WITH_XRAY=0
 DRY_RUN=0
 ASSUME_YES=0
 UNINSTALL=0
@@ -79,6 +80,7 @@ Options:
   --state-dir <path>   Config/state directory (default /var/lib/llm-router).
   --no-nginx           Never touch nginx/certbot.
   --no-firewall        Never touch ufw/firewalld.
+  --with-xray          Download Xray-core into the install dir (enables the V2Ray exit pool).
   --uninstall          Stop and remove the service and unit files.
   --purge              With --uninstall: also delete install and state dirs.
   --dry-run            Print every action without executing it.
@@ -114,6 +116,7 @@ while [ $# -gt 0 ]; do
     --state-dir=*) STATE_DIR="${1#*=}"; shift ;;
     --no-nginx)    WITH_NGINX="no"; shift ;;
     --no-firewall) WITH_FIREWALL=0; shift ;;
+    --with-xray)   WITH_XRAY=1; shift ;;
     --uninstall)   UNINSTALL=1; shift ;;
     --purge)       PURGE=1; shift ;;
     --dry-run)     DRY_RUN=1; shift ;;
@@ -287,6 +290,7 @@ ROUTER_CONFIG=$STATE_DIR/config.json
 ROUTER_STATE=$STATE_DIR/state.json
 # Host port for the docker-compose mapping (ignored by the systemd unit).
 ROUTER_PORT=$PORT
+ROUTER_XRAY=$XRAY_BIN
 EOF
 }
 
@@ -331,6 +335,7 @@ install_systemd() {
 
   # Key first: config.json, the env file and the final summary all use it.
   resolve_admin_key
+  if [ "$WITH_XRAY" = 1 ]; then install_xray; fi
   write_env_file
 
   run mkdir -p "$STATE_DIR"
@@ -507,6 +512,36 @@ EOF
   else
     warn "certbot unavailable — install it and run: certbot --nginx -d $DOMAIN"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Xray-core (optional): powers the V2Ray exit pool used for IP rotation
+# ---------------------------------------------------------------------------
+XRAY_BIN="${ROUTER_XRAY:-xray}"
+install_xray() {
+  local xa
+  case "$(uname -m)" in
+    x86_64|amd64)  xa=64 ;;
+    aarch64|arm64) xa=arm64-v8a ;;
+    *)             xa=64 ;;
+  esac
+  if have xray; then XRAY_BIN="$(command -v xray)"; ok "xray already installed at $XRAY_BIN"; return 0; fi
+  say "downloading Xray-core ($xa)"
+  run mkdir -p "$INSTALL_DIR/bin"
+  if [ "$DRY_RUN" = 1 ]; then
+    run sh -c "curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip"
+    run sh -c "unzip -o -q /tmp/xray.zip -d $INSTALL_DIR/bin"
+    XRAY_BIN="$INSTALL_DIR/bin/xray"
+    return 0
+  fi
+  have unzip || pkg_install unzip
+  curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip" || die "could not download Xray-core"
+  mkdir -p "$INSTALL_DIR/bin"
+  unzip -o -q /tmp/xray.zip -d "$INSTALL_DIR/bin"
+  chmod +x "$INSTALL_DIR/bin/xray"
+  rm -f /tmp/xray.zip
+  XRAY_BIN="$INSTALL_DIR/bin/xray"
+  ok "xray installed: $XRAY_BIN"
 }
 
 # ---------------------------------------------------------------------------

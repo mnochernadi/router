@@ -3,8 +3,17 @@
   "host": "0.0.0.0",
   "port": 8787,
   "cooldownHours": 12,
-  "cooldownStatuses": [429, 402, 403],
-  "retryStatuses": [500, 502, 503, 504],
+  "cooldownStatuses": [
+    429,
+    402,
+    403
+  ],
+  "retryStatuses": [
+    500,
+    502,
+    503,
+    504
+  ],
   "defaultProvider": "openai-main",
   "cors": true,
   "proxyKeys": [],
@@ -19,8 +28,18 @@
       "timeoutMs": 30000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-openai-1", "name": "openai-key-1", "apiKey": "sk-REPLACE_ME", "enabled": true },
-        { "id": "acc-openai-2", "name": "openai-key-2", "apiKey": "sk-REPLACE_ME_TOO", "enabled": true }
+        {
+          "id": "acc-openai-1",
+          "name": "openai-key-1",
+          "apiKey": "sk-REPLACE_ME",
+          "enabled": true
+        },
+        {
+          "id": "acc-openai-2",
+          "name": "openai-key-2",
+          "apiKey": "sk-REPLACE_ME_TOO",
+          "enabled": true
+        }
       ]
     },
     {
@@ -33,7 +52,12 @@
       "timeoutMs": 60000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-or-1", "name": "openrouter-key-1", "apiKey": "sk-or-REPLACE_ME", "enabled": true }
+        {
+          "id": "acc-or-1",
+          "name": "openrouter-key-1",
+          "apiKey": "sk-or-REPLACE_ME",
+          "enabled": true
+        }
       ]
     },
     {
@@ -46,7 +70,12 @@
       "timeoutMs": 60000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-anthropic-1", "name": "anthropic-key-1", "apiKey": "sk-ant-REPLACE_ME", "enabled": true }
+        {
+          "id": "acc-anthropic-1",
+          "name": "anthropic-key-1",
+          "apiKey": "sk-ant-REPLACE_ME",
+          "enabled": true
+        }
       ]
     },
     {
@@ -59,7 +88,12 @@
       "timeoutMs": 60000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-gemini-1", "name": "gemini-key-1", "apiKey": "AIzaREPLACE_ME", "enabled": true }
+        {
+          "id": "acc-gemini-1",
+          "name": "gemini-key-1",
+          "apiKey": "AIzaREPLACE_ME",
+          "enabled": true
+        }
       ]
     },
     {
@@ -72,7 +106,31 @@
       "timeoutMs": 120000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-opencode-1", "name": "opencode-console-key", "apiKey": "sk-REPLACE_ME", "enabled": true }
+        {
+          "id": "acc-opencode-1",
+          "name": "opencode-console-key",
+          "apiKey": "sk-REPLACE_ME",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "freebuff-main",
+      "name": "freebuff (Codebuff)",
+      "type": "freebuff",
+      "baseUrl": "https://www.codebuff.com",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 180000,
+      "maxAttempts": 2,
+      "proxy": "rotate",
+      "accounts": [
+        {
+          "id": "acc-freebuff-1",
+          "name": "freebuff-token-uuid",
+          "apiKey": "00000000-0000-0000-0000-000000000000",
+          "enabled": false
+        }
       ]
     },
     {
@@ -85,7 +143,12 @@
       "timeoutMs": 120000,
       "maxAttempts": 0,
       "accounts": [
-        { "id": "acc-opencode-free", "name": "keyless", "apiKey": "", "enabled": true }
+        {
+          "id": "acc-opencode-free",
+          "name": "keyless",
+          "apiKey": "",
+          "enabled": true
+        }
       ]
     },
     {
@@ -98,7 +161,12 @@
       "timeoutMs": 120000,
       "maxAttempts": 1,
       "accounts": [
-        { "id": "acc-local-1", "name": "local-no-key", "apiKey": "not-needed", "enabled": false }
+        {
+          "id": "acc-local-1",
+          "name": "local-no-key",
+          "apiKey": "not-needed",
+          "enabled": false
+        }
       ]
     }
   ]

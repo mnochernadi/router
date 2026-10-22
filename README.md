@@ -58,6 +58,7 @@ curl http://localhost:8787/v1/chat/completions \
 
 ## Dashboard (`/admin`)
 
+* **Three tabs** — Providers (cards, accounts, strategies, per-provider outbound proxy), Network (exit pool, subscriptions, testing, assignment), Activity (routing events).
 * **Top status bar** — live RSS (`process.memoryUsage().rss`) with an inline sparkline, uptime, routed-request counter, active vs. rate-limited account counts, failover counter, and a copy button for the router API base URL.
 * **Provider cards** — type badge, base URL, 1-click **Round-Robin ⇄ Sequential** toggle, per-provider totals, plus *Add Account*, *Edit Provider* and *Delete Provider*.
 * **Account rows** — name, masked API key, request counter, limit-hit counter, last HTTP status, health badge (green *Active* / red *Limited*), a live `HH:MM:SS` countdown to the automatic reset with a draining progress bar, **Reset now** (clears the cooldown immediately) and **Delete**.
@@ -107,6 +108,7 @@ An account is **healthy** when `enabled !== false` and `limitedUntil <= now`.
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | OpenAI ⇄ `generateContent`/`streamGenerateContent` |
 | `opencode` | `https://opencode.ai/inference` | `Authorization: Bearer` (+ `x-api-key`/`x-goog-api-key`) | **per model**: chat ⇄ messages / google / responses |
 | `opencode-free` | `https://opencode.ai/zen/v1` | none (keyless) | passthrough to the free model list |
+| `freebuff` | `https://www.codebuff.com` | Bearer token + **Ed25519 request signature** | OpenAI-shaped, session/run bound (see below) |
 | `custom` | whatever you set | `Authorization: Bearer` | passthrough (Ollama, vLLM, LM Studio, LiteLLM, a gateway…) |
 
 Translation covers system-message extraction, text and image parts, `max_tokens`, `temperature`, `top_p`, `stop`, usage mapping and finish reasons. Anthropic and Gemini streams are re-emitted as OpenAI `chat.completion.chunk` events terminated by `data: [DONE]`.
@@ -174,6 +176,9 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `POST` | `/admin/api/reset` | Unlock every cooling account (`/reset/counters` zeroes counters). |
 | `POST` | `/admin/api/settings` | Cooldown hours, default provider, inbound keys, CORS, admin key. |
 | `GET` | `/admin/api/provider/:id/models` | Live model list from the upstream (no key needed for OpenCode), with the route each id will take. |
+| `POST` | `/admin/api/proxies/{refresh,test,apply,rotate,purge,xray,sources,settings}` | Exit pool: download+parse subscriptions, batch-test, apply to xray, rotate, tune. |
+| `GET` | `/admin/api/proxies` · `/admin/api/proxies/exit/:id` | Pool snapshot / one exit (full URI). |
+| `GET` | `/admin/api/freebuff` | freebuff session state per account (device key, catalog, instance, run). |
 | `GET`/`POST` | `/admin/api/export` · `/admin/api/import` | Backup out / restore in. |
 
 ## Configuration (`config.json`)
@@ -189,6 +194,7 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `retryStatuses` | `[500,502,503,504]` | Statuses that fail over without cooldown. |
 | `defaultProvider` | `""` | Fallback provider id. |
 | `cors` | `true` | Send permissive CORS headers to proxy clients. |
+| `logging.requests` | `false` | Routing lines in the process log. Off by default — counters live in the dashboard. |
 | `proxyKeys` | `[]` | Inbound `Bearer` keys the router requires. Empty = open. |
 | `providers[]` | — | `id`, `name`, `type`, `baseUrl`, `strategy`, `cooldownHours`, `timeoutMs`, `maxAttempts`, `headers`, `modelStyles`, `accounts[]`. |
 
@@ -226,7 +232,8 @@ docker compose up -d          # http://localhost:8787/admin
 ```
 
 * `mem_limit: 128m` (plus a `deploy.resources.limits.memory: 128M` for Swarm), `NODE_OPTIONS=--max-old-space-size=96`.
-* Config and state live in the named volume `router-data` → `/data` (`ROUTER_CONFIG`, `ROUTER_STATE`).
+* Xray-core is baked into the image, so the exit pool works with no host dependency.
+* Config, state and the exit pool live in the named volume `router-data` → `/data` (`ROUTER_CONFIG`, `ROUTER_STATE`).
 * Runs as the non-root `node` user with `no-new-privileges`, and has a `HEALTHCHECK` on `/health`.
 
 | Env var | Purpose |
@@ -256,6 +263,7 @@ Useful flags (full list: `--help`):
 | `--docker` / `--systemd` | force a layout (default: Docker when present, else systemd) |
 | `--port <n>` | router port (default 8787) |
 | `--admin-key <key>` | use your own dashboard key instead of generating one |
+| `--with-xray` | download Xray-core into the install dir (enables the V2Ray exit pool) |
 | `--no-nginx`, `--no-firewall` | skip those steps |
 | `--dry-run` | print every action, change nothing |
 | `--uninstall [--purge]` | remove the service/unit (and, with `--purge`, the files and keys) |
@@ -359,6 +367,72 @@ Any key works unless you set `proxyKeys` in the dashboard's Settings (then send 
 
 Firewall: expose only `80`/`443`. `8787` must stay on loopback — the router has no TLS of its own, and `proxyKeys` is the only thing standing between a public port and your credits.
 
+## IP rotation: V2Ray/Xray exit pool
+
+Rate limits that follow your **IP** (OpenCode's per-address cap, freebuff's country gate) are not fixed by more accounts — they are fixed by leaving through different addresses. The router manages an [Xray-core](https://github.com/XTLS/Xray-core) process and a pool of exits parsed from V2Ray subscriptions:
+
+```
+subscription URLs ──▶ parse (vless / vmess / trojan / shadowsocks)
+                      │
+                      ├─▶ test in batches through a throwaway xray: latency + exit IP + alive/dead, persisted
+                      ▼
+                best N exits ──▶ live xray, one local HTTP inbound per exit
+                      │
+     provider.proxy = rotate ──▶ 429/402/403 arrives
+                      ▼
+             rotate to the next exit and retry the SAME account first;
+             only if the whole pool fails does the account get cooled down
+```
+
+Default sources (editable in the dashboard, stored in `proxies.json`):
+
+* `https://raw.githubusercontent.com/papa8274/sub-mirror/main/subscription.txt`
+* `https://raw.githubusercontent.com/papa8274/sub-mirror/main/subscription1000.txt`
+
+Workflow — **Network** tab, or the API:
+
+```bash
+K="x-admin-key: $ADMIN_KEY"
+curl -X POST localhost:8787/admin/api/proxies/refresh -H "$K"                 # download + parse (~1000 configs)
+curl -X POST localhost:8787/admin/api/proxies/test    -H "$K" -d '{}'   # test untested, in batches
+curl -X POST localhost:8787/admin/api/proxies/test    -H "$K" -d '{"retest":true,"limit":200}'
+curl -X POST localhost:8787/admin/api/proxies/apply   -H "$K"                 # start xray with the best exits
+curl -X POST localhost:8787/admin/api/proxies/rotate  -H "$K"                 # rotate now
+```
+
+Then assign it per provider — **Providers → Edit → Outbound proxy**: `Direct`, `Rotate the pool`, or one pinned exit. OpenCode and freebuff can rotate while OpenAI stays direct. In JSON:
+
+```json
+{ "id": "opencode-main", "type": "opencode", "proxy": "rotate" }
+```
+
+Notes that save time:
+
+* Every routed response carries `x-router-exit` (exit id or `direct`) and `x-router-rotations`, so `curl -i` shows which address served it.
+* Testing walks the list in batches (`testBatchSize`, default 40) through a second xray instance, so 1000 configs never all live at once. The best `maxActive` (default 24) go into the live pool.
+* Dead exits are dropped after `markDeadAfter` failures and retried on the next run; `rotateAttempts` (default 3) caps retries per request.
+* The `xray` binary: `install.sh --with-xray` installs it, the Docker image already contains it, or install it from your package manager. No binary = no pool, and the router reports that instead of failing requests.
+* `testUrl` defaults to `https://api.ipify.org?format=json` because it returns the exit IP; any JSON endpoint with an `ip` field works.
+
+## freebuff (Codebuff) as a provider
+
+freebuff is OpenAI-shaped (`POST /api/v1/chat/completions`) but will not answer a plain API-key call. `freebuff-driver.js` performs the whole handshake, so from the router's point of view it is just another provider:
+
+| Step | What the driver does |
+|---|---|
+| Device identity | Generates an Ed25519 key, registers it (`POST /api/v1/freebuff/device-keys`), and signs every request as `freebuff-device-v1\n<METHOD>\n<path>\n<ts>\n<sha256(body)>\n<fetchId>` → `x-freebuff-device-{key,ts,sig}` |
+| Catalog | `GET /api/v1/freebuff/models` with `x-freebuff-client: cli` → the `fbm1.` **handle** plus `fetchId` (cached 10 min) |
+| Session | `POST /api/v1/freebuff/session/admission` with the handle, a fresh instance id, `x-freebuff-wallet-spend-limit: session` |
+| Run ledger | `POST /api/v1/agent-runs` `START` → `runId`, echoed as `codebuff_metadata.run_id`; `FINISH` when the response (or stream) ends |
+| Request | `codebuff_metadata{cost_mode:"free",surface:"cli",freebuff_instance_id,…}`, `provider.data_collection:"deny"`, the Buffy preamble injected as the first system message, `connection: close`, `x-freebuff-sse-gzip-recovery: 1` |
+| Models | `model` may be the catalog key (`m-00032eaeec`), a name, or the raw `fbm1.` handle; the driver resolves it |
+
+Setup: paste the account token (a 36-char UUID from the desktop app vault, or the login flow at `freebuff.com/api/auth/cli/code`) as the account `apiKey`, pick a model with the **Models** button, and set **Outbound proxy: Rotate the pool**:
+
+> The service admits a session and then returns `country_not_allowed` and resets completions for blocked countries (Iran included). The session still reports `active`, so the only reliable fix is a non-blocked egress IP — exactly what the exit pool provides. Until then the driver says so plainly: *admitted but country_not_allowed (IR) — completions will be reset; assign a proxy exit*.
+
+Per-account freebuff state (device key id, catalog size, fetchId, admitted instance, run id, `needsReauth`) is visible at `GET /admin/api/freebuff`.
+
 ## Memory profile (measured, not estimated)
 
 `npm run smoke` measures the running process. On this machine (Node v26.8.1, Windows 11):
@@ -372,6 +446,8 @@ Firewall: expose only `80`/`443`. `8787` must stay on loopback — the router ha
 | Peak RSS vs. the 128 MB container ceiling | comfortably inside, with headroom |
 
 Consider the 35 MB target honestly: on Node 20+ the V8 isolate alone accounts for roughly 40 MB of RSS before a single byte of your code runs, so ~50 MB idle is the floor on Windows/Node 26 — no amount of application tuning reaches 35 MB there (`--max-old-space-size`, `--max-semi-space-size` and `--jitless` were all measured and none helped; a leaner `node:20-alpine` build, which ships small-icu, is the realistic way to get closer). What the design does guarantee, and what the smoke test verifies, is that **memory is flat with respect to traffic**: upstream bodies are piped, never accumulated, and only numeric counters are retained. The compose file enforces the 128 MB cap regardless.
+
+The deployment budget was raised for this workload: 512 MB RAM and 1 vCPU is comfortable — xray adds roughly 20–40 MB with a 24-exit pool, and the batch tester runs at most `testBatchSize` inbounds at once.
 
 ## Security
 
@@ -396,10 +472,10 @@ Consider the 35 MB target honestly: on Node 20+ the V8 isolate alone accounts fo
 ## Verification
 
 ```bash
-npm run smoke     # 52 checks, no network, no API keys, all in a temp dir
+npm run smoke     # 65 checks, no network, no API keys, all in a temp dir
 ```
 
-It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; and the memory behaviour in the table above.
+It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; **V2Ray exit rotation retrying an IP-bound 429 through a second CONNECT proxy without cooling the account**; **the freebuff Ed25519 handshake verified against a protocol-enforcing mock**; and the memory behaviour in the table above.
 
 ## License
 

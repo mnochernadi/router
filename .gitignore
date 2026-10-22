@@ -1,6 +1,10 @@
 # secrets + runtime files — never commit real keys
 config.json
 state.json
+proxies.json
+freebuff-state.json
+xray-config.json
+xray-test-config.json
 *.tmp
 *.log
 

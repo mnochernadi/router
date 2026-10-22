@@ -19,6 +19,26 @@ COPY config.example.json ./
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node
 
+# Xray-core inside the image so the exit pool works out of the box. The Go
+# binary is static, so the musl base is fine.
+USER root
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)         xa=64 ;; \
+      aarch64|arm64)  xa=arm64-v8a ;; \
+      *)              xa=64 ;; \
+    esac; \
+    apk add --no-cache --virtual .xray-dl curl unzip >/dev/null; \
+    curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xa}.zip"; \
+    mkdir -p /tmp/xray && unzip -o -q /tmp/xray.zip -d /tmp/xray; \
+    install -m 0755 /tmp/xray/xray /usr/local/bin/xray; \
+    install -m 0644 /tmp/xray/geoip.dat /usr/local/share/xray-geoip.dat 2>/dev/null || true; \
+    install -m 0644 /tmp/xray/geosite.dat /usr/local/share/xray-geosite.dat 2>/dev/null || true; \
+    rm -rf /tmp/xray /tmp/xray.zip; \
+    apk del .xray-dl >/dev/null || true; \
+    /usr/local/bin/xray -version
+USER node
+
 EXPOSE 8787
 VOLUME ["/data"]
 

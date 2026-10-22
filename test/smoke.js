@@ -9,6 +9,8 @@
  *
  * Everything runs in a temp directory; config.json/state.json in the repo are untouched.
  */const http = require('node:http');
+const net = require('node:net');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -22,6 +24,9 @@ const CONFIG = path.join(TMP, 'config.json');
 const STATE = path.join(TMP, 'state.json');
 
 let pass = 0, fail = 0;
+let ipLimitedLeft = 1;
+const proxyHits = [];
+const PROXY_BASE_PORT = 21000 + Math.floor(Math.random() * 5000);
 const results = [];
 function check(name, cond, detail = '') {
   if (cond) { pass++; results.push(`  PASS  ${name}`); console.log(`  PASS  ${name}`); }
@@ -46,6 +51,21 @@ const mock = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   let json = {};
   try { json = JSON.parse(body || '{}'); } catch {}
+
+  // freebuff protocol mock (see handleFreebuff): the router only reaches it
+  // because FB_API_HOST is pointed at this process.
+  if (url.pathname === '/api/v1/freebuff/models' || url.pathname.startsWith('/api/v1/agent-runs')
+      || url.pathname === '/api/v1/chat/completions' || url.pathname.startsWith('/api/v1/freebuff/session')
+      || url.pathname === '/api/v1/freebuff/device-keys') {
+    return handleFreebuff(req, res, url, Buffer.from(body || '', 'utf8'), json);
+  }
+
+  // Simulated IP-bound limit: the first call 429s whatever the key, the next works.
+  if ((req.headers.authorization || '').replace(/^Bearer\s+/i, '') === 'key-ip-limit' && ipLimitedLeft > 0) {
+    ipLimitedLeft -= 1;
+    res.writeHead(429, { 'content-type': 'application/json' });
+    return res.end('{"error":{"message":"rate limited by IP"}}');
+  }
 
   const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const anthropicKey = req.headers['x-api-key'] || '';
@@ -218,12 +238,171 @@ function writeConfig() {
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'ocf-1', name: 'keyless', apiKey: '', enabled: true }],
       },
       {
+        id: 'proxy-test', name: 'Proxy Rotation Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
+        strategy: 'round-robin', timeoutMs: 10000, proxy: 'rotate',
+        accounts: [{ id: 'pt-1', name: 'ip-limited-key', apiKey: 'key-ip-limit', enabled: true }],
+      },
+      {
+        id: 'freebuff-test', name: 'freebuff Test', type: 'freebuff', baseUrl: 'http://127.0.0.1:1',
+        strategy: 'round-robin', timeoutMs: 10000, proxy: 'direct',
+        accounts: [{ id: 'fb-1', name: 'freebuff-account', apiKey: '11111111-2222-3333-4444-555555555555', enabled: true }],
+      },
+      {
         id: 'gemini-test', name: 'Gemini Test', type: 'gemini', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1beta`,
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'gm-1', name: 'gemini-1', apiKey: 'key-gem-ok', enabled: true }],
       },
     ],
   };
   fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// mock freebuff backend: enforces the real protocol (Ed25519 signatures over
+// the documented canonical string, catalog fetchId, admission, run ledger,
+// Buffy preamble). Any mismatch fails the test loudly.
+// ---------------------------------------------------------------------------
+const fb = {
+  publicKey: null,
+  keyId: 'key_test_1',
+  fetchId: 'fbf1.testfetchid',
+  instanceId: '',
+  runId: '',
+  verifyOk: 0,
+  verifyFail: 0,
+  signedPaths: [],
+  preambleOk: 0,
+  handle: 'fbm1.testhandle',
+  modelKey: 'm-test1',
+};
+
+function fbCanonical({ method, path: p, ts, bodyHash, fetchId }) {
+  return ['freebuff-device-v1', method, p, String(ts), bodyHash, fetchId || ''].join('\n');
+}
+
+function fbVerify(req, rawBody, fetchId) {
+  try {
+    const pk = fb.publicKey;
+    if (!pk) throw new Error('no device key registered');
+    const canonical = fbCanonical({
+      method: req.method,
+      path: new URL(req.url, 'http://x').pathname,
+      ts: req.headers['x-freebuff-device-ts'],
+      bodyHash: crypto.createHash('sha256').update(rawBody || Buffer.alloc(0)).digest('hex'),
+      fetchId,
+    });
+    const key = crypto.createPublicKey({ key: Buffer.from(pk, 'base64url'), format: 'der', type: 'spki' });
+    const ok = crypto.verify(null, Buffer.from(canonical), key, Buffer.from(String(req.headers['x-freebuff-device-sig']), 'base64url'));
+    if (!ok) throw new Error('signature mismatch');
+    fb.verifyOk += 1;
+    fb.signedPaths.push(new URL(req.url, 'http://x').pathname);
+    return null;
+  } catch (err) {
+    fb.verifyFail += 1;
+    return err.message;
+  }
+}
+
+async function handleFreebuff(req, res, url, rawBody, jsonBody) {
+  const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+
+  if (url.pathname === '/api/v1/freebuff/models') {
+    if (req.headers['x-freebuff-catalog-protocol'] !== '1' || req.headers['x-freebuff-client'] !== 'cli') {
+      return send(400, { error: 'catalog protocol/client header missing' });
+    }
+    const bad = fbVerify(req, null, '');
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    return send(200, { fetchId: fb.fetchId, models: [{ key: fb.modelKey, handle: fb.handle, name: 'Test Model', family: 'test' }] });
+  }
+
+  if (url.pathname === '/api/v1/freebuff/device-keys') {
+    // First contact: there is no stored key yet, so the server verifies against
+    // the public key carried in the request itself.
+    if (jsonBody && jsonBody.publicKey) fb.publicKey = jsonBody.publicKey;
+    const bad = fbVerify(req, rawBody, '');
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    if (!jsonBody || !jsonBody.publicKey) return send(400, { error: 'publicKey required' });
+    return send(200, { keyId: fb.keyId });
+  }
+
+  if (url.pathname === '/api/v1/freebuff/session/admission') {
+    const bad = fbVerify(req, rawBody, fb.fetchId);
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    if (req.headers['x-freebuff-model'] !== fb.handle) return send(400, { error: 'x-freebuff-model must be the catalog handle' });
+    if (!req.headers['x-freebuff-instance-id']) return send(400, { error: 'x-freebuff-instance-id required' });
+    if (!req.headers['x-freebuff-wallet-spend-limit']) return send(400, { error: 'spend limit required' });
+    fb.instanceId = req.headers['x-freebuff-instance-id'];
+    return send(200, { status: 'active', accessTier: 'limited', instanceId: fb.instanceId, model: fb.modelKey, remainingMs: 3600000, freebucks: { balance: 15 } });
+  }
+
+  if (url.pathname === '/api/v1/agent-runs') {
+    const bad = fbVerify(req, rawBody, fb.fetchId);
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    if (jsonBody && jsonBody.action === 'START') {
+      if (jsonBody.agentId !== 'freebuff-desktop-thread-local-v3') return send(400, { error: 'agentId mismatch' });
+      fb.runId = 'run_test_1';
+      return send(200, { runId: fb.runId });
+    }
+    if (jsonBody && jsonBody.action === 'FINISH') {
+      if (jsonBody.runId !== fb.runId) return send(400, { error: `runId Not Found: ${jsonBody.runId}` });
+      return send(200, { status: 'ok' });
+    }
+    return send(400, { error: 'bad action' });
+  }
+
+  if (url.pathname === '/api/v1/freebuff/session' && req.method === 'DELETE') {
+    const bad = fbVerify(req, null, fb.fetchId);
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    return send(200, { status: 'ended' });
+  }
+
+  if (url.pathname === '/api/v1/chat/completions') {
+    const bad = fbVerify(req, rawBody, fb.fetchId);
+    if (bad) return send(401, { error: `signature rejected: ${bad}` });
+    const meta = (jsonBody && jsonBody.codebuff_metadata) || {};
+    if (meta.run_id !== fb.runId || !fb.runId) return send(400, { message: 'No runId found in request body' });
+    if (meta.cost_mode !== 'free') return send(403, { error: 'cost_mode must be free' });
+    if (meta.freebuff_instance_id !== fb.instanceId) return send(400, { error: 'instance mismatch' });
+    if (jsonBody.model !== fb.handle) return send(400, { error: 'model must be the handle' });
+    if (req.headers['x-freebuff-sse-gzip-recovery'] !== '1') return send(410, { error: 'freebuff_update_required' });
+    if (!String(req.headers['user-agent'] || '').includes('runtime/browser')) return send(403, { error: 'free_mode_cli_required' });
+    const first = (jsonBody.messages || [])[0] || {};
+    if (first.role !== 'system' || !String(first.content).startsWith('You are Buffy, the coding agent behind Codebuff.')) {
+      return send(403, { error: 'free_mode_cli_required' });
+    }
+    fb.preambleOk += 1;
+    if (jsonBody.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ id: 'fb1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'freebuff says hi' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: 'fb1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    return send(200, {
+      id: 'fb1', object: 'chat.completion', model: fb.handle,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'freebuff says hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    });
+  }
+
+  return send(404, { error: 'no such freebuff route' });
+}
+
+/** Minimal HTTP CONNECT proxy: the router's proxiedRequest talks to this. */
+function startConnectProxy(onConnect) {
+  const srv = http.createServer((req, res) => { res.writeHead(405); res.end(); });
+  srv.on('connect', (req, clientSocket, head) => {
+    const [host, port] = String(req.url).split(':');
+    if (onConnect) onConnect(req.url);
+    const upstream = net.connect(Number(port), host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstream.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => upstream.destroy());
+  });
+  return srv;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,12 +443,34 @@ async function memOf() {
   await new Promise((r) => mock.listen(0, '127.0.0.1', r));
   MOCK_PORT = mock.address().port;
   console.log(`mock upstream on 127.0.0.1:${MOCK_PORT}`);
+
+  // Two CONNECT proxies stand in for two Xray exits. The router dials
+  // inboundBasePort + <index of exit in the active pool>, so pointing
+  // inboundBasePort at these two ports makes the pool real without xray.
+  const proxyA = startConnectProxy((target) => proxyHits.push(`a:${target}`));
+  const proxyB = startConnectProxy((target) => proxyHits.push(`b:${target}`));
+  await new Promise((r) => proxyA.listen(PROXY_BASE_PORT, '127.0.0.1', r));
+  await new Promise((r) => proxyB.listen(PROXY_BASE_PORT + 1, '127.0.0.1', r));
+  fs.writeFileSync(path.join(TMP, 'proxies.json'), JSON.stringify({
+    version: 1,
+    settings: {
+      enabled: true, xrayPath: 'xray-not-installed', inboundBasePort: PROXY_BASE_PORT, maxActive: 4,
+      rotateAttempts: 3, rotateOnStatuses: [429, 402, 403], markDeadAfter: 3, testBatchSize: 2, testBasePort: PROXY_BASE_PORT + 50,
+    },
+    sources: [{ id: 's1', url: 'http://127.0.0.1:1/sub', enabled: false, lastFetched: 0, count: 0, error: '' }],
+    exits: [
+      { id: 'x1', name: 'exit one', protocol: 'vless', host: '10.0.0.1', port: 443, uri: 'vless://x1', status: 'ok', latencyMs: 120, exitIp: '10.0.0.1', failures: 0, outbound: { protocol: 'freedom' } },
+      { id: 'x2', name: 'exit two', protocol: 'vless', host: '10.0.0.2', port: 443, uri: 'vless://x2', status: 'ok', latencyMs: 240, exitIp: '10.0.0.2', failures: 0, outbound: { protocol: 'freedom' } },
+    ],
+    active: ['x1', 'x2'],
+  }));
+
   fs.rmSync(STATE, { force: true });
   writeConfig();
 
   const child = spawn(process.execPath, [path.join(REPO, 'server.js')], {
     cwd: REPO,
-    env: { ...process.env, ROUTER_CONFIG: CONFIG, ROUTER_STATE: STATE, PORT: String(ROUTER_PORT), HOST: '127.0.0.1' },
+    env: { ...process.env, ROUTER_CONFIG: CONFIG, ROUTER_STATE: STATE, PORT: String(ROUTER_PORT), HOST: '127.0.0.1', FB_API_HOST: `http://127.0.0.1:${MOCK_PORT}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let routerLog = '';
@@ -529,6 +730,61 @@ async function memOf() {
       method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'second-keyless', apiKey: '' }] }),
     });
     check('keyless provider accepts an account with an empty key', (await keylessAdd.json()).added === 1);
+  }
+
+  // 17. V2Ray exit pool: a 429 rotates the exit instead of burning the account
+  {
+    const snap = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
+    check('proxies: pool loaded from proxies.json with 2 working exits',
+      snap.counts.ok === 2 && snap.active === 2, JSON.stringify(snap.counts));
+
+    proxyHits.length = 0;
+    const r = await chat({ headers: { 'x-router-provider': 'proxy-test' } });
+    check('proxy rotate: IP-bound 429 is retried through the next exit and succeeds',
+      r.status === 200 && r.headers.get('x-router-rotations') === '1' && r.headers.get('x-router-exit') === 'x2',
+      `status=${r.status} exit=${r.headers.get('x-router-exit')} rotations=${r.headers.get('x-router-rotations')}`);
+    check('proxy rotate: the request really travelled over both CONNECT proxies',
+      proxyHits.length === 2 && proxyHits[0].startsWith('a:127.0.0.1:') && proxyHits[1].startsWith('b:127.0.0.1:'),
+      JSON.stringify(proxyHits));
+
+    await sleep(700);
+    const st = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+    const pt = st.providers['proxy-test'].accounts['pt-1'];
+    check('proxy rotate: the account was NOT put on a 12h cooldown', !pt.limitedUntil, JSON.stringify(pt));
+
+    const direct = await chat({ headers: { 'x-router-provider': 'rr-provider' } });
+    check('providers without a proxy still go direct', direct.headers.get('x-router-exit') === 'direct', direct.headers.get('x-router-exit'));
+
+    const before = (await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json()).index;
+    const rot = await (await fetch(routerUrl('/admin/api/proxies/rotate'), { method: 'POST', headers: ADMIN })).json();
+    check('manual rotate advances the pool index', rot.ok === true && rot.exit && rot.index !== before, JSON.stringify(rot).slice(0, 140));
+
+    const bad = await (await fetch(routerUrl('/admin/api/proxies/version'), { method: 'POST', headers: ADMIN })).json();
+    check('missing xray binary is reported, not fatal', bad.ok === false && /xray/i.test(bad.path), JSON.stringify(bad).slice(0, 160));
+  }
+
+  // 18. freebuff: full signed handshake against a protocol-enforcing mock
+  {
+    const r = await chat({ model: fb.modelKey, headers: { 'x-router-provider': 'freebuff-test' } });
+    const body = r.status === 200 ? JSON.parse(r.text) : {};
+    check('freebuff: signed catalog + admission + run + completion succeed',
+      r.status === 200 && body.choices[0].message.content === 'freebuff says hi', `${r.status} ${r.text.slice(0, 200)}`);
+    check('freebuff: every request carried a valid Ed25519 signature',
+      fb.verifyOk >= 5 && fb.verifyFail === 0, `ok=${fb.verifyOk} fail=${fb.verifyFail} paths=${fb.signedPaths.join(',')}`);
+    check('freebuff: the Buffy preamble was injected', fb.preambleOk === 1, String(fb.preambleOk));
+
+    const s = await chat({ model: fb.modelKey, stream: true, headers: { 'x-router-provider': 'freebuff-test' } });
+    check('freebuff: streaming passthrough with [DONE]',
+      s.status === 200 && s.text.includes('freebuff says hi') && s.text.trimEnd().endsWith('data: [DONE]'), s.text.slice(0, 160));
+
+    const models = await (await fetch(routerUrl('/admin/api/provider/freebuff-test/models'), { headers: ADMIN })).json();
+    check('freebuff: dashboard model list comes from the signed catalog',
+      models.count === 1 && models.models[0] === fb.modelKey, JSON.stringify(models).slice(0, 200));
+
+    const fbs = await (await fetch(routerUrl('/admin/api/freebuff'), { headers: ADMIN })).json();
+    check('freebuff: session state is exposed (device key, catalog, instance)',
+      fbs.accounts.length === 1 && fbs.accounts[0].deviceKeyId === fb.keyId && fbs.accounts[0].catalogSize === 1,
+      JSON.stringify(fbs).slice(0, 240));
   }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path

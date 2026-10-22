@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>LLM Router · Control Plane</title>
+<title>LLM Router — Control Plane</title>
 <meta name="color-scheme" content="dark" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Cpath d='M4 12h6m4 0h6M10 8v8m4-8v8'/%3E%3C/svg%3E" />
 <script src="https://cdn.tailwindcss.com"></script>
@@ -70,7 +70,7 @@
         <div class="flex items-center gap-2 text-sm font-semibold text-white">LLM Router
           <span class="pill bg-accent/10 text-accent" x-text="'v' + (s.version || '…')"></span>
         </div>
-        <div class="text-[11px] text-slate-500" x-text="'node ' + (s.node || '') + ' · cooldown ' + (s.cooldownHours ?? 12) + 'h on ' + ((s.cooldownStatuses||[]).join('/'))"></div>
+        <div class="text-[11px] text-slate-500" x-text="'node ' + (s.node || '') + ' — cooldown ' + (s.cooldownHours ?? 12) + 'h on ' + ((s.cooldownStatuses||[]).join('/'))"></div>
       </div>
     </div>
 
@@ -128,6 +128,24 @@
 <!-- ===================== BODY ===================== -->
 <main class="mx-auto max-w-[1400px] px-4 py-6">
 
+  <!-- tabs -->
+  <div class="mb-4 flex flex-wrap items-center gap-1.5 rounded-xl border border-ink-700 bg-ink-900/60 p-1.5">
+    <template x-for="t in [{id:'providers',label:'Providers',icon:'server'},{id:'network',label:'Network',icon:'globe'},{id:'activity',label:'Activity',icon:'activity'}]" :key="t.id">
+      <button class="btn" :class="tab === t.id && 'btn-primary'" @click="switchTab(t.id)">
+        <i :data-lucide="t.icon" class="h-3.5 w-3.5"></i><span x-text="t.label"></span>
+        <span x-show="t.id === 'network' && s.proxies && s.proxies.active" class="pill bg-emerald-500/20 text-emerald-200" x-text="s.proxies.active"></span>
+      </button>
+    </template>
+    <div class="ml-auto flex items-center gap-2 pr-1 text-[11px] text-slate-500">
+      <span x-show="s.proxies && s.proxies.running" class="pill bg-emerald-500/10 text-emerald-300">
+        <i data-lucide="waypoints" class="h-3 w-3"></i>xray <span x-text="s.proxies.version || ''"></span>
+      </span>
+      <span x-show="s.proxies && !s.proxies.running && (s.proxies.total > 0)" class="pill bg-rose-500/10 text-rose-300">xray down</span>
+    </div>
+  </div>
+
+  <!-- ===================== PROVIDERS TAB ===================== -->
+  <div x-show="tab === 'providers'">
   <!-- toolbar -->
   <div class="mb-5 flex flex-wrap items-center gap-2">
     <div class="mr-auto flex items-center gap-2">
@@ -159,12 +177,15 @@
               <h2 class="truncate text-sm font-semibold text-white" x-text="p.name"></h2>
               <span class="pill bg-ink-800 text-slate-400" x-text="p.type"></span>
               <span x-show="p.id === s.defaultProvider" class="pill bg-violet-500/10 text-violet-300">default</span>
+              <span x-show="p.proxy && p.proxy !== 'direct'" class="pill bg-accent/10 text-accent">
+                <i data-lucide="waypoints" class="h-3 w-3"></i><span x-text="p.proxy === 'rotate' ? 'rotating exits' : ('exit ' + p.proxy)"></span>
+              </span>
             </div>
-            <div class="mono mt-0.5 truncate text-[11px] text-slate-500" x-text="p.id + ' · ' + (p.baseUrl || '—')"></div>
+            <div class="mono mt-0.5 truncate text-[11px] text-slate-500" x-text="p.id + ' — ' + (p.baseUrl || '—')"></div>
           </div>
 
           <!-- strategy switch -->
-          <div class="seg" title="round-robin: rotate every request · sequential: keep the first healthy account until it is rate-limited">
+          <div class="seg" title="round-robin: rotate every request — sequential: keep the first healthy account until it is rate-limited">
             <button :class="p.strategy === 'round-robin' && 'on'" @click="setStrategy(p, 'round-robin')">Round-Robin</button>
             <button :class="p.strategy === 'sequential' && 'on'" @click="setStrategy(p, 'sequential')">Sequential</button>
           </div>
@@ -260,9 +281,180 @@
       </div>
     </template>
   </div>
+  </div><!-- /providers tab -->
+
+  <!-- ===================== NETWORK TAB ===================== -->
+  <div x-show="tab === 'network'" x-cloak>
+    <div class="grid grid-cols-1 gap-5 xl:grid-cols-3">
+      <!-- pool status -->
+      <section class="card rounded-2xl p-4 xl:col-span-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <i data-lucide="waypoints" class="h-4 w-4 text-accent"></i>
+          <h2 class="text-sm font-semibold text-white">V2Ray / Xray exit pool</h2>
+          <span class="pill" :class="np && np.xray.running ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'"
+                x-text="np && np.xray.running ? ('running — ' + (np.xray.version || '?') + ' — ' + np.xray.ports + ' ports') : 'stopped'"></span>
+          <span class="pill bg-ink-800 text-slate-400" x-text="np ? (np.counts.ok + ' working / ' + np.counts.total + ' known') : '—'"></span>
+          <span class="pill bg-accent/10 text-accent" x-show="np && np.active" x-text="(np ? np.active : 0) + ' in rotation'"></span>
+        </div>
+        <p class="mt-1 text-[11px] text-slate-500" x-show="np && np.xray.error" x-text="'xray: ' + (np ? np.xray.error : '')"></p>
+
+        <!-- actions -->
+        <div class="mt-3 flex flex-wrap items-center gap-2">
+          <button class="btn btn-primary" @click="refreshSubs()" :disabled="busySub">
+            <i data-lucide="download-cloud" class="h-3.5 w-3.5" :class="busySub && 'animate-pulse'"></i>Refresh subscriptions</button>
+          <button class="btn" @click="testProxies(false)">
+            <i data-lucide="gauge" class="h-3.5 w-3.5"></i>Test new</button>
+          <button class="btn" @click="testProxies(true)">
+            <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Re-test all</button>
+          <button class="btn" @click="applyPool()"><i data-lucide="power" class="h-3.5 w-3.5"></i>Apply best &amp; restart xray</button>
+          <button class="btn" @click="rotateNow()"><i data-lucide="shuffle" class="h-3.5 w-3.5"></i>Rotate now</button>
+          <button class="btn" @click="xrayAction(np && np.xray.running ? 'stop' : 'start')">
+            <i data-lucide="play" class="h-3.5 w-3.5"></i><span x-text="np && np.xray.running ? 'Stop xray' : 'Start xray'"></span></button>
+          <button class="btn" @click="purgeDead()"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i>Drop dead</button>
+        </div>
+
+        <!-- test progress -->
+        <div x-show="np && np.test && np.test.running" class="mt-3 rounded-xl border border-accent/30 bg-accent/5 p-3">
+          <div class="flex items-center gap-2 text-[11px] text-accent">
+            <i data-lucide="loader" class="h-3.5 w-3.5 animate-spin"></i>
+            testing <span class="mono" x-text="(np ? np.test.done : 0) + '/' + (np ? np.test.total : 0)"></span>
+            (batch <span x-text="np ? np.test.batch + '/' + np.test.batches : ''"></span>) —
+            <span class="text-emerald-300" x-text="(np ? np.test.ok : 0) + ' ok'"></span> —
+            <span class="text-rose-300" x-text="(np ? np.test.dead : 0) + ' dead'"></span>
+          </div>
+          <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-ink-800">
+            <div class="h-full bg-gradient-to-r from-accent to-emerald-400 transition-all duration-500"
+                 :style="'width:' + (np && np.test.total ? Math.round((np.test.done / np.test.total) * 100) : 0) + '%'"></div>
+          </div>
+        </div>
+
+        <!-- sources -->
+        <div class="mt-4">
+          <label class="fld">Subscription sources (one URL per line — vless / vmess / trojan / ss, plain or base64)</label>
+          <textarea class="input mono h-24" x-model="srcText" placeholder="https://raw.githubusercontent.com/—/subscription.txt"></textarea>
+          <div class="mt-2 flex items-center gap-2">
+            <button class="btn" @click="saveSources()"><i data-lucide="save" class="h-3.5 w-3.5"></i>Save sources</button>
+            <span class="text-[11px] text-slate-500" x-text="np ? (np.sources.length + ' configured — ' + (np.counts.byProtocol ? Object.entries(np.counts.byProtocol).map(([k,v]) => k + ' ' + v).join(', ') : 'no exits yet')) : ''"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- per-provider assignment + tuning -->
+      <section class="card rounded-2xl p-4">
+        <div class="mb-2 flex items-center gap-2">
+          <i data-lucide="plug-zap" class="h-4 w-4 text-accent"></i>
+          <h2 class="text-sm font-semibold text-white">Apply exits to providers</h2>
+        </div>
+        <p class="text-[11px] text-slate-500">Rate limits that follow your IP (OpenCode, freebuff geo-block) are beaten by giving that provider its own rotating exit.</p>
+        <div class="mt-3 space-y-2">
+          <template x-for="p in (s.providers || [])" :key="p.id">
+            <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/50 px-2.5 py-2">
+              <span class="min-w-0 flex-1 truncate text-[12px] text-slate-200" x-text="p.name"></span>
+              <select class="input mono !w-40 !py-1 !text-[11px]" :value="p.proxy || 'direct'" @change="assignProxy(p, $event.target.value)">
+                <option value="direct">Direct</option>
+                <option value="rotate">Rotate pool</option>
+                <template x-for="e in (np ? np.exits.filter(x => x.status === 'ok') : [])" :key="e.id">
+                  <option :value="e.id" x-text="'exit ' + e.id + ' — ' + (e.exitIp || e.host)"></option>
+                </template>
+              </select>
+            </div>
+          </template>
+        </div>
+
+        <div class="mt-4 grid grid-cols-2 gap-2">
+          <div>
+            <label class="fld">Pool size</label>
+            <input class="input mono" type="number" min="1" max="200" x-model.number="nps.maxActive" @change="saveProxySettings()" />
+          </div>
+          <div>
+            <label class="fld">Retries per exit</label>
+            <input class="input mono" type="number" min="0" max="10" x-model.number="nps.rotateAttempts" @change="saveProxySettings()" />
+          </div>
+          <div class="col-span-2">
+            <label class="fld">Test URL (must return JSON with an <code class="mono">ip</code> field for exit-IP detection)</label>
+            <input class="input mono" x-model="nps.testUrl" @change="saveProxySettings()" />
+          </div>
+          <div>
+            <label class="fld">Test batch size</label>
+            <input class="input mono" type="number" min="1" max="500" x-model.number="nps.testBatchSize" @change="saveProxySettings()" />
+          </div>
+          <div>
+            <label class="fld">Parallel tests</label>
+            <input class="input mono" type="number" min="1" max="64" x-model.number="nps.testConcurrency" @change="saveProxySettings()" />
+          </div>
+          <div class="col-span-2">
+            <label class="fld">xray binary path</label>
+            <div class="flex gap-2">
+              <input class="input mono" x-model="nps.xrayPath" placeholder="xray" />
+              <button class="btn" @click="xrayAction('start')">Test</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- exits table -->
+    <section class="card mt-5 rounded-2xl p-4">
+      <div class="mb-3 flex flex-wrap items-center gap-2">
+        <i data-lucide="list-tree" class="h-4 w-4 text-accent"></i>
+        <h2 class="text-sm font-semibold text-white">Exits</h2>
+        <input class="input mono !w-56 !py-1 !text-[11px]" x-model="nf" placeholder="filter by name / host / ip" />
+        <select class="input !w-32 !py-1 !text-[11px]" x-model="nstatus">
+          <option value="all">all states</option>
+          <option value="ok">working</option>
+          <option value="untested">untested</option>
+          <option value="dead">dead</option>
+        </select>
+        <span class="pill bg-ink-800 text-slate-400" x-text="filteredExits().length + ' shown'"></span>
+        <span class="pill bg-rose-500/10 text-rose-300" x-show="np && np.truncated">list truncated to 400 — use filters after re-test</span>
+      </div>
+      <div class="max-h-[520px] overflow-y-auto">
+        <table class="w-full text-left text-[12px]">
+          <thead class="sticky top-0 bg-ink-900/95 text-[10px] uppercase tracking-wider text-slate-500">
+            <tr>
+              <th class="px-2 py-1.5">exit</th>
+              <th class="px-2 py-1.5">proto</th>
+              <th class="px-2 py-1.5">endpoint</th>
+              <th class="px-2 py-1.5">exit IP</th>
+              <th class="px-2 py-1.5">latency</th>
+              <th class="px-2 py-1.5">state</th>
+              <th class="px-2 py-1.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="e in filteredExits()" :key="e.id">
+              <tr class="border-t border-ink-800 hover:bg-ink-850/60">
+                <td class="max-w-[240px] truncate px-2 py-1.5 text-slate-300" x-text="e.name"></td>
+                <td class="mono px-2 py-1.5 text-slate-500" x-text="e.protocol"></td>
+                <td class="mono px-2 py-1.5 text-slate-400" x-text="e.host + ':' + e.port"></td>
+                <td class="mono px-2 py-1.5 text-slate-400" x-text="e.exitIp || '—'"></td>
+                <td class="mono px-2 py-1.5" :class="e.latencyMs && e.latencyMs < 800 ? 'text-emerald-300' : 'text-amber-300'" x-text="e.latencyMs ? e.latencyMs + 'ms' : '—'"></td>
+                <td class="px-2 py-1.5">
+                  <span class="pill" :class="{ 'bg-emerald-500/10 text-emerald-300': e.status === 'ok', 'bg-rose-500/10 text-rose-300': e.status === 'dead', 'bg-ink-800 text-slate-400': e.status === 'untested' }" x-text="e.status"></span>
+                  <span x-show="e.active" class="pill bg-accent/10 text-accent">in pool</span>
+                </td>
+                <td class="px-2 py-1.5 text-right">
+                  <button class="btn !px-2 !py-0.5" title="Remove" @click="deleteExit(e)"><i data-lucide="x" class="h-3 w-3"></i></button>
+                </td>
+              </tr>
+            </template>
+            <template x-if="!filteredExits().length">
+              <tr><td colspan="7" class="px-3 py-8 text-center text-xs text-slate-500">
+                No exits yet. Keep the default sources and press <span class="text-slate-300">Refresh subscriptions</span>, then <span class="text-slate-300">Test new</span>.
+              </td></tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-2 text-[11px] text-slate-500">
+        Testing walks the list in batches through a throwaway xray instance (one inbound per candidate), records latency + exit IP, marks the best
+        <span class="mono" x-text="nps.maxActive"></span> for the live pool and restarts xray with them. Dead exits are retried on the next run.
+      </p>
+    </section>
+  </div><!-- /network tab -->
 
   <!-- activity -->
-  <section class="card mt-6 rounded-2xl p-4">
+  <section class="card mt-6 rounded-2xl p-4" x-show="tab === 'activity'">
     <div class="mb-3 flex items-center gap-2">
       <i data-lucide="activity" class="h-4 w-4 text-accent"></i>
       <h2 class="text-sm font-semibold text-white">Recent routing activity</h2>
@@ -298,7 +490,7 @@
       </div>
     </div>
     <label class="fld">ADMIN_KEY</label>
-    <input class="input mono" type="password" x-model="keyInput" @keydown.enter="login()" placeholder="config.json → adminKey" autofocus />
+    <input class="input mono" type="password" x-model="keyInput" @keydown.enter="login()" placeholder="config.json ? adminKey" autofocus />
     <p class="mt-2 text-[11px] text-rose-400" x-show="loginError" x-text="loginError"></p>
     <button class="btn btn-primary mt-4 w-full justify-center" @click="login()">
       <i data-lucide="log-in" class="h-3.5 w-3.5"></i>Unlock dashboard
@@ -333,6 +525,7 @@
           <option value="gemini">Google Gemini</option>
           <option value="opencode">OpenCode (Console key)</option>
           <option value="opencode-free">OpenCode Free (no key)</option>
+          <option value="freebuff">freebuff (Codebuff, needs an exit proxy if your IP is geo-blocked)</option>
           <option value="custom">Custom OpenAI-compatible</option>
         </select>
       </div>
@@ -342,6 +535,17 @@
           <option value="round-robin">Round-robin (rotate every request)</option>
           <option value="sequential">Sequential (first healthy until limited)</option>
         </select>
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Outbound proxy</label>
+        <select class="input" x-model="pf.proxy">
+          <option value="direct">Direct (use the server's own IP)</option>
+          <option value="rotate">Rotate the V2Ray/Xray pool — beats IP-bound rate limits</option>
+          <template x-for="e in (np ? np.exits.filter(x => x.status === 'ok') : [])" :key="e.id">
+            <option :value="e.id" x-text="'Pin to exit ' + e.id + ' — ' + (e.exitIp || e.host) + ' — ' + e.latencyMs + 'ms'"></option>
+          </template>
+        </select>
+        <p class="mt-1 text-[11px] text-slate-500">Rotating retries a rate-limited request through the next exit before it cools the account down. <span x-show="!np || !np.counts.ok" class="text-amber-400">No working exits yet — run a proxy test in the Network tab.</span></p>
       </div>
       <div class="sm:col-span-2">
         <label class="fld">Base URL</label>
@@ -394,7 +598,7 @@
         </div>
         <div>
           <label class="fld">API key <span class="text-slate-600">(leave blank to keep current)</span></label>
-          <input class="input mono" type="password" x-model="af.apiKey" :placeholder="af.maskedKey || 'sk-…'" />
+          <input class="input mono" type="password" x-model="af.apiKey" :placeholder="af.maskedKey || 'sk-—'" />
         </div>
         <label class="flex items-center gap-2 text-xs text-slate-400">
           <input type="checkbox" x-model="af.enabled" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" /> Enabled for routing
@@ -506,6 +710,9 @@
         <input class="input mono" type="password" x-model="sf.adminKey" placeholder="new ADMIN_KEY" />
       </div>
       <label class="flex items-center gap-2 text-xs text-slate-400 sm:col-span-2">
+        <input type="checkbox" x-model="sf.loggingRequests" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" /> Write routing lines to the process log (off by default — counters are in the dashboard)
+      </label>
+      <label class="flex items-center gap-2 text-xs text-slate-400 sm:col-span-2">
         <input type="checkbox" x-model="sf.cors" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" /> Send permissive CORS headers
       </label>
     </div>
@@ -555,12 +762,21 @@ const TYPES = {
   gemini:     { label: 'Google Gemini',          baseUrl: 'https://generativelanguage.googleapis.com/v1beta', style: 'gemini', icon: 'gem' },
   opencode:   { label: 'OpenCode (Console)',     baseUrl: 'https://opencode.ai/inference',                style: 'opencode',  icon: 'terminal' },
   'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1',              style: 'openai',    icon: 'unlock' },
+  freebuff:   { label: 'freebuff (Codebuff)',     baseUrl: 'https://www.codebuff.com',                     style: 'openai',    icon: 'bird' },
   custom:     { label: 'OpenAI-compatible',      baseUrl: '',                                              style: 'openai',    icon: 'plug' },
 };
 
 function app() {
   return {
-    s: { providers: [], totals: {}, memory: { samples: [] }, events: [] },
+    s: { providers: [], totals: {}, memory: { samples: [] }, events: [], proxies: {} },
+    tab: 'providers',
+    np: null,
+    nps: { maxActive: 24, rotateAttempts: 3, testUrl: '', testBatchSize: 40, testConcurrency: 8, xrayPath: 'xray' },
+    nf: '',
+    nstatus: 'all',
+    srcText: '',
+    busySub: false,
+    pollTimer: null,
     modal: null,
     key: localStorage.getItem('routerAdminKey') || '',
     keyInput: '',
@@ -572,9 +788,9 @@ function app() {
     tick: 0,
     timer: null,
 
-    pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', error: '' },
+    pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
-    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, adminKey: '', error: '' },
+    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
     mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
     cf: { title: '', body: '', run: null },
 
@@ -596,7 +812,7 @@ function app() {
     ago(t) { const d = Math.max(0, Math.round((Date.now() - t) / 1000)); if (d < 60) return d + 's ago'; if (d < 3600) return Math.round(d / 60) + 'm ago'; return Math.round(d / 3600) + 'h ago'; },
     uptime(sec) { const s = Number(sec || 0); const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; },
     providerIcon(type) { return (TYPES[type] || TYPES.custom).icon; },
-    typeHint() { const t = TYPES[this.pf.type] || TYPES.custom; return t.baseUrl ? `Default for ${t.label}: ${t.baseUrl} · upstream API style: ${t.style}` : 'Set the full base URL of your OpenAI-compatible endpoint.'; },
+    typeHint() { const t = TYPES[this.pf.type] || TYPES.custom; return t.baseUrl ? `Default for ${t.label}: ${t.baseUrl} — upstream API style: ${t.style}` : 'Set the full base URL of your OpenAI-compatible endpoint.'; },
     countdown(until) {
       const left = Math.max(0, Math.round((until - Date.now()) / 1000));
       const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), sec = left % 60;
@@ -686,10 +902,10 @@ function app() {
       if (p) {
         this.pf = { editing: true, id: p.id, name: p.name, type: p.type, baseUrl: p.baseUrl, strategy: p.strategy,
                     cooldownHours: p.cooldownHours, timeoutMs: p.timeoutMs || 30000, maxAttempts: p.maxAttempts || 0,
-                    headersText: '', hasHeaders: !!p.hasCustomHeaders, error: '' };
+                    headersText: '', hasHeaders: !!p.hasCustomHeaders, proxy: p.proxy || 'direct', error: '' };
       } else {
         this.pf = { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin',
-                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, error: '' };
+                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, proxy: 'direct', error: '' };
       }
       this.modal = 'provider';
       this.refreshIcons();
@@ -709,7 +925,7 @@ function app() {
       const body = {
         id: (this.pf.id || '').trim(), name: this.pf.name, type: this.pf.type, baseUrl: this.pf.baseUrl,
         strategy: this.pf.strategy, cooldownHours: this.pf.cooldownHours, timeoutMs: this.pf.timeoutMs,
-        maxAttempts: this.pf.maxAttempts, force: true,
+        maxAttempts: this.pf.maxAttempts, proxy: this.pf.proxy, force: true,
       };
       // Blank field = keep whatever is already stored, never silently wipe it.
       if (headers || !this.pf.hasHeaders) body.headers = headers;
@@ -726,7 +942,7 @@ function app() {
       try {
         await this.api('/provider/' + encodeURIComponent(p.id) + '/strategy', { method: 'POST', body: { strategy } });
         p.strategy = strategy;
-        this.toast(`${p.id} → ${strategy}`, 'ok');
+        this.toast(`${p.id} ? ${strategy}`, 'ok');
         this.load();
       } catch (err) { this.toast(err.message, 'err'); }
     },
@@ -828,6 +1044,121 @@ function app() {
                responses: 'bg-emerald-500/10 text-emerald-300', chat: 'bg-ink-800 text-slate-400' }[this.modelKind(m)];
     },
 
+    switchTab(id) { this.tab = id; this.refreshIcons(); if (id === 'network') this.loadProxies(); },
+
+    // ---------- network / exit pool ----------
+    async loadProxies(force) {
+      if (!force && this.tab !== 'network' && this.np) return this.np;
+      try {
+        const np = await this.api('/proxies');
+        this.np = np;
+        this.nps = {
+          maxActive: np.settings.maxActive, rotateAttempts: np.settings.rotateAttempts,
+          testUrl: np.settings.testUrl, testBatchSize: np.settings.testBatchSize,
+          testConcurrency: np.settings.testConcurrency, xrayPath: np.xrayPath || 'xray',
+        };
+        if (!this.srcText || force) this.srcText = (np.sources || []).map((s) => s.url).join('\n');
+        if (np.test && np.test.running) this.startPolling();
+        this.refreshIcons();
+      } catch (err) { if (force) this.toast(err.message, 'err'); }
+      return this.np;
+    },
+    startPolling() {
+      if (this.pollTimer) return;
+      this.pollTimer = setInterval(async () => {
+        const np = await this.api('/proxies').catch(() => null);
+        if (!np) return;
+        this.np = np;
+        if (!np.test.running) {
+          clearInterval(this.pollTimer);
+          this.pollTimer = null;
+          this.toast(`Proxy test finished: ${np.test.ok} working, ${np.test.dead} dead`, np.test.ok ? 'ok' : 'warn');
+          if (np.xray.running) this.toast('xray restarted with the best exits', 'ok');
+        }
+      }, 1500);
+    },
+    filteredExits() {
+      const list = (this.np && this.np.exits) || [];
+      const f = (this.nf || '').trim().toLowerCase();
+      return list.filter((e) => (this.nstatus === 'all' || e.status === this.nstatus)
+        && (!f || `${e.name} ${e.host} ${e.exitIp} ${e.id}`.toLowerCase().includes(f)));
+    },
+    async refreshSubs() {
+      this.busySub = true;
+      try {
+        await this.api('/proxies/sources', { method: 'POST', body: { sources: this.srcText.split('\n').map((u) => u.trim()).filter(Boolean).map((url) => ({ url })) } });
+        const r = await this.api('/proxies/refresh', { method: 'POST', body: {} });
+        const skipped = Object.entries(r.skipped || {}).map(([k, v]) => `${k} ${v}`).join(', ');
+        this.toast(`Subscriptions: ${r.parsed} configs parsed, ${r.added} new${skipped ? ` (skipped ${skipped})` : ''}`, 'ok');
+        (r.errors || []).forEach((e) => this.toast(e, 'err'));
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+      this.busySub = false;
+    },
+    async saveSources() {
+      try {
+        await this.api('/proxies/sources', { method: 'POST', body: { sources: this.srcText.split('\n').map((u) => u.trim()).filter(Boolean).map((url) => ({ url })) } });
+        this.toast('Sources saved', 'ok');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async testProxies(retest) {
+      try {
+        const r = await this.api('/proxies/test', { method: 'POST', body: { retest } });
+        this.toast(`Testing ${r.total} configs in ${r.batches} batches…`, 'info');
+        this.startPolling();
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async applyPool() {
+      try {
+        const r = await this.api('/proxies/apply', { method: 'POST', body: {} });
+        this.toast(r.running ? `xray running with ${r.exits} exits` : `xray did not start: ${r.error || r.reason}`, r.running ? 'ok' : 'err');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async rotateNow() {
+      try {
+        const r = await this.api('/proxies/rotate', { method: 'POST', body: {} });
+        this.toast(r.exit ? `Rotated to ${r.exit.exitIp || r.exit.id}` : 'No working exits to rotate to', r.exit ? 'ok' : 'warn');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async xrayAction(action) {
+      try {
+        const r = await this.api('/proxies/xray', { method: 'POST', body: { action, xrayPath: this.nps.xrayPath } });
+        if (action === 'stop') this.toast('xray stopped', 'info');
+        else this.toast(r.running ? `xray ${r.xray.version} up with ${r.exits} exits` : `xray failed: ${r.xray.error || r.error || r.reason}`, r.running ? 'ok' : 'err');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async saveProxySettings() {
+      try {
+        await this.api('/proxies/settings', { method: 'POST', body: { ...this.nps } });
+        this.toast('Pool settings saved', 'ok');
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async purgeDead() {
+      try {
+        const r = await this.api('/proxies/purge', { method: 'POST', body: { status: 'dead' } });
+        this.toast(`Removed ${r.removed} dead exits`, 'ok');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async deleteExit(e) {
+      try {
+        await this.api('/proxies/exit/' + encodeURIComponent(e.id), { method: 'DELETE' });
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async assignProxy(p, value) {
+      try {
+        await this.api('/provider/' + encodeURIComponent(p.id), { method: 'PATCH', body: { proxy: value } });
+        p.proxy = value;
+        this.toast(value === 'direct' ? `${p.id} ? direct` : value === 'rotate' ? `${p.id} ? rotating pool` : `${p.id} ? exit ${value}`, 'ok');
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+
     // ---------- settings ----------
     openSettings() {
       this.sf = {
@@ -836,6 +1167,7 @@ function app() {
         proxyKeysText: '',
         cooldownStatusesText: (this.s.cooldownStatuses || [429, 402, 403]).join(','),
         cors: !!this.s.cors,
+        loggingRequests: !!(this.s.logging && this.s.logging.requests),
         adminKey: '',
         error: '',
       };
@@ -848,6 +1180,7 @@ function app() {
         cooldownHours: this.sf.cooldownHours,
         defaultProvider: this.sf.defaultProvider,
         cors: this.sf.cors,
+        loggingRequests: this.sf.loggingRequests,
         cooldownStatuses: this.sf.cooldownStatusesText.split(',').map(x => Number(x.trim())).filter(Number.isFinite),
       };
       const keys = this.sf.proxyKeysText.split('\n').map(x => x.trim()).filter(Boolean);

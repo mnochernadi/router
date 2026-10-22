@@ -37,6 +37,9 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { Readable, Transform } = require('node:stream');
+const { ProxyManager } = require('./proxy-manager');
+const { proxiedRequest } = require('./proxy-client');
+const { FreebuffDriver } = require('./freebuff-driver');
 
 // ---------------------------------------------------------------------------
 // Paths and static defaults
@@ -66,6 +69,9 @@ const PROVIDER_TYPES = {
   // picks the right sub-endpoint per model id -- see openCodeKind().
   opencode: { label: 'OpenCode (Console)', baseUrl: 'https://opencode.ai/inference', style: 'opencode' },
   'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1', style: 'opencode-free' },
+  // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
+  // The driver owns the whole handshake, so this style always wants a proxy exit.
+  freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff' },
   custom: { label: 'OpenAI-compatible', baseUrl: '', style: 'openai' },
 };
 
@@ -212,6 +218,7 @@ function defaultConfig() {
     defaultProvider: '',
     cors: true,
     proxyKeys: [],
+    logging: { requests: false },
     providers: [
       { id: 'openai-main', name: 'OpenAI', type: 'openai', strategy: 'round-robin', accounts: [] },
       { id: 'openrouter-main', name: 'OpenRouter', type: 'openrouter', strategy: 'round-robin', accounts: [] },
@@ -247,6 +254,7 @@ function normalizeProvider(p) {
     maxAttempts: Number(p.maxAttempts) > 0 ? Math.min(Number(p.maxAttempts), 32) : 0,
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
+    proxy: String(p.proxy || 'direct'),
     accounts,
   };
 }
@@ -264,12 +272,23 @@ function normalizeConfig(cfg) {
     ? out.retryStatuses.map(Number).filter(Number.isFinite)
     : DEFAULT_RETRY_STATUSES.slice();
   out.proxyKeys = Array.isArray(out.proxyKeys) ? out.proxyKeys.map(String) : [];
+  out.logging = { requests: !!(out.logging && out.logging.requests) };
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
   if (process.env.ADMIN_KEY) out.adminKey = process.env.ADMIN_KEY;
   return out;
 }
 
 let config = defaultConfig();
+
+// V2Ray/Xray exit pool + freebuff session bookkeeping. Both are optional: with
+// no xray binary and no freebuff accounts the router behaves exactly as before.
+let proxies = null;
+let freebuff = null;
+const DATA_DIR = path.dirname(STATE_PATH);
+
+function reqLog(...args) {
+  if (config.logging && config.logging.requests) console.log(...args);
+}
 
 function loadConfigSync() {
   for (const file of [CONFIG_PATH, CONFIG_EXAMPLE_PATH]) {
@@ -503,6 +522,11 @@ function buildUpstream(provider, account, ctx) {
   const baseUrl = provider.baseUrl || def.baseUrl;
   const style = def.style;
 
+  if (style === 'freebuff') {
+    // URL/headers/body are produced by freebuff-driver inside callUpstream.
+    return { style, responseStyle: 'openai', url: '', headers: {}, payload: {} };
+  }
+
   if (style === 'opencode' || style === 'opencode-free') {
     const key = usableKey(account.apiKey);
     const headers = { 'content-type': 'application/json', ...(provider.headers || {}) };
@@ -594,19 +618,62 @@ async function callUpstream(provider, account, ctx) {
   const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 30_000;
   const timer = setTimeout(() => controller.abort(new Error('upstream timeout')), timeoutMs);
   if (timer.unref) timer.unref();
+
+  let url = spec.url;
+  let headers = spec.headers;
+  let payload = ctx.method === 'GET' ? null : JSON.stringify(spec.payload);
+  let meta = null;
+
+  try {
+    if (spec.style === 'freebuff') {
+      // The driver performs the catalog/admission/run handshake and returns a
+      // request that is already signed; we only choose the exit it travels over.
+      if (!freebuff) throw new Error('freebuff driver unavailable');
+      const built = await freebuff.prepare({ provider, account, body: ctx.body, model: ctx.model, stream: ctx.stream });
+      url = built.url;
+      headers = built.headers;
+      payload = built.raw;
+      meta = built.meta;
+    }
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+
+  const picked = proxies ? proxies.pick(provider) : null;
   let upstream;
   try {
-    upstream = await fetch(spec.url, {
-      method: ctx.method === 'GET' ? 'GET' : 'POST',
-      headers: spec.headers,
-      body: ctx.method === 'GET' ? undefined : JSON.stringify(spec.payload),
-      signal: controller.signal,
-      redirect: 'follow',
-    });
+    if (picked) {
+      upstream = await proxiedRequest(url, {
+        method: ctx.method === 'GET' ? 'GET' : 'POST',
+        headers,
+        body: payload,
+        proxy: picked.proxy,
+        timeoutMs,
+        insecure: !!proxies.state.settings.insecure,
+        signal: controller.signal,
+      });
+    } else {
+      upstream = await fetch(url, {
+        method: ctx.method === 'GET' ? 'GET' : 'POST',
+        headers,
+        body: payload,
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+    }
   } finally {
     clearTimeout(timer);
   }
-  return { upstream, controller, style: spec.style };
+  return {
+    upstream,
+    controller,
+    style: spec.style,
+    responseStyle: spec.responseStyle,
+    exit: picked ? picked.exit : null,
+    mode: picked ? picked.mode : 'direct',
+    meta,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1087,8 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   const headers = baseResponseHeaders(upstream.status, contentType, provider);
   headers['x-router-account'] = String(account?.id || '');
   headers['x-router-attempts'] = String(attempts);
+  headers['x-router-exit'] = ctx.exitId || 'direct';
+  headers['x-router-rotations'] = String(ctx.rotations || 0);
   const len = upstream.headers.get('content-length');
   if (!ctx.stream && len) headers['content-length'] = len;
   res.writeHead(upstream.status, headers);
@@ -1132,8 +1201,9 @@ async function handleProxy(req, res, url) {
     suffix: wantAnthropicIn && (style === 'openai' || style === 'opencode' || style === 'opencode-free') ? '/chat/completions' : suffix,
     style,
     anthropicInbound: wantAnthropicIn,
-    translate: isChat && style !== 'openai' && style !== 'opencode-free',
+    translate: isChat && style !== 'openai' && style !== 'opencode-free' && style !== 'freebuff',
   };
+  if (style === 'freebuff') ctx.responseStyle = 'openai';
   if (style === 'anthropic' && wantAnthropicIn) {
     ctx.suffix = '/messages';
     ctx.translate = false;
@@ -1161,68 +1231,107 @@ async function handleProxy(req, res, url) {
     tried.add(account.id);
 
     const as = accountState(provider.id, account.id);
-    as.requests = (as.requests || 0) + 1;
-    as.lastUsed = now();
+    const rotateWanted = provider.proxy === 'rotate' && !!proxies && proxies.state.settings.enabled;
+    const rotateMax = rotateWanted ? Math.max(0, Number(proxies.state.settings.rotateAttempts) || 0) : 0;
+    let rotations = 0;
+    let lastExitId = '';
+    let relayed = false;
 
-    let upstream;
-    let controller;
-    try {
-      ({ upstream, controller } = await callUpstream(provider, account, ctx));
-    } catch (err) {
-      as.failures = (as.failures || 0) + 1;
-      as.lastStatus = 0;
-      as.lastError = 'network';
-      pushEvent({ kind: 'error', pid: provider.id, aid: account.id, st: 0 });
+    // Inner loop: same account, new exit IP. A rate limit here is usually
+    // IP-bound, so rotating the exit beats burning the account for 12 hours.
+    for (;;) {
+      as.requests = (as.requests || 0) + 1;
+      as.lastUsed = now();
+
+      let upstream;
+      let controller;
+      let call;
+      try {
+        call = await callUpstream(provider, account, ctx);
+        ({ upstream, controller } = call);
+      } catch (err) {
+        as.failures = (as.failures || 0) + 1;
+        as.lastStatus = 0;
+        as.lastError = err.message.slice(0, 120);
+        pushEvent({ kind: 'error', pid: provider.id, aid: account.id, st: 0 });
+        persistState();
+        console.warn(`[proxy] ${provider.id}/${account.name} network error: ${err.message}`);
+        if (call && call.exit && proxies) proxies.noteResult(call.exit.id, false);
+        break;
+      }
+
+      lastExitId = call.exit ? call.exit.id : '';
+      as.lastStatus = upstream.status;
+      const cooldownStatuses = config.cooldownStatuses;
+
+      if (cooldownStatuses.includes(upstream.status)) {
+        sawLimit = true;
+        try { upstream.body && upstream.body.cancel && await upstream.body.cancel(); } catch { /* noop */ }
+        if (rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
+          if (call.exit) proxies.noteResult(call.exit.id, false);
+          const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`);
+          rotations += 1;
+          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; rotating exit to ${next ? next.id : '?'} and retrying (${rotations}/${rotateMax})`);
+          continue;
+        }
+        markLimited(provider, account, upstream.status);
+        console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}, cooling down ${clampHours(provider.cooldownHours ?? config.cooldownHours)}h, failing over`);
+        break;
+      }
+
+      if (config.retryStatuses.includes(upstream.status) && attempt < maxAttempts) {
+        as.failures = (as.failures || 0) + 1;
+        pushEvent({ kind: 'retry', pid: provider.id, aid: account.id, st: upstream.status });
+        persistState();
+        try { upstream.body && upstream.body.cancel && await upstream.body.cancel(); } catch { /* noop */ }
+        break;
+      }
+
+      const ok = upstream.status >= 200 && upstream.status < 300;
+      if (ok) {
+        state.totals.success += 1;
+        if (ctx.stream) state.totals.streamed += 1;
+        if (call.exit && proxies) proxies.noteResult(call.exit.id, true);
+      } else {
+        state.totals.failed += 1;
+        if (call.exit && proxies) proxies.noteResult(call.exit.id, false);
+      }
+      pushEvent({ kind: ok ? 'ok' : 'http', pid: provider.id, aid: account.id, st: upstream.status, ms: now() - t0, s: ctx.stream ? 1 : 0 });
       persistState();
-      console.error(`[proxy] ${provider.id}/${account.name} network error: ${err.message}`);
-      continue;
+
+      if (!ctx.stream && !ctx.translate) {
+        const len = Number(upstream.headers.get('content-length'));
+        if (Number.isFinite(len)) state.totals.bytesOut += len;
+      }
+
+      res.on('finish', () => {
+        reqLog(`[proxy] ${req.method} ${url.pathname} -> ${provider.id}/${account.name} ${upstream.status} ${now() - t0}ms attempts=${attempt}${ctx.stream ? ' stream' : ''}${call.mode === 'direct' ? '' : ` via=${call.exit ? call.exit.id : call.mode}`}`);
+      });
+
+      if (call.meta) {
+        // freebuff: close the agent run after the response (or the stream) ends
+        res.on('close', () => {
+          freebuff.onCallFinished({ provider, account, status: upstream.status, ok }).catch((err) => reqLog(`[freebuff] finish failed: ${err.message}`));
+        });
+      }
+
+      ctx.exitId = call.mode === 'direct' ? 'direct' : (call.exit ? call.exit.id : call.mode);
+      ctx.rotations = rotations;
+
+      try {
+        await relay(provider, account, upstream, controller, ctx, res, attempt);
+      } catch (err) {
+        console.error(`[proxy] relay error after ${now() - t0}ms: ${err.message}`);
+        if (!res.headersSent) sendJson(res, 502, { error: { message: `upstream relay failed: ${err.message}`, type: 'router_relay_error' } });
+        else res.destroy();
+      }
+      relayed = true;
+      break;
     }
 
-    as.lastStatus = upstream.status;
-
-    const cooldownStatuses = config.cooldownStatuses;
-    if (cooldownStatuses.includes(upstream.status)) {
-      sawLimit = true;
-      markLimited(provider, account, upstream.status);
-      try { await upstream.body?.cancel(); } catch { /* noop */ }
-      console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}, cooling down ${clampHours(provider.cooldownHours ?? config.cooldownHours)}h, failing over`);
-      continue;
-    }
-
-    if (config.retryStatuses.includes(upstream.status) && attempt < maxAttempts) {
-      as.failures = (as.failures || 0) + 1;
-      pushEvent({ kind: 'retry', pid: provider.id, aid: account.id, st: upstream.status });
-      persistState();
-      try { await upstream.body?.cancel(); } catch { /* noop */ }
-      continue;
-    }
-
-    const ok = upstream.status >= 200 && upstream.status < 300;
-    if (ok) state.totals.success += 1; else state.totals.failed += 1;
-    if (ok && ctx.stream && ctx.translate) state.totals.streamed += 1;
-    else if (ok && ctx.stream) state.totals.streamed += 1;
-    pushEvent({ kind: ok ? 'ok' : 'http', pid: provider.id, aid: account.id, st: upstream.status, ms: now() - t0, s: ctx.stream ? 1 : 0 });
-    persistState();
-
-    let bytes = 0;
-    if (!ctx.stream && !ctx.translate) {
-      const len = Number(upstream.headers.get('content-length'));
-      if (Number.isFinite(len)) bytes = len;
-    }
-    if (bytes) state.totals.bytesOut += bytes;
-
-    res.on('finish', () => {
-      console.log(`[proxy] ${req.method} ${url.pathname} -> ${provider.id}/${account.name} ${upstream.status} ${now() - t0}ms attempts=${attempt}${ctx.stream ? ' stream' : ''}`);
-    });
-
-    try {
-      await relay(provider, account, upstream, controller, ctx, res, attempt);
-    } catch (err) {
-      console.error(`[proxy] relay error after ${now() - t0}ms: ${err.message}`);
-      if (!res.headersSent) sendJson(res, 502, { error: { message: `upstream relay failed: ${err.message}`, type: 'router_relay_error' } });
-      else res.destroy();
-    }
-    return;
+    if (relayed) return;
+    if (rotations) pushEvent({ kind: 'rotated', pid: provider.id, aid: account.id, n: rotations });
+    void lastExitId;
   }
 
   state.totals.failed += 1;
@@ -1272,6 +1381,22 @@ function snapshot() {
       samples: state.mem.samples,
     },
     totals: { ...state.totals, accounts: accounts.length, active: accounts.filter((a) => !a.limitedUntil && a.enabled).length, limited: accounts.filter((a) => a.limitedUntil > 0).length },
+    logging: { requests: !!(config.logging && config.logging.requests) },
+    proxies: proxies ? {
+      enabled: proxies.state.settings.enabled,
+      running: proxies.xray.running,
+      version: proxies.xray.version,
+      error: proxies.xray.error,
+      active: proxies.state.active.length,
+      working: proxies.workingExits().length,
+      total: proxies.state.exits.length,
+      index: proxies.index,
+      testing: proxies.test.running,
+      test: proxies.testStatus(),
+      sources: proxies.state.sources.length,
+      // the dashboard only needs counts here; /admin/api/proxies has the detail
+    } : { enabled: false, total: 0 },
+    freebuff: freebuff ? freebuff.snapshot().filter((a) => a.lastError || a.needsReauth) : [],
     providers,
     events: state.events,
   };
@@ -1408,6 +1533,14 @@ async function handleAdmin(req, res, url) {
     if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
     const accounts = provider.accounts || [];
     const account = accounts.find((x) => x.enabled !== false && !isLimited(accountState(provider.id, x.id))) || accounts[0] || { apiKey: '' };
+    if (provider.type === 'freebuff') {
+      try {
+        const models = await freebuff.listModels({ provider, account });
+        return sendJson(res, 200, { ok: true, status: 200, source: 'freebuff catalog (signed)', provider: provider.id, count: models.length, models });
+      } catch (err) {
+        return sendJson(res, 502, { error: { message: `freebuff catalog failed: ${err.message}`, type: 'upstream_error' } });
+      }
+    }
     const spec = modelListRequest(provider, account);
     try {
       const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(15_000) });
@@ -1427,6 +1560,80 @@ async function handleAdmin(req, res, url) {
     } catch (err) {
       return sendJson(res, 502, { error: { message: `model list fetch failed: ${err.message}`, type: 'upstream_error' } });
     }
+  }
+
+  // ---- V2Ray / Xray exit pool -------------------------------------------
+  if (a === 'proxies') {
+    if (method === 'GET' && !b) return sendJson(res, 200, proxies.snapshot());
+    if (method === 'GET' && b === 'events') return sendJson(res, 200, { events: proxies.events });
+    if (method === 'POST' && b === 'sources') {
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, { ok: true, sources: proxies.updateSources(body.sources) });
+    }
+    if (method === 'POST' && b === 'settings') {
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, { ok: true, settings: proxies.updateSettings(body) });
+    }
+    if (method === 'POST' && b === 'refresh') {
+      const body = await readJsonBody(req);
+      const summary = await proxies.refresh({ sourceIds: body.sourceIds });
+      return sendJson(res, 200, { ok: true, ...summary, snapshot: proxies.snapshot() });
+    }
+    if (method === 'POST' && b === 'test') {
+      const body = await readJsonBody(req);
+      const started = await proxies.testAll({
+        limit: Number(body.limit) || 0,
+        protocols: Array.isArray(body.protocols) ? body.protocols : null,
+        retest: !!body.retest,
+        sourceIds: Array.isArray(body.sourceIds) ? body.sourceIds : null,
+      });
+      return sendJson(res, started.error ? 409 : 200, started.error ? { error: { message: started.error } } : { ok: true, ...started });
+    }
+    if (method === 'POST' && b === 'apply') {
+      const res2 = await proxies.apply();
+      return sendJson(res, 200, { ok: true, ...res2, snapshot: proxies.snapshot() });
+    }
+    if (method === 'POST' && b === 'rotate') {
+      const exit = proxies.rotate('manual');
+      return sendJson(res, 200, { ok: true, exit: exit ? { id: exit.id, host: exit.host, exitIp: exit.exitIp, latencyMs: exit.latencyMs } : null, index: proxies.index });
+    }
+    if (method === 'POST' && b === 'xray') {
+      const body = await readJsonBody(req);
+      if (body.xrayPath) proxies.updateSettings({ xrayPath: body.xrayPath });
+      if (body.action === 'stop') { await proxies.stopMain(); return sendJson(res, 200, { ok: true, xray: proxies.xray }); }
+      const started = await proxies.startMain();
+      return sendJson(res, 200, { ok: true, ...started, xray: { running: proxies.xray.running, version: proxies.xray.version, error: proxies.xray.error } });
+    }
+    if (method === 'POST' && b === 'version') {
+      const v = await proxies.version();
+      return sendJson(res, 200, { ok: !v.error, ...v, path: proxies.state.settings.xrayPath });
+    }
+    if (method === 'GET' && b === 'exit' && c) {
+      const exit = proxies.byId.get(c);
+      if (!exit) return sendJson(res, 404, { error: { message: 'exit not found', type: 'not_found' } });
+      return sendJson(res, 200, { ok: true, exit });
+    }
+    if (method === 'DELETE' && b === 'exit' && c) {
+      proxies.state.exits = proxies.state.exits.filter((e) => e.id !== c);
+      proxies.state.active = proxies.state.active.filter((id) => id !== c);
+      proxies.reindex();
+      proxies.save();
+      return sendJson(res, 200, { ok: true });
+    }
+    if (method === 'POST' && b === 'purge') {
+      const body = await readJsonBody(req);
+      const status = body.status || 'dead';
+      const before = proxies.state.exits.length;
+      proxies.state.exits = proxies.state.exits.filter((e) => e.status !== status);
+      proxies.state.active = proxies.state.active.filter((id) => proxies.byId.has(id));
+      proxies.reindex();
+      proxies.save();
+      return sendJson(res, 200, { ok: true, removed: before - proxies.state.exits.length });
+    }
+  }
+
+  if (method === 'GET' && a === 'freebuff') {
+    return sendJson(res, 200, { ok: true, accounts: freebuff.snapshot() });
   }
 
   if (a === 'provider' && b && c === 'account' && d) {
@@ -1497,9 +1704,10 @@ async function handleAdmin(req, res, url) {
     if (body.defaultProvider != null) config.defaultProvider = String(body.defaultProvider);
     if (body.cors != null) config.cors = !!body.cors;
     if (Array.isArray(body.proxyKeys)) config.proxyKeys = body.proxyKeys.map(String).filter(Boolean);
+    if (body.loggingRequests != null) config.logging = { requests: !!body.loggingRequests };
     if (Array.isArray(body.cooldownStatuses) && body.cooldownStatuses.length) config.cooldownStatuses = body.cooldownStatuses.map(Number);
     await saveConfig();
-    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, hasProxyKeys: config.proxyKeys.length > 0 } });
+    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
   }
 
   return sendJson(res, 404, { error: { message: `unknown admin route ${method} ${url.pathname}`, type: 'not_found' } });
@@ -1743,6 +1951,10 @@ function boot() {
     console.warn('[config] no config.json found - wrote defaults. Open /admin and add accounts.');
   }
   sampleMemory();
+  proxies = new ProxyManager({ dataDir: DATA_DIR, log: (m) => console.warn(m) });
+  proxies.init();
+  freebuff = new FreebuffDriver({ stateFile: path.join(DATA_DIR, 'freebuff-state.json'), log: (m) => console.warn(m) });
+  freebuff.init();
   server.listen(config.port, config.host, () => {
     const mem = process.memoryUsage();
     const where = `${config.host}:${config.port}`;
@@ -1760,6 +1972,16 @@ function boot() {
   const sampler = setInterval(sampleMemory, MEM_SAMPLE_MS);
   if (sweeper.unref) sweeper.unref();
   if (sampler.unref) sampler.unref();
+
+  // Bring the exit pool up in the background; a missing xray binary must never
+  // stop the router from serving direct traffic.
+  if (proxies.state.settings.enabled && proxies.activeExits().length) {
+    proxies.startMain()
+      .then((r) => { if (!r.running) console.warn(`[proxy] pool not started: ${r.error || r.reason}`); })
+      .catch((err) => console.warn(`[proxy] pool start failed: ${err.message}`));
+  } else if (proxies.state.settings.enabled) {
+    console.warn('[proxy] no working exits yet - open the dashboard Network tab and run a proxy test');
+  }
 }
 
 async function shutdown(signal) {
