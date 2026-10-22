@@ -170,6 +170,7 @@
           </div>
 
           <div class="flex items-center gap-1.5">
+            <button class="btn" @click="openModels(p)" title="List the models this provider serves"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
             <button class="btn" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
             <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
             <button class="btn btn-danger" @click="deleteProvider(p)" title="Delete provider"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -330,6 +331,8 @@
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="gemini">Google Gemini</option>
+          <option value="opencode">OpenCode (Console key)</option>
+          <option value="opencode-free">OpenCode Free (no key)</option>
           <option value="custom">Custom OpenAI-compatible</option>
         </select>
       </div>
@@ -401,6 +404,9 @@
 
     <template x-if="!af.editing">
       <div class="grid grid-cols-1 gap-3">
+        <p x-show="af.keyless" class="rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-[11px] text-accent">
+          This provider needs no API key — leave the key fields empty and just save.
+        </p>
         <div>
           <label class="fld">Single account</label>
           <div class="grid grid-cols-2 gap-2">
@@ -421,6 +427,49 @@
       <button class="btn" @click="modal = null">Cancel</button>
       <button class="btn btn-primary" @click="saveAccount()"><i data-lucide="save" class="h-3.5 w-3.5"></i>Save</button>
     </div>
+  </div>
+</div>
+
+<!-- ===================== MODELS MODAL ===================== -->
+<div x-show="modal === 'models'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-8 w-full max-w-2xl rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex flex-wrap items-center gap-2">
+      <i data-lucide="list" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white">Models</h3>
+      <span class="pill bg-ink-800 text-slate-400" x-text="mf.pid"></span>
+      <span class="pill bg-accent/10 text-accent" x-show="!mf.loading" x-text="mf.total + ' models'"></span>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <input class="input mono" x-model="mf.filter" placeholder="filter models…" />
+      <button class="btn" @click="copy(mf.models.join('\n'))" title="Copy every model id"><i data-lucide="copy" class="h-3.5 w-3.5"></i>Copy all</button>
+    </div>
+    <p class="mono mt-2 truncate text-[11px] text-slate-500" x-text="'source: ' + (mf.source || '…')"></p>
+    <p class="mt-2 text-[11px] text-rose-400" x-show="mf.error" x-text="mf.error"></p>
+
+    <div class="mt-3 max-h-80 space-y-1 overflow-y-auto rounded-xl border border-ink-700 bg-ink-950/60 p-2">
+      <template x-if="mf.loading">
+        <div class="px-2 py-6 text-center text-xs text-slate-500">asking the provider…</div>
+      </template>
+      <template x-for="m in filteredModels()" :key="m">
+        <div class="flex items-center gap-2 rounded-lg px-2 py-1 hover:bg-ink-850">
+          <code class="mono flex-1 truncate text-[11px] text-slate-300" x-text="m"></code>
+          <span class="pill" :class="kindBadge(m)" x-text="modelKind(m)"></span>
+          <button class="text-slate-500 hover:text-accent" @click="copy(m)"><i data-lucide="copy" class="h-3 w-3"></i></button>
+        </div>
+      </template>
+      <template x-if="!mf.loading && !filteredModels().length">
+        <div class="px-2 py-6 text-center text-xs text-slate-500">nothing to show</div>
+      </template>
+    </div>
+
+    <p class="mt-3 text-[11px] text-slate-500">
+      Model ids are what you send as <code class="mono">model</code> (prefix with
+      <code class="mono">provider-id/</code> to force a provider). OpenCode routes each family to its own
+      wire format automatically: claude / qwen-plus ⇢ messages, gemini ⇢ google, gpt / grok / muse ⇢ responses,
+      everything else ⇢ chat/completions.
+    </p>
   </div>
 </div>
 
@@ -504,6 +553,8 @@ const TYPES = {
   openrouter: { label: 'OpenRouter',             baseUrl: 'https://openrouter.ai/api/v1',                 style: 'openai',    icon: 'shuffle' },
   anthropic:  { label: 'Anthropic',              baseUrl: 'https://api.anthropic.com/v1',                 style: 'anthropic', icon: 'brain' },
   gemini:     { label: 'Google Gemini',          baseUrl: 'https://generativelanguage.googleapis.com/v1beta', style: 'gemini', icon: 'gem' },
+  opencode:   { label: 'OpenCode (Console)',     baseUrl: 'https://opencode.ai/inference',                style: 'opencode',  icon: 'terminal' },
+  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1',              style: 'openai',    icon: 'unlock' },
   custom:     { label: 'OpenAI-compatible',      baseUrl: '',                                              style: 'openai',    icon: 'plug' },
 };
 
@@ -524,6 +575,7 @@ function app() {
     pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
     sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, adminKey: '', error: '' },
+    mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
     cf: { title: '', body: '', run: null },
 
     async init() {
@@ -689,9 +741,10 @@ function app() {
 
     // ---------- accounts ----------
     openAccount(p, a) {
+      const keyless = p.type === 'opencode-free';
       this.af = a
-        ? { editing: true, pid: p.id, providerName: p.name, aid: a.id, name: a.name, apiKey: '', maskedKey: a.maskedKey, enabled: a.enabled, bulk: '', error: '' }
-        : { editing: false, pid: p.id, providerName: p.name, aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' };
+        ? { editing: true, pid: p.id, providerName: p.name, aid: a.id, name: a.name, apiKey: '', maskedKey: a.maskedKey, enabled: a.enabled, bulk: '', keyless, error: '' }
+        : { editing: false, pid: p.id, providerName: p.name, aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', keyless, error: '' };
       this.modal = 'account';
       this.refreshIcons();
     },
@@ -710,6 +763,7 @@ function app() {
           const accounts = [];
           if (this.af.apiKey.trim()) accounts.push({ name: this.af.name.trim() || undefined, apiKey: this.af.apiKey.trim() });
           for (const line of lines) accounts.push(line);
+          if (!accounts.length && this.af.keyless) accounts.push({ name: this.af.name.trim() || 'keyless', apiKey: '' });
           if (!accounts.length) { this.af.error = 'Provide a key or paste at least one line.'; return; }
           const res = await this.api(`/provider/${pid}/accounts`, { method: 'POST', body: { accounts } });
           this.toast(`Added ${res.added} account(s) to ${this.af.providerName}`, 'ok');
@@ -737,6 +791,41 @@ function app() {
     async resetAll() {
       try { const r = await this.api('/reset', { method: 'POST', body: {} }); this.toast(`Unlocked ${r.unlocked} account(s)`, 'ok'); await this.load(); }
       catch (err) { this.toast(err.message, 'err'); }
+    },
+
+    // ---------- models ----------
+    async openModels(p) {
+      this.mf = { pid: p.id, loading: true, total: 0, models: [], source: '', error: '', filter: '' };
+      this.modal = 'models';
+      this.refreshIcons();
+      try {
+        const r = await this.api('/provider/' + encodeURIComponent(p.id) + '/models');
+        this.mf.models = r.models || [];
+        this.mf.total = r.count || this.mf.models.length;
+        this.mf.source = r.source || '';
+        if (!r.ok) this.mf.error = 'upstream answered HTTP ' + r.status + (r.raw ? ' — ' + String(r.raw).slice(0, 160) : '');
+      } catch (err) {
+        this.mf.error = err.message;
+      } finally {
+        this.mf.loading = false;
+        this.refreshIcons();
+      }
+    },
+    filteredModels() {
+      const f = (this.mf.filter || '').trim().toLowerCase();
+      const list = this.mf.models || [];
+      return f ? list.filter((m) => m.toLowerCase().includes(f)) : list;
+    },
+    modelKind(m) {
+      const id = String(m || '');
+      if (/^gemini-/.test(id)) return 'google';
+      if (/^(claude-|qwen3\.5-plus|qwen3\.6-plus|qwen3\.7-(max|plus)|qwen3\.8-flash)/.test(id)) return 'messages';
+      if (/^(gpt-|grok-|muse-)/.test(id)) return 'responses';
+      return 'chat';
+    },
+    kindBadge(m) {
+      return { google: 'bg-sky-500/10 text-sky-300', messages: 'bg-violet-500/10 text-violet-300',
+               responses: 'bg-emerald-500/10 text-emerald-300', chat: 'bg-ink-800 text-slate-400' }[this.modelKind(m)];
     },
 
     // ---------- settings ----------

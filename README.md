@@ -105,9 +105,45 @@ An account is **healthy** when `enabled !== false` and `limitedUntil <= now`.
 | `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer` + `HTTP-Referer`/`X-Title` | passthrough |
 | `anthropic` | `https://api.anthropic.com/v1` | `x-api-key` + `anthropic-version` | OpenAI ⇄ Anthropic messages, incl. SSE |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | OpenAI ⇄ `generateContent`/`streamGenerateContent` |
+| `opencode` | `https://opencode.ai/inference` | `Authorization: Bearer` (+ `x-api-key`/`x-goog-api-key`) | **per model**: chat ⇄ messages / google / responses |
+| `opencode-free` | `https://opencode.ai/zen/v1` | none (keyless) | passthrough to the free model list |
 | `custom` | whatever you set | `Authorization: Bearer` | passthrough (Ollama, vLLM, LM Studio, LiteLLM, a gateway…) |
 
 Translation covers system-message extraction, text and image parts, `max_tokens`, `temperature`, `top_p`, `stop`, usage mapping and finish reasons. Anthropic and Gemini streams are re-emitted as OpenAI `chat.completion.chunk` events terminated by `data: [DONE]`.
+
+## OpenCode (what 9Router calls OpenCode Free, done properly)
+
+One OpenCode account fronts **four different wire formats**, and OpenCode only lists the endpoint per model. The router picks it for you from the model id — no separate providers, no manual endpoint juggling:
+
+| Model family | Upstream route | Format |
+|---|---|---|
+| `claude-*`, `qwen3.5-plus`, `qwen3.6-plus`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.8-flash` | `/inference/anthropic/v1/messages` | Anthropic messages ⇄ OpenAI |
+| `gemini-*` | `/inference/google/v1beta/models/<id>:generateContent` | Google ⇄ OpenAI |
+| `gpt-*`, `grok-*`, `muse-*` | `/inference/openai/v1/responses` | Responses API ⇄ OpenAI (incl. SSE events) |
+| everything else (`glm-*`, `kimi-*`, `deepseek-*`, `minimax-*`, `qwen3.8-max`, `big-pickle`, `*-free`, …) | `/inference/openai/v1/chat/completions` | native passthrough |
+
+```bash
+# Console key (paid + free models): type "opencode", base URL https://opencode.ai/inference
+# Free list only, no key at all   : type "opencode-free", base URL https://opencode.ai/zen/v1
+
+curl http://localhost:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-router-provider: opencode-free' \
+  -d '{"model":"big-pickle","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+
+curl http://localhost:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"opencode-main/claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
+```
+
+* **Keyless accounts are legal.** An `opencode-free` account (or any account whose key is empty, `none`, `free`, `no-auth`, `not-needed`) sends no `Authorization` header at all.
+* **Model list built in.** Open the provider's **Models** button in the dashboard, or `GET /admin/api/provider/<id>/models` — it asks the upstream (`https://opencode.ai/inference/v1/models`, 85 ids at the time of writing, no key required) and shows each id with the route it will take.
+* **Escape hatch.** If OpenCode moves a model to another format, override it per provider without touching code:
+  ```json
+  { "id": "opencode-main", "type": "opencode", "modelStyles": { "gpt-5.5": "openai", "claude-*": "anthropic" } }
+  ```
+  Keys are exact ids or `glob*` patterns; values are `openai`, `anthropic`, `gemini` or `responses`.
+* **Pin one endpoint.** A base URL that already points at a format (`…/inference/openai/v1`) disables per-model routing and is used verbatim — handy for a gateway in front of OpenCode.
 
 ## API
 
@@ -137,6 +173,7 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `POST` | `/admin/api/provider/:id/account/:aid/reset` | Clear the cooldown now. |
 | `POST` | `/admin/api/reset` | Unlock every cooling account (`/reset/counters` zeroes counters). |
 | `POST` | `/admin/api/settings` | Cooldown hours, default provider, inbound keys, CORS, admin key. |
+| `GET` | `/admin/api/provider/:id/models` | Live model list from the upstream (no key needed for OpenCode), with the route each id will take. |
 | `GET`/`POST` | `/admin/api/export` · `/admin/api/import` | Backup out / restore in. |
 
 ## Configuration (`config.json`)
@@ -153,9 +190,9 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `defaultProvider` | `""` | Fallback provider id. |
 | `cors` | `true` | Send permissive CORS headers to proxy clients. |
 | `proxyKeys` | `[]` | Inbound `Bearer` keys the router requires. Empty = open. |
-| `providers[]` | — | `id`, `name`, `type`, `baseUrl`, `strategy`, `cooldownHours`, `timeoutMs`, `maxAttempts`, `headers`, `accounts[]`. |
+| `providers[]` | — | `id`, `name`, `type`, `baseUrl`, `strategy`, `cooldownHours`, `timeoutMs`, `maxAttempts`, `headers`, `modelStyles`, `accounts[]`. |
 
-Account fields: `id`, `name`, `apiKey`, `enabled`.
+Account fields: `id`, `name`, `apiKey`, `enabled`. `apiKey` may be empty for keyless providers (OpenCode Free, local servers) — the router then sends no auth header.
 
 ### Runtime state (`state.json`)
 
@@ -359,10 +396,10 @@ Consider the 35 MB target honestly: on Node 20+ the V8 isolate alone accounts fo
 ## Verification
 
 ```bash
-npm run smoke     # 43 checks, no network, no API keys, all in a temp dir
+npm run smoke     # 52 checks, no network, no API keys, all in a temp dir
 ```
 
-It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; and the memory behaviour in the table above.
+It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; and the memory behaviour in the table above.
 
 ## License
 

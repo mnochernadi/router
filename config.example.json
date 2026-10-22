@@ -63,6 +63,32 @@
       ]
     },
     {
+      "id": "opencode-main",
+      "name": "OpenCode (Console)",
+      "type": "opencode",
+      "baseUrl": "https://opencode.ai/inference",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 120000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-opencode-1", "name": "opencode-console-key", "apiKey": "sk-REPLACE_ME", "enabled": true }
+      ]
+    },
+    {
+      "id": "opencode-free",
+      "name": "OpenCode Free (no key)",
+      "type": "opencode-free",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 120000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-opencode-free", "name": "keyless", "apiKey": "", "enabled": true }
+      ]
+    },
+    {
       "id": "local-ollama",
       "name": "Local (Ollama / vLLM / LM Studio)",
       "type": "custom",

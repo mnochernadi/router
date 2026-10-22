@@ -57,7 +57,8 @@ const mock = http.createServer(async (req, res) => {
   if (key === 'key-payment') { res.writeHead(402, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"payment required"}}'); }
   if (key === 'key-forbidden') { res.writeHead(403, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"forbidden"}}'); }
   if (key === 'key-broken') { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"boom"}}'); }
-  if (!key) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"no key"}}'); }
+  // Keyless routes (OpenCode Free / zen passthrough) accept no credentials.
+  if (!key && !url.pathname.startsWith('/zen/')) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end('{"error":{"message":"no key"}}'); }
 
   // anthropic style
   if (url.pathname.endsWith('/messages')) {
@@ -80,9 +81,49 @@ const mock = http.createServer(async (req, res) => {
     }));
   }
 
+  // --- OpenCode: four wire formats behind one provider -----------------------
+  // /inference/v1/models  (model discovery, no key needed)
+  if (url.pathname === '/inference/v1/models') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ object: 'list', data: [
+      { id: 'big-pickle' }, { id: 'claude-sonnet-4-5' }, { id: 'gemini-3.1-pro' }, { id: 'gpt-5.5' }, { id: 'glm-5.2' },
+    ].map((m) => ({ ...m, object: 'model', owned_by: 'opencode' })) }));
+  }
+  // OpenAI Responses API (GPT / Grok / Muse family)
+  if (url.pathname === '/inference/openai/v1/responses') {
+    if (json.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (let i = 0; i < nChunks; i++) res.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: `R${i} ` })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 9, output_tokens: nChunks, total_tokens: 9 + nChunks } } })}\n\n`);
+      return res.end();
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({
+      id: 'resp_1', model: json.model, status: 'completed',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'responses says hi' }] }],
+      usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+    }));
+  }
+  // OpenCode OpenAI-compatible route
+  if (url.pathname === '/inference/openai/v1/chat/completions' || url.pathname === '/zen/v1/chat/completions') {
+    if (json.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (let i = 0; i < nChunks; i++) {
+        res.write(`data: ${JSON.stringify({ id: 'oc1', object: 'chat.completion.chunk', model: json.model, choices: [{ index: 0, delta: { content: `OC${i} ` }, finish_reason: null }] })}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({
+      id: 'oc1', object: 'chat.completion', model: json.model,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'opencode says hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+    }));
+  }
+
   // gemini style
-  if (url.pathname.includes(':streamGenerateContent')) {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+  if (url.pathname.includes(':streamGenerateContent')) {    res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (let i = 0; i < nChunks; i++) {
       res.write(`data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: `G${i} ` }] } }] })}\n\n`);
     }
@@ -167,6 +208,14 @@ function writeConfig() {
       {
         id: 'anthropic-test', name: 'Anthropic Test', type: 'anthropic', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'an-1', name: 'anthropic-1', apiKey: 'key-ant-ok', enabled: true }],
+      },
+      {
+        id: 'opencode-test', name: 'OpenCode Test', type: 'opencode', baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference`,
+        strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'oc-1', name: 'oc-key', apiKey: 'key-oc-ok', enabled: true }],
+      },
+      {
+        id: 'opencode-free-test', name: 'OpenCode Free Test', type: 'opencode-free', baseUrl: `http://127.0.0.1:${MOCK_PORT}/zen/v1`,
+        strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'ocf-1', name: 'keyless', apiKey: '', enabled: true }],
       },
       {
         id: 'gemini-test', name: 'Gemini Test', type: 'gemini', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1beta`,
@@ -435,6 +484,52 @@ async function memOf() {
     `heapUsed=${(mem.heapUsed / 1048576).toFixed(2)}MB arrayBuffers=${(mem.arrayBuffers / 1048576).toFixed(2)}MB`);
   check('RSS stays inside the 128 MB container budget', afterBig < 128 * 1048576, `${(afterBig / 1048576).toFixed(2)}MB`);
   check('no 401/429 leakage in the load window', small.concat(big).filter((d) => d.status !== 200).length === 0);
+
+  // 16. OpenCode: one account, four wire formats chosen per model id
+  {
+    const oc = await chat({ model: 'glm-5.2', headers: { 'x-router-provider': 'opencode-test' } });
+    check('opencode: glm-* hits /openai/v1/chat/completions (passthrough)',
+      oc.status === 200 && JSON.parse(oc.text).choices[0].message.content === 'opencode says hi', oc.text.slice(0, 160));
+
+    const cl = await chat({ model: 'claude-sonnet-4-5', headers: { 'x-router-provider': 'opencode-test' } });
+    check('opencode: claude-* routed to /anthropic/v1/messages and translated',
+      cl.status === 200 && JSON.parse(cl.text).choices[0].message.content === 'anthropic says hi', cl.text.slice(0, 160));
+
+    const clS = await chat({ model: 'claude-sonnet-4-5', stream: true, n: 3, headers: { 'x-router-provider': 'opencode-test' } });
+    check('opencode: claude-* streams as OpenAI chunks',
+      clS.text.includes('"object":"chat.completion.chunk"') && clS.text.trimEnd().endsWith('data: [DONE]'), clS.text.slice(0, 140));
+
+    const gm = await chat({ model: 'gemini-3.1-pro', headers: { 'x-router-provider': 'opencode-test' } });
+    check('opencode: gemini-* routed to /google/v1beta generateContent',
+      gm.status === 200 && JSON.parse(gm.text).choices[0].message.content === 'gemini says hi', gm.text.slice(0, 160));
+
+    const rs = await chat({ model: 'gpt-5.5', headers: { 'x-router-provider': 'opencode-test' } });
+    const rsJson = rs.status === 200 ? JSON.parse(rs.text) : {};
+    check('opencode: gpt-* routed to the Responses API and translated',
+      rs.status === 200 && rsJson.choices[0].message.content === 'responses says hi' && rsJson.usage.prompt_tokens === 9, rs.text.slice(0, 220));
+
+    const rsS = await chat({ model: 'gpt-5.5', stream: true, n: 3, headers: { 'x-router-provider': 'opencode-test' } });
+    const rsText = rsS.text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+      .map((l) => { try { return JSON.parse(l.slice(6)).choices[0].delta.content || ''; } catch { return ''; } }).join('');
+    // the bridge rebuilds the payload (unknown fields like "n" are dropped), so the
+    // mock answers with its own default of 4 deltas.
+    check('opencode: Responses SSE translated to chat.completion.chunk with [DONE]',
+      rsText === 'R0 R1 R2 R3 ' && rsS.text.trimEnd().endsWith('data: [DONE]'), `"${rsText}"`);
+
+    const free = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'opencode-free-test' } });
+    check('opencode-free: keyless account works with no auth header',
+      free.status === 200 && JSON.parse(free.text).choices[0].message.content === 'opencode says hi', free.text.slice(0, 200));
+
+    const models = await (await fetch(routerUrl('/admin/api/provider/opencode-test/models'), { headers: ADMIN })).json();
+    check('admin model discovery returns the upstream model list',
+      models.count === 5 && models.models.includes('claude-sonnet-4-5') && models.source.endsWith('/inference/v1/models'),
+      JSON.stringify(models).slice(0, 240));
+
+    const keylessAdd = await fetch(routerUrl('/admin/api/provider/opencode-free-test/accounts'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ accounts: [{ name: 'second-keyless', apiKey: '' }] }),
+    });
+    check('keyless provider accepts an account with an empty key', (await keylessAdd.json()).added === 1);
+  }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
   const pastDeadline = await fetch(routerUrl('/admin/api/provider/seq-provider/account/a-limited/reset'), { method: 'POST', headers: ADMIN });

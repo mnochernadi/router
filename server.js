@@ -62,8 +62,51 @@ const PROVIDER_TYPES = {
   },
   anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', style: 'anthropic' },
   gemini: { label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', style: 'gemini' },
+  // OpenCode (opencode.ai): one account fronts four wire formats. The router
+  // picks the right sub-endpoint per model id -- see openCodeKind().
+  opencode: { label: 'OpenCode (Console)', baseUrl: 'https://opencode.ai/inference', style: 'opencode' },
+  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1', style: 'opencode-free' },
   custom: { label: 'OpenAI-compatible', baseUrl: '', style: 'openai' },
 };
+
+// Model families that OpenCode serves over a non-OpenAI wire format.
+// Source: opencode.ai/v2/docs/console/models endpoint table.
+const OPENCODE_ANTHROPIC_RE = [
+  /^claude-/, /^qwen3\.5-plus$/, /^qwen3\.6-plus$/, /^qwen3\.7-plus$/, /^qwen3\.7-max$/, /^qwen3\.8-flash$/,
+];
+const OPENCODE_RESPONSES_RE = [/^gpt-/, /^grok-/, /^muse-/];
+const KEYS_MEANINGLESS = /^(none|no-?auth|free|not-?needed|dummy|placeholder|public)$/i;
+
+function usableKey(apiKey) {
+  const k = String(apiKey ?? '').trim();
+  return !k || KEYS_MEANINGLESS.test(k) ? '' : k;
+}
+
+function normalizeKind(kind) {
+  const k = String(kind || '').toLowerCase();
+  if (k === 'google' || k === 'gemini') return 'gemini';
+  if (k === 'anthropic' || k === 'claude') return 'anthropic';
+  if (k === 'responses' || k === 'openai-responses') return 'responses';
+  return 'openai';
+}
+
+/** Which upstream wire format serves this model on OpenCode. */
+function openCodeKind(provider, model) {
+  const m = String(model || '').trim();
+  const overrides = provider && provider.modelStyles;
+  if (overrides && typeof overrides === 'object') {
+    if (overrides[m]) return normalizeKind(overrides[m]);
+    for (const [pattern, kind] of Object.entries(overrides)) {
+      if (pattern.includes('*') && new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`).test(m)) {
+        return normalizeKind(kind);
+      }
+    }
+  }
+  if (/^gemini-/.test(m)) return 'gemini';
+  if (OPENCODE_ANTHROPIC_RE.some((re) => re.test(m))) return 'anthropic';
+  if (OPENCODE_RESPONSES_RE.some((re) => re.test(m))) return 'responses';
+  return 'openai';
+}
 
 const DEFAULT_COOLDOWN_STATUSES = [429, 402, 403];
 const DEFAULT_RETRY_STATUSES = [500, 502, 503, 504];
@@ -203,6 +246,7 @@ function normalizeProvider(p) {
     timeoutMs: Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : 30_000,
     maxAttempts: Number(p.maxAttempts) > 0 ? Math.min(Number(p.maxAttempts), 32) : 0,
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
+    modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
     accounts,
   };
 }
@@ -408,6 +452,7 @@ function providerSummary(provider) {
     timeoutMs: provider.timeoutMs,
     maxAttempts: provider.maxAttempts || 0,
     hasCustomHeaders: !!provider.headers,
+    hasModelStyles: !!provider.modelStyles,
     accounts,
     accountCount: accounts.length,
     activeCount: accounts.filter((a) => a.limitedUntil === 0 && a.enabled).length,
@@ -457,6 +502,45 @@ function buildUpstream(provider, account, ctx) {
   const def = PROVIDER_TYPES[type];
   const baseUrl = provider.baseUrl || def.baseUrl;
   const style = def.style;
+
+  if (style === 'opencode' || style === 'opencode-free') {
+    const key = usableKey(account.apiKey);
+    const headers = { 'content-type': 'application/json', ...(provider.headers || {}) };
+    if (key) headers.authorization = `Bearer ${key}`;
+
+    const root = String(baseUrl || '').replace(/\/+$/, '');
+    const kind = style === 'opencode-free' ? 'openai' : (ctx.responseStyle || openCodeKind(provider, ctx.model));
+
+    // A base URL that already points at one wire format (/v1, /openai/v1, ...)
+    // means the caller wants exactly that endpoint, no per-model routing.
+    const pinned = /\/(openai|anthropic|google)\/v\d/.test(root) || /\/v\d$/.test(root);
+
+    if (!pinned && kind === 'anthropic') {
+      if (key) headers['x-api-key'] = key;
+      headers['anthropic-version'] = '2023-06-01';
+      return {
+        style, responseStyle: 'anthropic',
+        url: `${root}/anthropic/v1/messages`,
+        headers,
+        payload: ctx.anthropicInbound ? ctx.body : toAnthropicBody(ctx.body, ctx.model),
+      };
+    }
+    if (!pinned && kind === 'gemini') {
+      const model = String(ctx.model || 'gemini-3.1-pro');
+      if (key) headers['x-goog-api-key'] = key;
+      const suffix2 = ctx.stream
+        ? `/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`
+        : `/models/${encodeURIComponent(model)}:generateContent`;
+      return { style, responseStyle: 'gemini', url: `${root}/google/v1beta${suffix2}`, headers, payload: toGeminiBody(ctx.body) };
+    }
+    if (!pinned && kind === 'responses') {
+      return { style, responseStyle: 'responses', url: `${root}/openai/v1/responses`, headers, payload: toResponsesBody(ctx.body, ctx.model) };
+    }
+    const payload = { ...(ctx.body || {}) };
+    if (ctx.model) payload.model = ctx.model;
+    const suffix2 = pinned ? (ctx.suffix || '/chat/completions') : '/openai/v1/chat/completions';
+    return { style, responseStyle: 'openai', url: joinUrl(root, suffix2), headers, payload };
+  }
 
   if (style === 'anthropic') {
     return {
@@ -665,6 +749,81 @@ function fromGeminiResponse(json, model) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI Responses API  <->  chat.completions
+// OpenCode exposes its GPT/Grok/Muse models only on /openai/v1/responses.
+// ---------------------------------------------------------------------------
+
+function toResponsesBody(body, model) {
+  const src = Array.isArray(body?.messages) ? body.messages : [];
+  const input = [];
+  const instructions = [];
+  for (const m of src) {
+    if (m.role === 'system' || m.role === 'developer') {
+      const t = textFromContent(m.content);
+      if (t) instructions.push(t);
+      continue;
+    }
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: textFromContent(m.content) }];
+    const content = [];
+    for (const p of parts) {
+      if (typeof p === 'string') {
+        content.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: p });
+        continue;
+      }
+      if (p?.type === 'image_url' && p.image_url?.url) {
+        content.push({ type: 'input_image', image_url: String(p.image_url.url) });
+        continue;
+      }
+      if (typeof p?.text === 'string') content.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: p.text });
+    }
+    input.push({ role, content: content.length ? content : [{ type: 'input_text', text: '' }] });
+  }
+  const out = { model: model || body?.model, input, stream: !!body?.stream };
+  if (instructions.length) out.instructions = instructions.join('\n\n');
+  if (Number(body?.max_tokens) > 0) out.max_output_tokens = Number(body.max_tokens);
+  if (body?.temperature != null) out.temperature = body.temperature;
+  if (body?.top_p != null) out.top_p = body.top_p;
+  return out;
+}
+
+function responsesText(json) {
+  if (typeof json?.output_text === 'string' && json.output_text) return json.output_text;
+  const parts = [];
+  for (const item of json?.output || []) {
+    for (const c of item?.content || []) {
+      if (typeof c?.text === 'string') parts.push(c.text);
+    }
+  }
+  return parts.join('');
+}
+
+function fromResponsesResponse(json, model) {
+  const u = json?.usage || {};
+  const prompt = u.input_tokens ?? 0;
+  const completion = u.output_tokens ?? 0;
+  return {
+    id: json?.id || uid('chatcmpl'),
+    object: 'chat.completion',
+    created: Math.floor(now() / 1000),
+    model: json?.model || model,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: responsesText(json) },
+      finish_reason: json?.status === 'incomplete' ? 'length' : 'stop',
+    }],
+    usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: u.total_tokens ?? (prompt + completion) },
+  };
+}
+
+/** Single entry point for "upstream JSON -> OpenAI chat.completion". */
+function fromUpstreamResponse(style, json, model) {
+  if (style === 'anthropic') return fromAnthropicResponse(json, model);
+  if (style === 'responses') return fromResponsesResponse(json, model);
+  return fromGeminiResponse(json, model);
+}
+
 function openAiChunk(model, delta, finishReason, extra) {
   const payload = {
     id: extra?.id || chunkId(),
@@ -724,6 +883,33 @@ function translateStream(style, model) {
           break;
         case 'error':
           out.push(`data: ${JSON.stringify({ error: { message: ev.error?.message || 'upstream error', type: 'upstream_error' } })}\n\n`);
+          break;
+        default:
+          break;
+      }
+      return out;
+    }
+
+    if (style === 'responses') {
+      switch (ev.type) {
+        case 'response.output_text.delta':
+          if (ev.delta) out.push(emit({ content: ev.delta }));
+          break;
+        case 'response.completed': {
+          const u = ev.response?.usage || {};
+          usage = {
+            prompt_tokens: u.input_tokens ?? 0,
+            completion_tokens: u.output_tokens ?? 0,
+            total_tokens: u.total_tokens ?? ((u.input_tokens ?? 0) + (u.output_tokens ?? 0)),
+          };
+          out.push(emit({}, ev.response?.status === 'incomplete' ? 'length' : 'stop'));
+          break;
+        }
+        case 'response.failed':
+        case 'response.incomplete':
+        case 'error':
+          out.push(`data: ${JSON.stringify({ error: { message: ev.response?.error?.message || ev.error?.message || ev.type, type: 'upstream_error' } })}\n\n`);
+          out.push(emit({}, 'stop'));
           break;
         default:
           break;
@@ -813,7 +999,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
         payload = raw || JSON.stringify({ error: { message: 'upstream error', type: 'upstream_error' } });
       } else {
         const json = JSON.parse(raw);
-        payload = JSON.stringify(ctx.style === 'anthropic' ? fromAnthropicResponse(json, ctx.model) : fromGeminiResponse(json, ctx.model));
+        payload = JSON.stringify(fromUpstreamResponse(ctx.style, json, ctx.model));
       }
     } catch (err) {
       if (!res.headersSent) {
@@ -943,14 +1129,26 @@ async function handleProxy(req, res, url) {
     model,
     method: req.method,
     stream: !!body?.stream,
-    suffix: wantAnthropicIn && style === 'openai' ? '/chat/completions' : suffix,
+    suffix: wantAnthropicIn && (style === 'openai' || style === 'opencode' || style === 'opencode-free') ? '/chat/completions' : suffix,
     style,
-    translate: isChat && style !== 'openai',
+    anthropicInbound: wantAnthropicIn,
+    translate: isChat && style !== 'openai' && style !== 'opencode-free',
   };
-  if (url.pathname === '/v1/messages' && style === 'anthropic') {
+  if (style === 'anthropic' && wantAnthropicIn) {
     ctx.suffix = '/messages';
-    ctx.body = body;
     ctx.translate = false;
+  }
+  if (style === 'opencode') {
+    // One OpenCode account fronts four wire formats; pick by model id.
+    const kind = openCodeKind(provider, model);
+    ctx.responseStyle = kind;
+    ctx.style = kind; // selects the translator (anthropic | gemini | responses)
+    ctx.translate = isChat && kind !== 'openai';
+    if (kind === 'anthropic' && wantAnthropicIn) ctx.translate = false;
+  } else if (style === 'anthropic' || style === 'gemini') {
+    ctx.responseStyle = style;
+  } else {
+    ctx.responseStyle = 'openai';
   }
 
   const tried = new Set();
@@ -1089,6 +1287,41 @@ function touchProvider(provider) {
   return { provider, created: true };
 }
 
+/**
+ * Model discovery: ask the upstream what it serves. Works for OpenAI-compatible
+ * /models, Anthropic, Gemini and OpenCode (which lists 80+ ids at
+ * https://opencode.ai/inference/v1/models, no key required).
+ */
+function modelListRequest(provider, account) {
+  const def = PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom;
+  const base = String(provider.baseUrl || def.baseUrl || '').replace(/\/+$/, '');
+  const key = usableKey(account && account.apiKey);
+  const headers = { accept: 'application/json' };
+  if (key) headers.authorization = `Bearer ${key}`;
+  if (def.style === 'anthropic') {
+    if (key) headers['x-api-key'] = key;
+    headers['anthropic-version'] = '2023-06-01';
+  } else if (def.style === 'gemini') {
+    if (key) headers['x-goog-api-key'] = key;
+  }
+  if (def.style === 'opencode') {
+    if (key) headers['x-api-key'] = key;
+    return { url: /\/v\d+$/.test(base) ? `${base}/models` : `${base}/v1/models`, headers };
+  }
+  return { url: `${base}/models`, headers };
+}
+
+function extractModelIds(json) {
+  if (!json) return [];
+  const arr = Array.isArray(json.data) ? json.data
+    : Array.isArray(json.models) ? json.models
+      : Array.isArray(json) ? json
+        : [];
+  return [...new Set(arr.map((m) => (typeof m === 'string' ? m : (m && (m.id || m.name || m.model)) || ''))
+    .map((s) => String(s).replace(/^models\//, ''))
+    .filter(Boolean))].sort();
+}
+
 async function handleAdmin(req, res, url) {
   if (url.pathname === '/admin/api/ping') return sendJson(res, 200, { ok: true, version: PKG_VERSION });
   if (!requireAdmin(req, res)) return;
@@ -1127,7 +1360,7 @@ async function handleAdmin(req, res, url) {
     // value (accounts above all — an "edit provider" must never orphan keys).
     const seeded = {};
     if (existing) {
-      for (const key of ['accounts', 'headers', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type']) {
+      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type']) {
         if (body[key] === undefined) seeded[key] = existing[key];
       }
     }
@@ -1156,15 +1389,44 @@ async function handleAdmin(req, res, url) {
     if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
     const body = await readJsonBody(req);
     const incoming = Array.isArray(body.accounts) ? body.accounts : [body];
+    // Keyless providers (OpenCode Free, local servers) legitimately store no key.
+    const keyless = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style === 'opencode-free'
+      || (PROVIDER_TYPES[provider.type] || {}).keyless === true;
     const added = [];
     for (const raw of incoming) {
       const acc = typeof raw === 'string' ? parseAccountLine(raw) : normalizeAccount(raw, `account-${provider.accounts.length + 1}`);
-      if (!acc.apiKey) continue;
+      if (!acc.apiKey && !keyless) continue;
       provider.accounts.push(acc);
       added.push(accountSummary(provider, acc));
     }
     await saveConfig();
     return sendJson(res, 200, { ok: true, added: added.length, accounts: added });
+  }
+
+  if (method === 'GET' && a === 'provider' && b && c === 'models') {
+    const provider = findProvider(b);
+    if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+    const accounts = provider.accounts || [];
+    const account = accounts.find((x) => x.enabled !== false && !isLimited(accountState(provider.id, x.id))) || accounts[0] || { apiKey: '' };
+    const spec = modelListRequest(provider, account);
+    try {
+      const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(15_000) });
+      const text = await upstream.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* non-JSON: report the raw head */ }
+      const models = extractModelIds(json);
+      return sendJson(res, 200, {
+        ok: upstream.ok,
+        status: upstream.status,
+        source: spec.url,
+        provider: provider.id,
+        count: models.length,
+        models: models.length ? models : undefined,
+        raw: models.length ? undefined : text.slice(0, 2000),
+      });
+    } catch (err) {
+      return sendJson(res, 502, { error: { message: `model list fetch failed: ${err.message}`, type: 'upstream_error' } });
+    }
   }
 
   if (a === 'provider' && b && c === 'account' && d) {
