@@ -321,13 +321,20 @@ class FreebuffDriver {
     let json = null;
     try { json = JSON.parse(text); } catch { /* keep text */ }
     if (!res.ok || !json) throw new Error(`login start failed: HTTP ${res.status} ${text.slice(0, 160)}`);
+    if (!json.loginUrl) throw new Error('login code response carried no loginUrl');
+    const fingerprintHash = String(json.fingerprintHash || '').trim();
+    if (!fingerprintHash) throw new Error('login code response carried no fingerprintHash');
+    // The real client marks the browser hand-off as a desktop flow; without it
+    // the page completes but the status endpoint never returns a token.
+    const loginUrl = new URL(json.loginUrl, LOGIN_HOST);
+    loginUrl.searchParams.set('desktop_flow', crypto.randomUUID());
     this.logins = this.logins || new Map();
     const session = {
       id: fingerprintId,
       fingerprintId,
-      fingerprintHash: json.fingerprintHash || json.hash || '',
-      expiresAt: json.expiresAt || Date.now() + 3_600_000,
-      loginUrl: json.loginUrl || json.url || '',
+      fingerprintHash,
+      expiresAt: Number(json.expiresAt) > 0 ? Number(json.expiresAt) : Date.now() + 3_600_000,
+      loginUrl: loginUrl.toString(),
       startedAt: Date.now(),
     };
     this.logins.set(fingerprintId, session);
@@ -347,8 +354,16 @@ class FreebuffDriver {
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch { /* keep text */ }
-    const token = (json && (json.user?.authToken || json.authToken || json.token)) || '';
-    return { status: res.status, ok: res.ok, token, pending: !token, raw: token ? undefined : text.slice(0, 200) };
+    const user = (json && json.user) || {};
+    const token = user.authToken || (json && (json.authToken || json.token)) || '';
+    if (token && !user.id) {
+      return { status: res.status, ok: res.ok, token: '', pending: true, error: 'login did not return a user id', raw: text.slice(0, 200) };
+    }
+    return {
+      status: res.status, ok: res.ok, token, pending: !token,
+      user: token ? { id: user.id || '', email: user.email || '', name: user.name || '' } : null,
+      raw: token ? undefined : text.slice(0, 200),
+    };
   }
 
   /** First message must be the Buffy preamble or the service answers 403. */

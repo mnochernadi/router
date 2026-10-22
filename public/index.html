@@ -913,7 +913,10 @@
         <p class="text-slate-500">Until then this provider is a model catalogue only.</p>
     </div>
     <div class="space-y-3" x-show="lf.providerType === 'freebuff'">
-        <p class="text-[12px] text-slate-300">freebuff has no API key. Open this link, sign in, approve the device, and this page finishes by itself.</p>
+        <p class="text-[12px] text-slate-300">freebuff has no API key: you sign in on freebuff.com, approve the device, and this page finishes by itself.</p>
+        <p class="text-[11px] text-amber-300" x-show="lf.blocked">The browser blocked the popup — press the link below to continue on freebuff.com.</p>
+        <a class="btn btn-primary w-full justify-center" :href="lf.url || '#'" target="_blank" rel="noopener" x-show="lf.url">
+          <i data-lucide="external-link" class="h-3.5 w-3.5"></i>Open freebuff.com to approve</a>
         <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-2">
           <code class="mono min-w-0 flex-1 truncate text-[11px] text-accent" x-text="lf.url || 'asking freebuff…'"></code>
           <button class="btn !px-2 !py-1" @click="copy(lf.url)" x-show="lf.url"><i data-lucide="copy" class="h-3 w-3"></i></button>
@@ -1034,7 +1037,7 @@ const CATALOG = [
     note: 'The free list changes over time — use Models to see what is live right now. Rotating exits help if you hit per-IP limits.' },
 
   { group: 'Free with account', key: 'freebuff', type: 'freebuff', label: 'freebuff (Codebuff)', icon: 'bird',
-    blurb: 'free coding models — authorize with a device login, no key to paste', keyMode: 'token', optional: true,
+    blurb: 'free coding models — sign in on freebuff.com, nothing to paste', keyMode: 'none', optional: true,
     baseUrl: 'https://www.codebuff.com', strategy: 'round-robin', proxy: 'rotate',
     keyHint: 'Paste the 36-character account token from the freebuff app. You can add it later — calls start once it is set.',
     note: 'Blocked-country egress (IR included) is reset by the service. Assign "Rotate the exit pool" so requests leave from a working IP.' },
@@ -1443,7 +1446,7 @@ function app() {
 
     switchTab(id) { this.tab = id; this.refreshIcons(); if (id === 'network') this.loadProxies(); },
 
-    lf: { providerType: '', provider: '', account: '', session: '', url: '', status: '', error: '', done: false },
+    lf: { providerType: '', provider: '', account: '', session: '', url: '', status: '', error: '', done: false, blocked: false },
     async startFreebuffLogin(p) {
       this.lf = { providerType: p.type, provider: p.id, account: (p.accounts[0] || {}).id || '', session: '', url: '', status: '', error: '', done: false };
       this.modal = 'authorize';
@@ -1453,7 +1456,9 @@ function app() {
         const r = await this.api('/freebuff/login', { method: 'POST', body: {} });
         this.lf.session = r.session.id;
         this.lf.url = r.session.loginUrl;
-        this.lf.status = 'waiting for approval…';
+        this.lf.status = 'a freebuff tab should have opened — sign in there and approve';
+        // Redirect to freebuff itself; if the popup is blocked the link below works.
+        try { const w = window.open(r.session.loginUrl, 'freebuff_login', 'noopener,width=520,height=720'); if (!w) this.lf.blocked = true; } catch (e) { this.lf.blocked = true; }
         this.pollTimer2 = setInterval(() => this.pollFreebuffLogin(true), 4000);
       } catch (err) { this.lf.error = err.message; }
     },

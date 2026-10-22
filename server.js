@@ -2219,7 +2219,7 @@ async function handleAdmin(req, res, url) {
     const body = await readJsonBody(req);
     try {
       const session = await freebuff.startLogin();
-      return sendJson(res, 200, { ok: true, session: { id: session.id, loginUrl: session.loginUrl, expiresAt: session.expiresAt } });
+      return sendJson(res, 200, { ok: true, session: { id: session.id, loginUrl: session.loginUrl, expiresAt: session.expiresAt, pollMs: 4000 } });
     } catch (err) {
       return sendJson(res, 502, { error: { message: err.message, type: 'login_failed' } });
     }
@@ -2236,11 +2236,13 @@ async function handleAdmin(req, res, url) {
         const provider = findProvider(providerId);
         const account = provider && (provider.accounts.find((x) => x.id === accountId) || provider.accounts[0]);
         if (!provider) return sendJson(res, 400, { error: { message: 'provider query parameter is required', type: 'bad_request' } });
+        const label = (r.user && (r.user.email || r.user.name)) || '';
         if (account) {
           account.apiKey = r.token;
           delete account.keyless;
+          if (label) account.name = label;
         } else {
-          provider.accounts.push(normalizeAccount({ name: 'freebuff-login', apiKey: r.token }));
+          provider.accounts.push(normalizeAccount({ name: label || 'freebuff-login', apiKey: r.token }));
         }
         const st = freebuff.accountState(provider.id, (account || provider.accounts[provider.accounts.length - 1]).id);
         st.needsReauth = false;
@@ -2249,7 +2251,7 @@ async function handleAdmin(req, res, url) {
         await saveConfig();
         await freebuff.save();
         pushEvent({ kind: 'freebuff-login', pid: provider.id, s: 1 });
-        return sendJson(res, 200, { ok: true, authorized: true, provider: providerSummary(provider) });
+        return sendJson(res, 200, { ok: true, authorized: true, user: r.user || null, provider: providerSummary(provider) });
       }
       return sendJson(res, 200, { ok: true, authorized: false, pending: true, status: r.status, raw: r.raw });
     } catch (err) {
