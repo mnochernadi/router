@@ -130,6 +130,39 @@ const mock = http.createServer(async (req, res) => {
     }));
   }
   // OpenCode OpenAI-compatible route
+  if (url.pathname === '/inference/v1/chat/completions') {
+    const ua = String(req.headers['user-agent'] || '');
+    const session = String(req.headers['x-opencode-session'] || '');
+    const aliases = [req.headers['x-opencode-session-id'], req.headers['x-session-affinity'], req.headers['x-session-id']];
+    const toolNames = (Array.isArray(json.tools) ? json.tools : []).map((x) => String(x?.function?.name || x?.name || ''));
+    const missing = ['bash', 'glob', 'grep', 'read'].filter((n) => !toolNames.includes(n));
+    const problems = [];
+    if (req.headers.authorization !== 'Bearer public') problems.push('authorization');
+    if (!/^opencode\/latest\/\d+\.\d+\.\d+\/cli$/.test(ua)) problems.push('user-agent');
+    if (req.headers['x-opencode-client'] !== 'cli') problems.push('client');
+    if (!/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(session)) problems.push('session');
+    if (aliases.some((a) => a !== session)) problems.push('session-aliases');
+    if (json.stream !== true) problems.push('stream');
+    if (missing.length) problems.push('tools:' + missing.join('|'));
+    if (problems.length) {
+      fb.freeTierRejects += 1;
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeTierError', message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai", problems } }));
+    }
+    fb.freeTierAccepted += 1;
+    if (json.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (let i = 0; i < 4; i++) {
+        res.write(`data: ${JSON.stringify({ id: 'oc1', object: 'chat.completion.chunk', model: json.model, choices: [{ index: 0, delta: { content: `OC${i} ` }, finish_reason: null }] })}\n\n`);
+      }
+      res.write(`data: ${JSON.stringify({ id: 'oc1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ id: 'oc1', object: 'chat.completion', model: json.model, choices: [{ index: 0, message: { role: 'assistant', content: 'opencode says hi' }, finish_reason: 'stop' }] }));
+  }
+
   if (url.pathname === '/inference/openai/v1/chat/completions' || url.pathname === '/zen/v1/chat/completions') {
     if (json.stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -264,7 +297,7 @@ function writeConfig() {
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'oc-1', name: 'oc-key', apiKey: 'key-oc-ok', enabled: true }],
       },
       {
-        id: 'opencode-free-test', name: 'OpenCode Free Test', type: 'opencode-free', baseUrl: `http://127.0.0.1:${MOCK_PORT}/zen/v1`,
+        id: 'opencode-free-test', name: 'OpenCode Free Test', type: 'opencode-free', baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`,
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'ocf-1', name: 'keyless', apiKey: '', enabled: true }],
       },
       {
@@ -303,6 +336,8 @@ const fb = {
   preambleOk: 0,
   handle: 'fbm1.testhandle',
   modelKey: 'm-test1',
+  freeTierAccepted: 0,
+  freeTierRejects: 0,
 };
 
 function fbCanonical({ method, path: p, ts, bodyHash, fetchId }) {
@@ -768,8 +803,18 @@ async function memOf() {
       rsText === 'R0 R1 R2 R3 ' && rsS.text.trimEnd().endsWith('data: [DONE]'), `"${rsText}"`);
 
     const free = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'opencode-free-test' } });
-    check('opencode-free: keyless account works with no auth header',
-      free.status === 200 && JSON.parse(free.text).choices[0].message.content === 'opencode says hi', free.text.slice(0, 200));
+    const freeJson = free.status === 200 ? JSON.parse(free.text) : {};
+    check('opencode-free: the attested identity is accepted and a non-stream client gets one JSON object',
+      free.status === 200 && freeJson.object === 'chat.completion' && freeJson.choices[0].message.content === 'OC0 OC1 OC2 OC3 ',
+      `${free.status} ${free.text.slice(0, 200)}`);
+    check('opencode-free: the upstream really saw Bearer public, the v2 UA, a ses_ session and the tool quartet',
+      fb.freeTierAccepted === 1 && fb.freeTierRejects === 0,
+      `accepted=${fb.freeTierAccepted} rejected=${fb.freeTierRejects}`);
+    const freeStream = await chat({ model: 'big-pickle', stream: true, headers: { 'x-router-provider': 'opencode-free-test' } });
+    check('opencode-free: a streaming client gets the SSE pass-through',
+      freeStream.status === 200 && (freeStream.headers.get('content-type') || '').includes('text/event-stream')
+        && freeStream.text.includes('OC0 ') && freeStream.text.trimEnd().endsWith('data: [DONE]'),
+      freeStream.text.slice(0, 160));
 
     const models = await (await fetch(routerUrl('/admin/api/provider/opencode-test/models'), { headers: ADMIN })).json();
     check('admin model discovery returns the upstream model list',

@@ -68,7 +68,10 @@ const PROVIDER_TYPES = {
   // OpenCode (opencode.ai): one account fronts four wire formats. The router
   // picks the right sub-endpoint per model id -- see openCodeKind().
   opencode: { label: 'OpenCode (Console)', baseUrl: 'https://opencode.ai/inference', style: 'opencode' },
-  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/zen/v1', style: 'opencode-free', keyless: true },
+  // Free tier lives on /inference/v1 (v2). It needs the attested client
+  // identity: Bearer public, the v2 UA, x-opencode-session and the built-in
+  // tool quartet -- see the adapter below, ported from 9Router's opencode.js.
+  'opencode-free': { label: 'OpenCode Free (no key)', baseUrl: 'https://opencode.ai/inference/v1', style: 'opencode-free', keyless: true },
   // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
   // The driver owns the whole handshake, so this style always wants a proxy exit.
   freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff', keyOptional: true },
@@ -690,7 +693,31 @@ function buildUpstream(provider, account, ctx) {
     return { style, responseStyle: 'openai', url: '', headers: {}, payload: {} };
   }
 
-  if (style === 'opencode' || style === 'opencode-free') {
+  if (style === 'opencode-free') {
+    const session = openCodeSession(provider, account, { fresh: !!ctx.freshSession });
+    if (ctx.freshSession) ctx.freshSession = false;
+    const payload = ensureFingerprintTools({ ...(ctx.body || {}), model: ctx.model || (ctx.body || {}).model });
+    return {
+      style, responseStyle: 'openai',
+      url: `${String(baseUrl || '').replace(/\/+$/, '')}${ctx.suffix || '/chat/completions'}`,
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        authorization: 'Bearer public',
+        'user-agent': OPENCODE_FREE_UA,
+        'x-opencode-client': 'cli',
+        'x-opencode-session': session,
+        'x-opencode-session-id': session,
+        'x-session-affinity': session,
+        'x-session-id': session,
+        'x-opencode-project': 'global',
+        ...(provider.headers || {}),
+      },
+      payload,
+    };
+  }
+
+  if (style === 'opencode') {
     const key = usableKey(account.apiKey);
     const headers = { 'content-type': 'application/json', ...(provider.headers || {}) };
     if (key) headers.authorization = `Bearer ${key}`;
@@ -1246,6 +1273,33 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     return;
   }
 
+  // ---- upstream streams, client asked for one JSON object ------------------
+  if (ctx.aggregate && upstream.body) {
+    let payload = '';
+    try {
+      const agg = sseAggregator(ctx.model);
+      const done = new Promise((resolve, reject) => {
+        agg.on('data', (c) => { payload += c.toString('utf8'); });
+        agg.on('end', resolve);
+        agg.on('error', reject);
+      });
+      Readable.fromWeb(upstream.body).pipe(agg);
+      await done;
+    } catch (err) {
+      if (!res.headersSent) sendJson(res, 502, { error: { message: `aggregating the upstream stream failed: ${err.message}`, type: 'router_relay_error' } });
+      return;
+    }
+    const headers2 = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
+    headers2['x-router-account'] = String(account?.id || '');
+    headers2['x-router-attempts'] = String(attempts);
+    headers2['x-router-exit'] = ctx.exitId || 'direct';
+    headers2['x-router-rotations'] = String(ctx.rotations || 0);
+    headers2['content-length'] = Buffer.byteLength(payload);
+    res.writeHead(upstream.status, headers2);
+    res.end(payload);
+    return;
+  }
+
   // ---- streaming / passthrough: zero-copy, never buffered -------------------
   const headers = baseResponseHeaders(upstream.status, contentType, provider);
   headers['x-router-account'] = String(account?.id || '');
@@ -1421,6 +1475,11 @@ async function handleProxy(req, res, url) {
     ctx.style = kind; // selects the translator (anthropic | gemini | responses)
     ctx.translate = isChat && kind !== 'openai';
     if (kind === 'anthropic' && wantAnthropicIn) ctx.translate = false;
+  } else if (style === 'opencode-free') {
+    ctx.responseStyle = 'openai';
+    // Upstream always streams on the free tier; a non-stream client is served
+    // by aggregating the SSE here instead of asking for stream:false.
+    ctx.aggregate = !ctx.stream;
   } else if (style === 'anthropic' || style === 'gemini') {
     ctx.responseStyle = style;
   } else {
@@ -1486,6 +1545,15 @@ async function handleProxy(req, res, url) {
         // exit (policy gate, bad model handle): stop burning the pool.
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
+        const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
+        if (freeTier && kind === 'quota' && rotations < Math.max(1, rotateMax)) {
+          // The free tier accounts quota per session, so a new session is a new
+          // allowance; that beats sitting out a cooldown.
+          ctx.freshSession = true;
+          rotations += 1;
+          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying (${rotations}/${Math.max(1, rotateMax)})`);
+          continue;
+        }
         if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
           const next = proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`, provider.id);
@@ -1630,6 +1698,106 @@ function touchProvider(provider) {
   }
   config.providers.push(provider);
   return { provider, created: true };
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode free tier (ported from 9Router's opencode executor)
+// ---------------------------------------------------------------------------
+// The gate is client attestation, not an IP or an account:
+//   * POST /inference/v1/chat/completions  (the old /zen/v1 now always 403s)
+//   * Authorization: Bearer public
+//   * User-Agent: opencode/latest/<v>/cli  (the v1 'opencode/1.x' form is refused)
+//   * x-opencode-session plus its three aliases, shaped ses_<12 hex><14 base62>
+//     where the hex field is ~(timeMs*4096 + counter) truncated to 48 bits
+//   * tools must contain bash, glob, grep and read
+//   * stream is always true upstream
+// Quota is accounted per session, so a fresh session is a fresh allowance.
+const OPENCODE_FREE_UA = 'opencode/latest/2.0.26/cli';
+const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function openCodeSessionId(timestamp = Date.now(), counter = 1) {
+  const mask = (1n << 48n) - 1n;
+  const hex = (~(BigInt(timestamp) * 0x1000n + BigInt(counter)) & mask).toString(16).padStart(12, '0');
+  const bytes = crypto.randomBytes(14);
+  let tail = '';
+  for (let i = 0; i < 14; i += 1) tail += BASE62[bytes[i] % 62];
+  return `ses_${hex}${tail}`;
+}
+
+/** One stable session per provider+account, so quota is not burned per request. */
+function openCodeSession(provider, account, { fresh = false } = {}) {
+  const as = accountState(provider.id, account.id);
+  if (fresh || !as.sessionId) {
+    as.sessionId = openCodeSessionId();
+    as.sessionStartedAt = Date.now();
+    persistState();
+  }
+  return as.sessionId;
+}
+
+function ensureFingerprintTools(body) {
+  const out = { ...(body || {}) };
+  const tools = Array.isArray(out.tools) ? out.tools.slice() : [];
+  const present = new Set(tools.map((t) => String(t?.function?.name || t?.name || '').trim()));
+  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+    if (present.has(name)) continue;
+    tools.push({
+      type: 'function',
+      function: { name, description: `OpenCode built-in ${name} tool`, parameters: { type: 'object', properties: {} } },
+    });
+  }
+  out.tools = tools;
+  out.stream = true; // stream:false is refused on the free tier
+  return out;
+}
+
+/** Aggregate an upstream SSE stream into one chat.completion (for non-stream clients). */
+function sseAggregator(model) {
+  let buf = '';
+  let content = '';
+  let reasoning = '';
+  let usage = null;
+  let finish = 'stop';
+  let id = '';
+  let created = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      buf += chunk.toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const j = JSON.parse(data);
+          if (j.id) id = j.id;
+          if (j.created) created = j.created;
+          const ch = j.choices && j.choices[0];
+          if (ch) {
+            if (ch.delta && typeof ch.delta.content === 'string') content += ch.delta.content;
+            if (ch.delta && typeof ch.delta.reasoning_content === 'string') reasoning += ch.delta.reasoning_content;
+            if (ch.finish_reason) finish = ch.finish_reason;
+          }
+          if (j.usage) usage = j.usage;
+        } catch { /* partial frame */ }
+      }
+      cb();
+    },
+    flush(cb) {
+      this.push(JSON.stringify({
+        id: id || uid('chatcmpl'),
+        object: 'chat.completion',
+        created: created || Math.floor(now() / 1000),
+        model,
+        choices: [{ index: 0, message: { role: 'assistant', content, ...(reasoning ? { reasoning_content: reasoning } : {}) }, finish_reason: finish }],
+        ...(usage ? { usage } : {}),
+      }));
+      cb();
+    },
+  });
 }
 
 /**
