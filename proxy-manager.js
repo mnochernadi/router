@@ -469,9 +469,15 @@ class ProxyManager {
     const child = spawn(bin, ['run', '-config', file], { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     let exited = false;
+    let resolveDied;
+    const died = new Promise((resolve) => { resolveDied = resolve; });
+    // A missing or non-executable binary emits 'error' and never 'exit', so both
+    // paths must settle the race -- otherwise every batch waits out the full
+    // port timeout for a process that was never started.
+    const markDead = () => { exited = true; resolveDied(null); };
+    child.once('error', (err) => { stderr += `spawn error: ${err.message}\n`; markDead(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-8000); });
     child.once('exit', (code) => {
-      exited = true;
       const target = tag === 'test' ? this.tester : this.xray;
       target.running = false;
       target.pid = 0;
@@ -480,11 +486,9 @@ class ProxyManager {
         this.log(`[xray:${tag}] ${target.error}`);
         this.pushEvent({ kind: 'xray-exit', tag, code });
       }
+      markDead();
     });
     const ports = exits.map((_, i) => (basePort || settings.inboundBasePort) + i);
-    // A config xray refuses to load exits within milliseconds; don't sit out the
-    // full port timeout for it, or a poisoned batch costs 8s per attempt.
-    const died = new Promise((resolve) => child.once('exit', () => resolve(null)));
     const ready = await Promise.race([Promise.all(ports.map((p) => waitPort(p, 8000))), died]);
     const up = Array.isArray(ready) && ready.some(Boolean) && !exited;
     return { child, ports, up, stderr, exited };
@@ -559,6 +563,17 @@ class ProxyManager {
 
   async testAll({ limit = 0, protocols = null, retest = false, sourceIds = null } = {}) {
     if (this.test.running) return { error: 'a test run is already in progress' };
+
+    // Pre-flight: without a usable binary every batch would burn its port
+    // timeout and report the exits dead for the wrong reason.
+    const bin = await this.version();
+    if (bin.error) {
+      const msg = `xray is not usable (${bin.error}) - install it (install.sh --with-xray) or set the path in the Network tab`;
+      this.test.error = msg;
+      this.pushEvent({ kind: 'test-blocked', error: msg.slice(0, 160) });
+      return { error: msg };
+    }
+
     const settings = this.state.settings;
     let candidates = this.state.exits.filter((e) => (!sourceIds || sourceIds.includes(e.sourceId)));
     if (protocols && protocols.length) candidates = candidates.filter((e) => protocols.includes(e.protocol));

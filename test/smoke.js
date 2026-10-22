@@ -822,6 +822,23 @@ async function memOf() {
     check('connect: "check models" probes an unsaved provider', probe.status === 200 && probeBody.ok === true && probeBody.count === 5, JSON.stringify(probeBody).slice(0, 200));
   }
 
+  // 20. a test run with no usable xray binary must fail fast and say why
+  {
+    const start = await fetch(routerUrl('/admin/api/proxies/test'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ retest: true }),
+    });
+    const body = await start.json();
+    check('proxy test: a missing xray binary is refused immediately with a clear reason',
+      start.status === 409 && /xray/i.test(body.error.message), `${start.status} ${JSON.stringify(body).slice(0, 160)}`);
+    await sleep(400);
+    const status = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
+    check('proxy test: the refusal leaves no half-started run behind',
+      status.test.running === false && status.test.total === 0 && /xray/i.test(status.test.error),
+      JSON.stringify(status.test).slice(0, 200));
+    check('proxy test: exits stay untouched (no false "dead" verdicts)',
+      status.counts.ok === 2 && status.counts.dead === 0, JSON.stringify(status.counts));
+  }
+
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
   const pastDeadline = await fetch(routerUrl('/admin/api/provider/seq-provider/account/a-limited/reset'), { method: 'POST', headers: ADMIN });
   check('unlock path exercised without restart', pastDeadline.status === 200);
