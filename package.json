@@ -1,0 +1,31 @@
+{
+  "name": "llm-api-router",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Ultra-lightweight multi-account LLM API router with streaming SSE passthrough, 12-hour rate-limit memory, automatic failover and a client-side dashboard.",
+  "keywords": ["llm", "router", "openai", "anthropic", "gemini", "openrouter", "proxy", "sse", "streaming", "failover", "rate-limit"],
+  "license": "MIT",
+  "author": "mnochernadi",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "smoke": "node test/smoke.js",
+    "test": "node test/smoke.js",
+    "health": "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>r.text()).then(t=>console.log(t)).catch(e=>{console.error(e.message);process.exit(1)})\""
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mnochernadi/router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mnochernadi/router/issues"
+  },
+  "homepage": "https://github.com/mnochernadi/router#readme"
+}

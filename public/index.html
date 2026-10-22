@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLM Router · Control Plane</title>
+<meta name="color-scheme" content="dark" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Cpath d='M4 12h6m4 0h6M10 8v8m4-8v8'/%3E%3C/svg%3E" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          ink: { 950: '#070a12', 900: '#0b0f1a', 850: '#0f1422', 800: '#141a2b', 700: '#1d2438', 600: '#2a3350' },
+          accent: { DEFAULT: '#38bdf8', soft: '#0ea5e9', violet: '#8b5cf6' },
+        },
+        fontFamily: { sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'], mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'] },
+        boxShadow: { glow: '0 0 0 1px rgba(56,189,248,.18), 0 12px 40px -12px rgba(56,189,248,.35)' },
+      },
+    },
+  };
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<script src="https://unpkg.com/lucide@0.451.0/dist/umd/lucide.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { background:
+      radial-gradient(1200px 600px at 12% -8%, rgba(56,189,248,.10), transparent 60%),
+      radial-gradient(900px 500px at 92% 4%, rgba(139,92,246,.10), transparent 55%),
+      #070a12; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #0b0f1a; }
+  ::-webkit-scrollbar-thumb { background: #1d2438; border-radius: 999px; border: 2px solid #0b0f1a; }
+  ::-webkit-scrollbar-thumb:hover { background: #2a3350; }
+  .card { background: linear-gradient(180deg, rgba(20,26,43,.92), rgba(11,15,26,.92)); border: 1px solid #1d2438; }
+  .card:hover { border-color: #2a3350; }
+  .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.15rem .5rem; border-radius:999px; font-size:.7rem; font-weight:600; letter-spacing:.01em; }
+  .seg { position: relative; display:grid; grid-template-columns:1fr 1fr; gap:.25rem; padding:.2rem; border-radius:.6rem; background:#0b0f1a; border:1px solid #1d2438; }
+  .seg button { position:relative; z-index:1; padding:.3rem .6rem; border-radius:.45rem; font-size:.72rem; font-weight:600; color:#8b95ad; transition:all .15s ease; }
+  .seg button.on { background:linear-gradient(180deg,#1d2438,#141a2b); color:#e6ecf7; box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 6px 16px -10px rgba(56,189,248,.8); }
+  .btn { display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .7rem; border-radius:.55rem; font-size:.78rem; font-weight:600; border:1px solid #1d2438; background:#0f1422; color:#c7d2e4; transition:all .15s ease; }
+  .btn:hover { background:#141a2b; border-color:#2a3350; color:#fff; }
+  .btn-primary { background:linear-gradient(180deg,#0ea5e9,#0284c7); border-color:#0ea5e9; color:#fff; }
+  .btn-primary:hover { background:linear-gradient(180deg,#38bdf8,#0ea5e9); }
+  .btn-danger { color:#fca5a5; border-color:#3f1d24; }
+  .btn-danger:hover { background:#2a1319; border-color:#7f1d1d; color:#fecaca; }
+  .input { width:100%; padding:.5rem .65rem; border-radius:.55rem; background:#0b0f1a; border:1px solid #1d2438; color:#e6ecf7; font-size:.82rem; }
+  .input:focus { outline:none; border-color:#0ea5e9; box-shadow:0 0 0 3px rgba(14,165,233,.15); }
+  label.fld { display:block; font-size:.7rem; font-weight:600; color:#8b95ad; text-transform:uppercase; letter-spacing:.06em; margin-bottom:.3rem; }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  [x-cloak] { display:none !important; }
+  .fade-in { animation: fade .18s ease both; }
+  @keyframes fade { from { opacity:0; transform: translateY(4px); } to { opacity:1; transform:none; } }
+  .pulse-dot { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+</style>
+</head>
+<body class="min-h-screen font-sans text-slate-200 antialiased" x-data="app()" x-init="init()" x-cloak>
+
+<!-- ===================== TOP STATUS BAR ===================== -->
+<header class="sticky top-0 z-30 border-b border-ink-700/70 bg-ink-950/85 backdrop-blur">
+  <div class="mx-auto flex max-w-[1400px] flex-wrap items-center gap-x-5 gap-y-3 px-4 py-3">
+    <div class="flex items-center gap-2.5">
+      <div class="grid h-9 w-9 place-items-center rounded-xl border border-accent/30 bg-accent/10 shadow-glow">
+        <i data-lucide="network" class="h-4.5 w-4.5 text-accent"></i>
+      </div>
+      <div class="leading-tight">
+        <div class="flex items-center gap-2 text-sm font-semibold text-white">LLM Router
+          <span class="pill bg-accent/10 text-accent" x-text="'v' + (s.version || '…')"></span>
+        </div>
+        <div class="text-[11px] text-slate-500" x-text="'node ' + (s.node || '') + ' · cooldown ' + (s.cooldownHours ?? 12) + 'h on ' + ((s.cooldownStatuses||[]).join('/'))"></div>
+      </div>
+    </div>
+
+    <!-- live metrics -->
+    <div class="flex flex-1 flex-wrap items-center gap-x-4 gap-y-2 text-[11px]">
+      <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-1.5">
+        <i data-lucide="cpu" class="h-3.5 w-3.5 text-emerald-400"></i>
+        <span class="text-slate-500">RAM</span>
+        <span class="mono font-semibold text-emerald-300" x-text="mb(s.memory.rss)"></span>
+        <svg viewBox="0 0 120 24" class="h-5 w-[90px]" preserveAspectRatio="none">
+          <polyline :points="spark()" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      </div>
+      <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-1.5">
+        <i data-lucide="clock" class="h-3.5 w-3.5 text-sky-400"></i>
+        <span class="text-slate-500">uptime</span>
+        <span class="mono font-semibold text-sky-300" x-text="uptime(s.uptimeSeconds)"></span>
+      </div>
+      <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-1.5">
+        <i data-lucide="route" class="h-3.5 w-3.5 text-violet-400"></i>
+        <span class="text-slate-500">routed</span>
+        <span class="mono font-semibold text-violet-300" x-text="num(s.totals.requests)"></span>
+      </div>
+      <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-1.5">
+        <i data-lucide="check-circle-2" class="h-3.5 w-3.5 text-emerald-400"></i>
+        <span class="text-slate-500">active</span>
+        <span class="mono font-semibold text-emerald-300" x-text="s.totals.active || 0"></span>
+        <span class="text-slate-600">/</span>
+        <i data-lucide="ban" class="h-3.5 w-3.5 text-rose-400"></i>
+        <span class="mono font-semibold text-rose-300" x-text="s.totals.limited || 0"></span>
+      </div>
+      <div class="flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-3 py-1.5">
+        <i data-lucide="refresh-cw" class="h-3.5 w-3.5 text-amber-400"></i>
+        <span class="text-slate-500">failovers</span>
+        <span class="mono font-semibold text-amber-300" x-text="num(s.totals.failovers)"></span>
+      </div>
+    </div>
+
+    <!-- actions -->
+    <div class="flex items-center gap-2">
+      <div class="hidden items-center gap-2 rounded-lg border border-ink-700 bg-ink-900/70 px-2.5 py-1.5 md:flex">
+        <i data-lucide="link" class="h-3.5 w-3.5 text-slate-500"></i>
+        <code class="mono max-w-[210px] truncate text-[11px] text-slate-300" x-text="baseUrl()"></code>
+        <button class="text-slate-400 hover:text-accent" title="Copy API base URL" @click="copy(baseUrl())">
+          <i data-lucide="copy" class="h-3.5 w-3.5"></i>
+        </button>
+      </div>
+      <button class="btn" @click="load(true)" title="Refresh now"><i data-lucide="refresh-cw" class="h-3.5 w-3.5" :class="busy && 'animate-spin'"></i></button>
+      <button class="btn" @click="openSettings()" title="Router settings"><i data-lucide="settings" class="h-3.5 w-3.5"></i></button>
+      <button class="btn btn-primary" @click="openProvider(null)"><i data-lucide="plus" class="h-3.5 w-3.5"></i>Provider</button>
+    </div>
+  </div>
+</header>
+
+<!-- ===================== BODY ===================== -->
+<main class="mx-auto max-w-[1400px] px-4 py-6">
+
+  <!-- toolbar -->
+  <div class="mb-5 flex flex-wrap items-center gap-2">
+    <div class="mr-auto flex items-center gap-2">
+      <h1 class="text-lg font-semibold text-white">Providers &amp; Accounts</h1>
+      <span class="pill bg-ink-800 text-slate-400" x-text="(s.providers||[]).length + ' providers'"></span>
+      <span class="pill bg-ink-800 text-slate-400" x-text="(s.totals.accounts||0) + ' accounts'"></span>
+      <span x-show="s.hasProxyKeys" class="pill bg-amber-500/10 text-amber-300" title="Inbound API keys are required on /v1">
+        <i data-lucide="key-round" class="h-3 w-3"></i>inbound keys on</span>
+    </div>
+    <button class="btn" @click="exportBackup()"><i data-lucide="download" class="h-3.5 w-3.5"></i>Export backup</button>
+    <label class="btn cursor-pointer">
+      <i data-lucide="upload" class="h-3.5 w-3.5"></i>Import backup
+      <input type="file" accept="application/json,.json" class="hidden" @change="importBackup($event)" />
+    </label>
+    <button class="btn" @click="resetAll()"><i data-lucide="unlock" class="h-3.5 w-3.5"></i>Unlock all</button>
+  </div>
+
+  <!-- provider grid -->
+  <div class="grid grid-cols-1 gap-5 xl:grid-cols-2">
+    <template x-for="p in (s.providers || [])" :key="p.id">
+      <section class="card fade-in rounded-2xl p-4">
+        <!-- provider header -->
+        <div class="flex flex-wrap items-start gap-3">
+          <div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-ink-600 bg-ink-850">
+            <i :data-lucide="providerIcon(p.type)" class="h-4.5 w-4.5 text-accent"></i>
+          </div>
+          <div class="mr-auto min-w-0">
+            <div class="flex items-center gap-2">
+              <h2 class="truncate text-sm font-semibold text-white" x-text="p.name"></h2>
+              <span class="pill bg-ink-800 text-slate-400" x-text="p.type"></span>
+              <span x-show="p.id === s.defaultProvider" class="pill bg-violet-500/10 text-violet-300">default</span>
+            </div>
+            <div class="mono mt-0.5 truncate text-[11px] text-slate-500" x-text="p.id + ' · ' + (p.baseUrl || '—')"></div>
+          </div>
+
+          <!-- strategy switch -->
+          <div class="seg" title="round-robin: rotate every request · sequential: keep the first healthy account until it is rate-limited">
+            <button :class="p.strategy === 'round-robin' && 'on'" @click="setStrategy(p, 'round-robin')">Round-Robin</button>
+            <button :class="p.strategy === 'sequential' && 'on'" @click="setStrategy(p, 'sequential')">Sequential</button>
+          </div>
+
+          <div class="flex items-center gap-1.5">
+            <button class="btn" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
+            <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
+            <button class="btn btn-danger" @click="deleteProvider(p)" title="Delete provider"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
+          </div>
+        </div>
+
+        <!-- provider stats -->
+        <div class="mt-3 grid grid-cols-4 gap-2 text-center">
+          <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-1.5">
+            <div class="mono text-sm font-semibold text-white" x-text="p.accountCount"></div>
+            <div class="text-[10px] uppercase tracking-wider text-slate-500">accounts</div>
+          </div>
+          <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-1.5">
+            <div class="mono text-sm font-semibold text-emerald-300" x-text="p.activeCount"></div>
+            <div class="text-[10px] uppercase tracking-wider text-slate-500">active</div>
+          </div>
+          <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-1.5">
+            <div class="mono text-sm font-semibold text-rose-300" x-text="p.limitedCount"></div>
+            <div class="text-[10px] uppercase tracking-wider text-slate-500">limited</div>
+          </div>
+          <div class="rounded-lg border border-ink-700 bg-ink-900/60 py-1.5">
+            <div class="mono text-sm font-semibold text-violet-300" x-text="num(p.requests)"></div>
+            <div class="text-[10px] uppercase tracking-wider text-slate-500">requests</div>
+          </div>
+        </div>
+
+        <!-- accounts -->
+        <div class="mt-3 space-y-2">
+          <template x-if="!p.accounts.length">
+            <div class="rounded-xl border border-dashed border-ink-600 px-3 py-6 text-center text-xs text-slate-500">
+              No accounts yet — click <span class="text-slate-300">Account</span> to paste one or bulk-add.
+            </div>
+          </template>
+          <template x-for="(a, ai) in p.accounts" :key="a.id">
+            <div class="rounded-xl border border-ink-700 bg-ink-900/50 p-2.5 transition-colors hover:border-ink-600">
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
+                <span class="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-ink-800 text-[10px] font-semibold text-slate-400" x-text="ai + 1"></span>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="truncate text-[13px] font-medium text-slate-100" x-text="a.name"></span>
+                    <span x-show="a.limitedUntil > 0" class="pill bg-rose-500/10 text-rose-300 pulse-dot">
+                      <i data-lucide="ban" class="h-3 w-3"></i>Limited
+                    </span>
+                    <span x-show="a.limitedUntil === 0 && a.enabled" class="pill bg-emerald-500/10 text-emerald-300">
+                      <i data-lucide="check" class="h-3 w-3"></i>Active
+                    </span>
+                    <span x-show="!a.enabled" class="pill bg-slate-500/10 text-slate-400">disabled</span>
+                  </div>
+                  <div class="mono mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
+                    <span x-text="a.maskedKey || 'no key'"></span>
+                    <span x-text="num(a.requests) + ' req'"></span>
+                    <span x-show="a.limits" x-text="a.limits + ' limit hit(s)'"></span>
+                    <span x-show="a.lastStatus" x-text="'last HTTP ' + a.lastStatus"></span>
+                    <span x-show="a.lastUsed" x-text="'used ' + ago(a.lastUsed)"></span>
+                  </div>
+                </div>
+
+                <!-- countdown -->
+                <div x-show="a.limitedUntil > 0" class="rounded-lg border border-rose-900/60 bg-rose-950/30 px-2.5 py-1 text-right">
+                  <div class="text-[10px] uppercase tracking-wider text-rose-400/70">auto-reset in</div>
+                  <div class="mono text-[13px] font-semibold text-rose-200" x-text="countdown(a.limitedUntil)"></div>
+                </div>
+
+                <div class="flex items-center gap-1.5">
+                  <button class="btn" @click="resetAccount(p, a)" x-show="a.limitedUntil > 0" title="Clear cooldown now">
+                    <i data-lucide="zap" class="h-3.5 w-3.5"></i>Reset now
+                  </button>
+                  <button class="btn" @click="openAccount(p, a)" title="Edit account"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
+                  <button class="btn btn-danger" @click="deleteAccount(p, a)" title="Delete account"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
+                </div>
+              </div>
+              <div x-show="a.limitedUntil > 0" class="mt-2 h-1 overflow-hidden rounded-full bg-ink-800">
+                <div class="h-full rounded-full bg-gradient-to-r from-rose-500 to-amber-400 transition-all duration-1000"
+                     :style="'width:' + pct(a.limitedUntil) + '%'"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+    </template>
+
+    <template x-if="!(s.providers || []).length">
+      <div class="card col-span-full rounded-2xl p-10 text-center">
+        <i data-lucide="plug-zap" class="mx-auto h-8 w-8 text-slate-600"></i>
+        <p class="mt-3 text-sm text-slate-400">No providers configured.</p>
+        <button class="btn btn-primary mx-auto mt-4" @click="openProvider(null)"><i data-lucide="plus" class="h-3.5 w-3.5"></i>Add your first provider</button>
+      </div>
+    </template>
+  </div>
+
+  <!-- activity -->
+  <section class="card mt-6 rounded-2xl p-4">
+    <div class="mb-3 flex items-center gap-2">
+      <i data-lucide="activity" class="h-4 w-4 text-accent"></i>
+      <h2 class="text-sm font-semibold text-white">Recent routing activity</h2>
+      <span class="pill bg-ink-800 text-slate-400">bodies are never stored — counters only</span>
+      <button class="btn ml-auto" @click="clearEvents()"><i data-lucide="eraser" class="h-3.5 w-3.5"></i>Clear</button>
+    </div>
+    <div class="max-h-56 space-y-1 overflow-y-auto pr-1">
+      <template x-for="(e, i) in localEvents" :key="i">
+        <div class="flex items-center gap-2.5 rounded-lg border border-ink-700/60 bg-ink-900/40 px-2.5 py-1.5 text-[11px]">
+          <span class="mono text-slate-500" x-text="clock(e.t)"></span>
+          <span class="pill" :class="eventClass(e.kind)" x-text="e.kind"></span>
+          <span class="mono truncate text-slate-300" x-text="e.pid + (e.aid ? '/' + acctName(e.pid, e.aid) : '')"></span>
+          <span class="mono text-slate-500" x-show="e.st" x-text="'HTTP ' + e.st"></span>
+          <span class="mono text-slate-500" x-show="e.ms" x-text="e.ms + 'ms'"></span>
+          <span class="mono ml-auto text-slate-600" x-show="e.s">stream</span>
+        </div>
+      </template>
+      <template x-if="!localEvents.length">
+        <div class="rounded-lg border border-dashed border-ink-700 px-3 py-6 text-center text-xs text-slate-500">No routed requests yet.</div>
+      </template>
+    </div>
+  </section>
+</main>
+
+<!-- ===================== LOGIN MODAL ===================== -->
+<div x-show="modal === 'login'" class="fixed inset-0 z-50 grid place-items-center bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card w-full max-w-sm rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-2.5">
+      <div class="grid h-9 w-9 place-items-center rounded-xl border border-accent/30 bg-accent/10"><i data-lucide="shield-check" class="h-4 w-4 text-accent"></i></div>
+      <div>
+        <h3 class="text-sm font-semibold text-white">Admin authentication</h3>
+        <p class="text-[11px] text-slate-500">Key is stored in localStorage and sent as <code class="mono">x-admin-key</code>.</p>
+      </div>
+    </div>
+    <label class="fld">ADMIN_KEY</label>
+    <input class="input mono" type="password" x-model="keyInput" @keydown.enter="login()" placeholder="config.json → adminKey" autofocus />
+    <p class="mt-2 text-[11px] text-rose-400" x-show="loginError" x-text="loginError"></p>
+    <button class="btn btn-primary mt-4 w-full justify-center" @click="login()">
+      <i data-lucide="log-in" class="h-3.5 w-3.5"></i>Unlock dashboard
+    </button>
+  </div>
+</div>
+
+<!-- ===================== PROVIDER MODAL ===================== -->
+<div x-show="modal === 'provider'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-8 w-full max-w-lg rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-2">
+      <i data-lucide="server-cog" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white" x-text="pf.editing ? 'Edit provider' : 'Add provider'"></h3>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div>
+        <label class="fld">Provider ID</label>
+        <input class="input mono" x-model="pf.id" :disabled="pf.editing" placeholder="openai-main" />
+      </div>
+      <div>
+        <label class="fld">Display name</label>
+        <input class="input" x-model="pf.name" placeholder="OpenAI" />
+      </div>
+      <div>
+        <label class="fld">Type</label>
+        <select class="input" x-model="pf.type" @change="applyTypeDefaults()">
+          <option value="openai">OpenAI</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="gemini">Google Gemini</option>
+          <option value="custom">Custom OpenAI-compatible</option>
+        </select>
+      </div>
+      <div>
+        <label class="fld">Strategy</label>
+        <select class="input" x-model="pf.strategy">
+          <option value="round-robin">Round-robin (rotate every request)</option>
+          <option value="sequential">Sequential (first healthy until limited)</option>
+        </select>
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Base URL</label>
+        <input class="input mono" x-model="pf.baseUrl" placeholder="https://api.openai.com/v1" />
+        <p class="mt-1 text-[11px] text-slate-500" x-text="typeHint()"></p>
+      </div>
+      <div>
+        <label class="fld">Cooldown hours</label>
+        <input class="input mono" type="number" min="0.05" step="0.5" x-model.number="pf.cooldownHours" />
+      </div>
+      <div>
+        <label class="fld">Upstream timeout (ms)</label>
+        <input class="input mono" type="number" min="1000" step="1000" x-model.number="pf.timeoutMs" />
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Max failover attempts</label>
+        <input class="input mono" type="number" min="0" max="32" x-model.number="pf.maxAttempts" />
+        <p class="mt-1 text-[11px] text-slate-500">0 = try every account in the provider.</p>
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Extra upstream headers (JSON, optional)</label>
+        <textarea class="input mono h-20" x-model="pf.headersText" placeholder='{"X-Custom": "value"}'></textarea>
+        <p class="mt-1 text-[11px] text-slate-500" x-show="pf.editing && pf.hasHeaders">Custom headers are configured — leave blank to keep them, or paste a full JSON object to replace.</p>
+      </div>
+    </div>
+
+    <div class="mt-5 flex items-center gap-2">
+      <p class="mr-auto text-[11px] text-rose-400" x-show="pf.error" x-text="pf.error"></p>
+      <button class="btn" @click="modal = null">Cancel</button>
+      <button class="btn btn-primary" @click="saveProvider()"><i data-lucide="save" class="h-3.5 w-3.5"></i>Save provider</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== ACCOUNT MODAL ===================== -->
+<div x-show="modal === 'account'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-8 w-full max-w-lg rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-2">
+      <i data-lucide="key-round" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white" x-text="af.editing ? 'Edit account' : 'Add account(s)'"></h3>
+      <span class="pill bg-ink-800 text-slate-400" x-text="af.providerName"></span>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+
+    <template x-if="af.editing">
+      <div class="grid grid-cols-1 gap-3">
+        <div>
+          <label class="fld">Account name</label>
+          <input class="input" x-model="af.name" placeholder="team-key-1" />
+        </div>
+        <div>
+          <label class="fld">API key <span class="text-slate-600">(leave blank to keep current)</span></label>
+          <input class="input mono" type="password" x-model="af.apiKey" :placeholder="af.maskedKey || 'sk-…'" />
+        </div>
+        <label class="flex items-center gap-2 text-xs text-slate-400">
+          <input type="checkbox" x-model="af.enabled" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" /> Enabled for routing
+        </label>
+      </div>
+    </template>
+
+    <template x-if="!af.editing">
+      <div class="grid grid-cols-1 gap-3">
+        <div>
+          <label class="fld">Single account</label>
+          <div class="grid grid-cols-2 gap-2">
+            <input class="input" x-model="af.name" placeholder="name (optional)" />
+            <input class="input mono" type="password" x-model="af.apiKey" placeholder="api key" />
+          </div>
+        </div>
+        <div>
+          <label class="fld">Bulk paste — one per line, <code class="mono">name:key</code> or just <code class="mono">key</code></label>
+          <textarea class="input mono h-32" x-model="af.bulk" placeholder="team-a:sk-aaa…&#10;team-b:sk-bbb…&#10;sk-ccc…"></textarea>
+          <p class="mt-1 text-[11px] text-slate-500" x-text="bulkCount() + ' key(s) detected in the textarea'"></p>
+        </div>
+      </div>
+    </template>
+
+    <div class="mt-5 flex items-center gap-2">
+      <p class="mr-auto text-[11px] text-rose-400" x-show="af.error" x-text="af.error"></p>
+      <button class="btn" @click="modal = null">Cancel</button>
+      <button class="btn btn-primary" @click="saveAccount()"><i data-lucide="save" class="h-3.5 w-3.5"></i>Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SETTINGS MODAL ===================== -->
+<div x-show="modal === 'settings'" class="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card my-8 w-full max-w-lg rounded-2xl p-5 fade-in">
+    <div class="mb-4 flex items-center gap-2">
+      <i data-lucide="settings" class="h-4 w-4 text-accent"></i>
+      <h3 class="text-sm font-semibold text-white">Router settings</h3>
+      <button class="ml-auto text-slate-500 hover:text-white" @click="modal = null"><i data-lucide="x" class="h-4 w-4"></i></button>
+    </div>
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div>
+        <label class="fld">Global cooldown hours</label>
+        <input class="input mono" type="number" min="0.05" step="0.5" x-model.number="sf.cooldownHours" />
+      </div>
+      <div>
+        <label class="fld">Default provider</label>
+        <select class="input" x-model="sf.defaultProvider">
+          <option value="">— auto (first healthy) —</option>
+          <template x-for="p in (s.providers || [])" :key="p.id"><option :value="p.id" x-text="p.id"></option></template>
+        </select>
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Inbound router API keys (one per line, empty = open)</label>
+        <textarea class="input mono h-20" x-model="sf.proxyKeysText" placeholder="sk-router-…"></textarea>
+      </div>
+      <div>
+        <label class="fld">Cooldown status codes</label>
+        <input class="input mono" x-model="sf.cooldownStatusesText" placeholder="429,402,403" />
+      </div>
+      <div>
+        <label class="fld">Replace admin key (optional)</label>
+        <input class="input mono" type="password" x-model="sf.adminKey" placeholder="new ADMIN_KEY" />
+      </div>
+      <label class="flex items-center gap-2 text-xs text-slate-400 sm:col-span-2">
+        <input type="checkbox" x-model="sf.cors" class="h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" /> Send permissive CORS headers
+      </label>
+    </div>
+    <div class="mt-5 flex items-center gap-2">
+      <p class="mr-auto text-[11px] text-rose-400" x-show="sf.error" x-text="sf.error"></p>
+      <button class="btn" @click="modal = null">Cancel</button>
+      <button class="btn btn-primary" @click="saveSettings()"><i data-lucide="save" class="h-3.5 w-3.5"></i>Save settings</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== CONFIRM MODAL ===================== -->
+<div x-show="modal === 'confirm'" class="fixed inset-0 z-[60] grid place-items-center bg-ink-950/80 p-4 backdrop-blur-sm" x-cloak>
+  <div class="card w-full max-w-sm rounded-2xl p-5 fade-in">
+    <div class="mb-3 flex items-center gap-2">
+      <i data-lucide="alert-triangle" class="h-4 w-4 text-amber-400"></i>
+      <h3 class="text-sm font-semibold text-white" x-text="cf.title"></h3>
+    </div>
+    <p class="text-xs text-slate-400" x-text="cf.body"></p>
+    <div class="mt-5 flex justify-end gap-2">
+      <button class="btn" @click="modal = null">Cancel</button>
+      <button class="btn btn-danger" @click="cf.run && cf.run(); modal = null">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== TOASTS ===================== -->
+<div class="pointer-events-none fixed bottom-4 right-4 z-[70] flex w-80 flex-col gap-2">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="pointer-events-auto flex items-start gap-2 rounded-xl border px-3 py-2 text-xs shadow-lg fade-in"
+         :class="{ 'border-emerald-800 bg-emerald-950/70 text-emerald-200': t.kind === 'ok',
+                   'border-rose-900 bg-rose-950/70 text-rose-200': t.kind === 'err',
+                   'border-ink-600 bg-ink-850/90 text-slate-200': t.kind === 'info',
+                   'border-amber-800 bg-amber-950/70 text-amber-200': t.kind === 'warn' }">
+      <i :data-lucide="t.kind === 'ok' ? 'check-circle-2' : t.kind === 'err' ? 'alert-octagon' : t.kind === 'warn' ? 'alert-triangle' : 'info'" class="mt-0.5 h-3.5 w-3.5 shrink-0"></i>
+      <div class="min-w-0 flex-1 break-words" x-text="t.msg"></div>
+      <button class="text-slate-500 hover:text-white" @click="toasts = toasts.filter(x => x.id !== t.id)"><i data-lucide="x" class="h-3 w-3"></i></button>
+    </div>
+  </template>
+</div>
+
+<script>
+const TYPES = {
+  openai:     { label: 'OpenAI',                 baseUrl: 'https://api.openai.com/v1',                    style: 'openai',    icon: 'sparkles' },
+  openrouter: { label: 'OpenRouter',             baseUrl: 'https://openrouter.ai/api/v1',                 style: 'openai',    icon: 'shuffle' },
+  anthropic:  { label: 'Anthropic',              baseUrl: 'https://api.anthropic.com/v1',                 style: 'anthropic', icon: 'brain' },
+  gemini:     { label: 'Google Gemini',          baseUrl: 'https://generativelanguage.googleapis.com/v1beta', style: 'gemini', icon: 'gem' },
+  custom:     { label: 'OpenAI-compatible',      baseUrl: '',                                              style: 'openai',    icon: 'plug' },
+};
+
+function app() {
+  return {
+    s: { providers: [], totals: {}, memory: { samples: [] }, events: [] },
+    modal: null,
+    key: localStorage.getItem('routerAdminKey') || '',
+    keyInput: '',
+    loginError: '',
+    busy: false,
+    toasts: [],
+    localEvents: [],
+    toastSeq: 0,
+    tick: 0,
+    timer: null,
+
+    pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', error: '' },
+    af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
+    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', cooldownStatusesText: '429,402,403', cors: true, adminKey: '', error: '' },
+    cf: { title: '', body: '', run: null },
+
+    async init() {
+      this.refreshIcons();
+      setInterval(() => { this.tick += 1; }, 1000);
+      this.timer = setInterval(() => this.load(), 3000);
+      if (!this.key) this.modal = 'login';
+      else await this.load();
+      this.refreshIcons();
+    },
+
+    // ---------- helpers ----------
+    refreshIcons() { this.$nextTick(() => { try { window.lucide && window.lucide.createIcons(); } catch (e) {} }); },
+    baseUrl() { return location.origin + '/v1'; },
+    mb(bytes) { return (Number(bytes || 0) / 1048576).toFixed(1) + ' MB'; },
+    num(n) { return Number(n || 0).toLocaleString(); },
+    clock(t) { return new Date(t).toLocaleTimeString([], { hour12: false }); },
+    ago(t) { const d = Math.max(0, Math.round((Date.now() - t) / 1000)); if (d < 60) return d + 's ago'; if (d < 3600) return Math.round(d / 60) + 'm ago'; return Math.round(d / 3600) + 'h ago'; },
+    uptime(sec) { const s = Number(sec || 0); const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; },
+    providerIcon(type) { return (TYPES[type] || TYPES.custom).icon; },
+    typeHint() { const t = TYPES[this.pf.type] || TYPES.custom; return t.baseUrl ? `Default for ${t.label}: ${t.baseUrl} · upstream API style: ${t.style}` : 'Set the full base URL of your OpenAI-compatible endpoint.'; },
+    countdown(until) {
+      const left = Math.max(0, Math.round((until - Date.now()) / 1000));
+      const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), sec = left % 60;
+      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    },
+    pct(until) {
+      const total = (this.s.cooldownHours || 12) * 3600 * 1000;
+      const left = Math.max(0, until - Date.now());
+      return Math.max(0, Math.min(100, Math.round((left / total) * 100)));
+    },
+    spark() {
+      const s = (this.s.memory && this.s.memory.samples) || [];
+      if (s.length < 2) return '0,24 120,24';
+      const max = Math.max(...s, 1), min = Math.min(...s);
+      const span = Math.max(1, max - min);
+      return s.map((v, i) => `${(i / (s.length - 1)) * 120},${22 - ((v - min) / span) * 20}`).join(' ');
+    },
+    eventClass(kind) {
+      return { ok: 'bg-emerald-500/10 text-emerald-300', limited: 'bg-rose-500/10 text-rose-300', unlocked: 'bg-sky-500/10 text-sky-300',
+               error: 'bg-rose-500/10 text-rose-300', retry: 'bg-amber-500/10 text-amber-300', strategy: 'bg-violet-500/10 text-violet-300',
+               http: 'bg-slate-500/10 text-slate-300' }[kind] || 'bg-ink-800 text-slate-400';
+    },
+    acctName(pid, aid) {
+      const p = (this.s.providers || []).find(x => x.id === pid);
+      const a = p && p.accounts.find(x => x.id === aid);
+      return a ? a.name : aid.slice(0, 8);
+    },
+    clearEvents() { this.localEvents = []; this.toast('Activity list cleared (server counters untouched)', 'info'); },
+    toast(msg, kind = 'info') { const id = ++this.toastSeq; this.toasts.push({ id, msg, kind }); this.refreshIcons(); setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 5000); },
+    async copy(text) { try { await navigator.clipboard.writeText(text); this.toast('Copied: ' + text, 'ok'); } catch { this.toast('Clipboard blocked by the browser', 'err'); } },
+
+    // ---------- API ----------
+    async api(path, opts = {}) {
+      const res = await fetch('/admin/api' + path, {
+        method: opts.method || 'GET',
+        headers: { 'x-admin-key': this.key, ...(opts.body ? { 'content-type': 'application/json' } : {}) },
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      if (res.status === 401) { this.modal = 'login'; this.loginError = 'Invalid or expired admin key.'; throw new Error('unauthorized'); }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+      return data;
+    },
+
+    async load(manual) {
+      if (!this.key) return;
+      if (manual) this.busy = true;
+      try {
+        const data = await this.api('/state');
+        this.s = data;
+        if (data.events) {
+          const seen = new Set(this.localEvents.map(e => e.t + '|' + e.kind + '|' + e.aid));
+          const fresh = data.events.filter(e => !seen.has(e.t + '|' + e.kind + '|' + e.aid)).slice(0, 8);
+          this.localEvents = [...fresh, ...this.localEvents].slice(0, 80);
+        }
+        if (this.modal === 'login') this.modal = null;
+      } catch (err) {
+        if (err.message !== 'unauthorized' && manual) this.toast(err.message, 'err');
+      } finally {
+        this.busy = false;
+        this.refreshIcons();
+      }
+    },
+
+    async login() {
+      this.loginError = '';
+      const candidate = this.keyInput.trim();
+      if (!candidate) { this.loginError = 'Enter the ADMIN_KEY from config.json.'; return; }
+      this.key = candidate;
+      try {
+        await this.api('/state');
+        localStorage.setItem('routerAdminKey', candidate);
+        this.keyInput = '';
+        this.modal = null;
+        this.toast('Authenticated as admin', 'ok');
+        await this.load();
+      } catch (err) {
+        this.key = '';
+        localStorage.removeItem('routerAdminKey');
+        this.loginError = 'Invalid or expired admin key.';
+      }
+      this.refreshIcons();
+    },
+
+    // ---------- providers ----------
+    openProvider(p) {
+      if (p) {
+        this.pf = { editing: true, id: p.id, name: p.name, type: p.type, baseUrl: p.baseUrl, strategy: p.strategy,
+                    cooldownHours: p.cooldownHours, timeoutMs: p.timeoutMs || 30000, maxAttempts: p.maxAttempts || 0,
+                    headersText: '', hasHeaders: !!p.hasCustomHeaders, error: '' };
+      } else {
+        this.pf = { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin',
+                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, error: '' };
+      }
+      this.modal = 'provider';
+      this.refreshIcons();
+    },
+    applyTypeDefaults() {
+      const t = TYPES[this.pf.type] || TYPES.custom;
+      this.pf.baseUrl = t.baseUrl || this.pf.baseUrl;
+      if (!this.pf.editing || !this.pf.name) this.pf.name = t.label;
+      if (!this.pf.editing) this.pf.id = this.pf.id || (this.pf.type + '-' + Math.random().toString(36).slice(2, 6));
+    },
+    async saveProvider() {
+      this.pf.error = '';
+      let headers;
+      if (this.pf.headersText && this.pf.headersText.trim()) {
+        try { headers = JSON.parse(this.pf.headersText); } catch { this.pf.error = 'Extra headers must be valid JSON.'; return; }
+      }
+      const body = {
+        id: (this.pf.id || '').trim(), name: this.pf.name, type: this.pf.type, baseUrl: this.pf.baseUrl,
+        strategy: this.pf.strategy, cooldownHours: this.pf.cooldownHours, timeoutMs: this.pf.timeoutMs,
+        maxAttempts: this.pf.maxAttempts, force: true,
+      };
+      // Blank field = keep whatever is already stored, never silently wipe it.
+      if (headers || !this.pf.hasHeaders) body.headers = headers;
+      if (!body.id) { this.pf.error = 'Provider ID is required.'; return; }
+      try {
+        await this.api('/providers', { method: 'POST', body });
+        this.modal = null;
+        this.toast('Provider saved: ' + body.id, 'ok');
+        await this.load();
+      } catch (err) { this.pf.error = err.message; }
+    },
+    async setStrategy(p, strategy) {
+      if (p.strategy === strategy) return;
+      try {
+        await this.api('/provider/' + encodeURIComponent(p.id) + '/strategy', { method: 'POST', body: { strategy } });
+        p.strategy = strategy;
+        this.toast(`${p.id} → ${strategy}`, 'ok');
+        this.load();
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    deleteProvider(p) {
+      this.cf = { title: 'Delete provider?', body: `"${p.name}" (${p.id}) and its ${p.accountCount} account(s) will be removed from config.json.`, run: async () => {
+        try { await this.api('/provider/' + encodeURIComponent(p.id), { method: 'DELETE' }); this.toast('Deleted ' + p.id, 'ok'); await this.load(); }
+        catch (err) { this.toast(err.message, 'err'); }
+      } };
+      this.modal = 'confirm';
+      this.refreshIcons();
+    },
+
+    // ---------- accounts ----------
+    openAccount(p, a) {
+      this.af = a
+        ? { editing: true, pid: p.id, providerName: p.name, aid: a.id, name: a.name, apiKey: '', maskedKey: a.maskedKey, enabled: a.enabled, bulk: '', error: '' }
+        : { editing: false, pid: p.id, providerName: p.name, aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' };
+      this.modal = 'account';
+      this.refreshIcons();
+    },
+    bulkCount() { return (this.af.bulk || '').split('\n').map(x => x.trim()).filter(Boolean).length; },
+    async saveAccount() {
+      this.af.error = '';
+      const pid = encodeURIComponent(this.af.pid);
+      try {
+        if (this.af.editing) {
+          const body = { name: this.af.name, enabled: this.af.enabled };
+          if (this.af.apiKey.trim()) body.apiKey = this.af.apiKey.trim();
+          await this.api(`/provider/${pid}/account/${encodeURIComponent(this.af.aid)}`, { method: 'PATCH', body });
+          this.toast('Account updated', 'ok');
+        } else {
+          const lines = (this.af.bulk || '').split('\n').map(x => x.trim()).filter(Boolean);
+          const accounts = [];
+          if (this.af.apiKey.trim()) accounts.push({ name: this.af.name.trim() || undefined, apiKey: this.af.apiKey.trim() });
+          for (const line of lines) accounts.push(line);
+          if (!accounts.length) { this.af.error = 'Provide a key or paste at least one line.'; return; }
+          const res = await this.api(`/provider/${pid}/accounts`, { method: 'POST', body: { accounts } });
+          this.toast(`Added ${res.added} account(s) to ${this.af.providerName}`, 'ok');
+        }
+        this.modal = null;
+        await this.load();
+      } catch (err) { this.af.error = err.message; }
+    },
+    async resetAccount(p, a) {
+      try {
+        await this.api(`/provider/${encodeURIComponent(p.id)}/account/${encodeURIComponent(a.id)}/reset`, { method: 'POST' });
+        a.limitedUntil = 0;
+        this.toast('Cooldown cleared for ' + a.name, 'ok');
+        this.load();
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    deleteAccount(p, a) {
+      this.cf = { title: 'Delete account?', body: `"${a.name}" will be removed from ${p.id}.`, run: async () => {
+        try { await this.api(`/provider/${encodeURIComponent(p.id)}/account/${encodeURIComponent(a.id)}`, { method: 'DELETE' }); this.toast('Account deleted', 'ok'); await this.load(); }
+        catch (err) { this.toast(err.message, 'err'); }
+      } };
+      this.modal = 'confirm';
+      this.refreshIcons();
+    },
+    async resetAll() {
+      try { const r = await this.api('/reset', { method: 'POST', body: {} }); this.toast(`Unlocked ${r.unlocked} account(s)`, 'ok'); await this.load(); }
+      catch (err) { this.toast(err.message, 'err'); }
+    },
+
+    // ---------- settings ----------
+    openSettings() {
+      this.sf = {
+        cooldownHours: this.s.cooldownHours || 12,
+        defaultProvider: this.s.defaultProvider || '',
+        proxyKeysText: '',
+        cooldownStatusesText: (this.s.cooldownStatuses || [429, 402, 403]).join(','),
+        cors: !!this.s.cors,
+        adminKey: '',
+        error: '',
+      };
+      this.modal = 'settings';
+      this.refreshIcons();
+    },
+    async saveSettings() {
+      this.sf.error = '';
+      const body = {
+        cooldownHours: this.sf.cooldownHours,
+        defaultProvider: this.sf.defaultProvider,
+        cors: this.sf.cors,
+        cooldownStatuses: this.sf.cooldownStatusesText.split(',').map(x => Number(x.trim())).filter(Number.isFinite),
+      };
+      const keys = this.sf.proxyKeysText.split('\n').map(x => x.trim()).filter(Boolean);
+      if (keys.length || this.s.hasProxyKeys) body.proxyKeys = keys;
+      if (this.sf.adminKey.trim()) body.adminKey = this.sf.adminKey.trim();
+      try {
+        const r = await this.api('/settings', { method: 'POST', body });
+        if (body.adminKey) localStorage.setItem('routerAdminKey', body.adminKey);
+        this.modal = null;
+        this.toast('Settings saved', 'ok');
+        await this.load();
+        void r;
+      } catch (err) { this.sf.error = err.message; }
+    },
+
+    // ---------- backup ----------
+    async exportBackup() {
+      try {
+        const res = await fetch('/admin/api/export', { headers: { 'x-admin-key': this.key } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `llm-router-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        this.toast('Backup downloaded (contains API keys — store it safely)', 'warn');
+      } catch (err) { this.toast('Export failed: ' + err.message, 'err'); }
+    },
+    async importBackup(ev) {
+      const file = ev.target.files && ev.target.files[0];
+      ev.target.value = '';
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const res = await this.api('/import', { method: 'POST', body: parsed });
+        this.toast(`Imported ${res.imported.accounts} account(s) across ${res.imported.providers} provider(s)`, 'ok');
+        (res.warnings || []).forEach(w => this.toast(w, 'warn'));
+        await this.load();
+      } catch (err) { this.toast('Import failed: ' + err.message, 'err'); }
+    },
+  };
+}
+</script>
+</body>
+</html>

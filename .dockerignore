@@ -1,0 +1,9 @@
+.git
+.gitignore
+config.json
+state.json
+node_modules
+npm-debug.log*
+llm-router-backup-*.json
+router-backup-*.json
+*.md

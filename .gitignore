@@ -1,0 +1,19 @@
+# secrets + runtime files — never commit real keys
+config.json
+state.json
+*.tmp
+*.log
+
+# backups produced by the dashboard
+llm-router-backup-*.json
+router-backup-*.json
+
+# node / editor noise
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.env
+.env.*

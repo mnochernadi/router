@@ -1,0 +1,79 @@
+{
+  "adminKey": "changeme",
+  "host": "0.0.0.0",
+  "port": 8787,
+  "cooldownHours": 12,
+  "cooldownStatuses": [429, 402, 403],
+  "retryStatuses": [500, 502, 503, 504],
+  "defaultProvider": "openai-main",
+  "cors": true,
+  "proxyKeys": [],
+  "providers": [
+    {
+      "id": "openai-main",
+      "name": "OpenAI",
+      "type": "openai",
+      "baseUrl": "https://api.openai.com/v1",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 30000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-openai-1", "name": "openai-key-1", "apiKey": "sk-REPLACE_ME", "enabled": true },
+        { "id": "acc-openai-2", "name": "openai-key-2", "apiKey": "sk-REPLACE_ME_TOO", "enabled": true }
+      ]
+    },
+    {
+      "id": "openrouter-main",
+      "name": "OpenRouter",
+      "type": "openrouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 60000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-or-1", "name": "openrouter-key-1", "apiKey": "sk-or-REPLACE_ME", "enabled": true }
+      ]
+    },
+    {
+      "id": "anthropic-main",
+      "name": "Anthropic",
+      "type": "anthropic",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "strategy": "sequential",
+      "cooldownHours": 12,
+      "timeoutMs": 60000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-anthropic-1", "name": "anthropic-key-1", "apiKey": "sk-ant-REPLACE_ME", "enabled": true }
+      ]
+    },
+    {
+      "id": "gemini-main",
+      "name": "Google Gemini",
+      "type": "gemini",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "strategy": "round-robin",
+      "cooldownHours": 12,
+      "timeoutMs": 60000,
+      "maxAttempts": 0,
+      "accounts": [
+        { "id": "acc-gemini-1", "name": "gemini-key-1", "apiKey": "AIzaREPLACE_ME", "enabled": true }
+      ]
+    },
+    {
+      "id": "local-ollama",
+      "name": "Local (Ollama / vLLM / LM Studio)",
+      "type": "custom",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "strategy": "sequential",
+      "cooldownHours": 1,
+      "timeoutMs": 120000,
+      "maxAttempts": 1,
+      "accounts": [
+        { "id": "acc-local-1", "name": "local-no-key", "apiKey": "not-needed", "enabled": false }
+      ]
+    }
+  ]
+}

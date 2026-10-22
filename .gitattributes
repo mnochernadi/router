@@ -1,0 +1,7 @@
+# Keep LF everywhere: CRLF in a Dockerfile breaks the build, and the JSON/JS
+# files are consumed on Linux too.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.jpg binary
+*.woff2 binary

@@ -1,0 +1,39 @@
+services:
+  router:
+    build: .
+    image: llm-api-router:latest
+    container_name: llm-api-router
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      # Change this. It is the key the dashboard asks for and the key sent as x-admin-key.
+      ADMIN_KEY: "${ADMIN_KEY:-changeme}"
+      PORT: "8787"
+      HOST: "0.0.0.0"
+      ROUTER_CONFIG: /data/config.json
+      ROUTER_STATE: /data/state.json
+      # Hard heap cap; the process is designed to stay flat regardless of stream size.
+      NODE_OPTIONS: "--max-old-space-size=96"
+    volumes:
+      - router-data:/data
+    # Container memory ceiling requested in the spec: 128 MB.
+    mem_limit: 128m
+    memswap_limit: 128m
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 32M
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  router-data:
