@@ -200,6 +200,102 @@ docker compose up -d          # http://localhost:8787/admin
 | `ROUTER_PUBLIC_URL` | Value used in the OpenRouter `HTTP-Referer` header. |
 | `NODE_OPTIONS` | e.g. `--max-old-space-size=96`. |
 
+## Deploy on your own server
+
+Two supported layouts. Both end up at the same place: the router on `127.0.0.1:8787`, TLS in front of it, and clients pointed at `https://your-domain/v1`.
+
+### A. Docker (fastest)
+
+```bash
+git clone https://github.com/mnochernadi/router.git /opt/llm-router
+cd /opt/llm-router
+printf 'ADMIN_KEY=%s\n' "$(openssl rand -hex 24)" | sudo tee /etc/llm-router.env   # keep this key
+sudo docker compose --env-file /etc/llm-router.env up -d
+curl -s localhost:8787/health
+```
+
+Config and cooldown state live in the `router-data` volume (`/data/config.json`, `/data/state.json`), so `docker compose up -d --build` after a `git pull` keeps your keys.
+
+### B. Bare metal with systemd
+
+```bash
+sudo useradd --system --home /opt/llm-router --shell /usr/sbin/nologin llmrouter
+sudo git clone https://github.com/mnochernadi/router.git /opt/llm-router
+sudo mkdir -p /var/lib/llm-router
+sudo cp /opt/llm-router/config.example.json /var/lib/llm-router/config.json
+sudo chown -R llmrouter:llmrouter /var/lib/llm-router /opt/llm-router
+
+printf 'ADMIN_KEY=%s\n' "$(openssl rand -hex 24)" | sudo tee /etc/llm-router.env
+sudo chmod 600 /etc/llm-router.env
+
+sudo cp /opt/llm-router/deploy/llm-router.service /etc/systemd/system/llm-router.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-router
+systemctl status llm-router --no-pager
+curl -s localhost:8787/health
+journalctl -u llm-router -f          # logs (routing lines only, never bodies)
+```
+
+The unit binds to `127.0.0.1`, caps memory at 128 MB and restricts writes to `/var/lib/llm-router`.
+
+### TLS in front (required if the internet can reach it)
+
+```bash
+sudo cp /opt/llm-router/deploy/nginx.conf.example /etc/nginx/sites-available/llm-router
+sudo sed -i 's/router.example.com/your-domain/' /etc/nginx/sites-available/llm-router
+sudo ln -s /etc/nginx/sites-available/llm-router /etc/nginx/sites-enabled/
+sudo certbot --nginx -d your-domain            # or use your own certs
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The one setting you cannot skip is `proxy_buffering off` — it is already in the example, and without it SSE responses arrive in bursts or appear to hang.
+
+Caddy equivalent (`flush_interval -1` keeps SSE un-buffered):
+
+```
+your-domain {
+    reverse_proxy 127.0.0.1:8787 {
+        flush_interval -1
+    }
+}
+```
+
+### Add accounts and use it
+
+1. Open `https://your-domain/admin` and unlock with `ADMIN_KEY`.
+2. *Add provider* (type + base URL) → *Account* → paste one key or bulk-paste `name:key` lines.
+3. Point any OpenAI-compatible client at `https://your-domain/v1`:
+
+```bash
+curl -N https://your-domain/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://your-domain/v1", api_key="anything")
+```
+
+```javascript
+import OpenAI from "openai";
+const client = new OpenAI({ baseURL: "https://your-domain/v1", apiKey: "anything" });
+```
+
+Any key works unless you set `proxyKeys` in the dashboard's Settings (then send that key as `Authorization: Bearer …` — recommended on a public host).
+
+### Operating it
+
+| Task | Command |
+|---|---|
+| Health check | `curl -s https://your-domain/health` |
+| Live logs | `journalctl -u llm-router -f` / `docker compose logs -f` |
+| Update | `git pull && sudo systemctl restart llm-router` / `docker compose up -d --build` |
+| Backup keys + state | Dashboard *Export backup* (contains secrets — store it encrypted) |
+| Restore | Dashboard *Import backup*, or drop `config.json` into `/var/lib/llm-router` and restart |
+
+Firewall: expose only `80`/`443`. `8787` must stay on loopback — the router has no TLS of its own, and `proxyKeys` is the only thing standing between a public port and your credits.
+
 ## Memory profile (measured, not estimated)
 
 `npm run smoke` measures the running process. On this machine (Node v26.8.1, Windows 11):

@@ -1,0 +1,36 @@
+[Unit]
+Description=LLM API Router (multi-account LLM proxy + dashboard)
+Documentation=https://github.com/mnochernadi/router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmrouter
+Group=llmrouter
+WorkingDirectory=/opt/llm-router
+
+# Bind to loopback and let nginx/caddy terminate TLS in front of it.
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=ROUTER_CONFIG=/var/lib/llm-router/config.json
+Environment=ROUTER_STATE=/var/lib/llm-router/state.json
+# ADMIN_KEY=... lives here, chmod 600, owned by root:
+EnvironmentFile=-/etc/llm-router.env
+
+ExecStart=/usr/bin/node --max-old-space-size=96 /opt/llm-router/server.js
+Restart=always
+RestartSec=3
+
+# Hardening: the service only ever writes its own state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llm-router
+MemoryMax=128M
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
