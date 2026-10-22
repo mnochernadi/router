@@ -352,6 +352,9 @@ class FreebuffDriver {
       signal: AbortSignal.timeout(20_000),
     });
     const text = await res.text();
+    // The status endpoint answers 401 while the device is still unapproved; that
+    // is a normal pending state, not an error to show the operator.
+    if (res.status === 401) return { status: 401, ok: false, token: '', pending: true };
     let json = null;
     try { json = JSON.parse(text); } catch { /* keep text */ }
     const user = (json && json.user) || {};
