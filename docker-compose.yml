@@ -5,7 +5,9 @@ services:
     container_name: llm-api-router
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      # Host port is configurable (ROUTER_PORT, set by install.sh); the process
+      # inside the container always listens on 8787.
+      - "${ROUTER_PORT:-8787}:8787"
     environment:
       # Change this. It is the key the dashboard asks for and the key sent as x-admin-key.
       ADMIN_KEY: "${ADMIN_KEY:-changeme}"

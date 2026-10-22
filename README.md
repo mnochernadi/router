@@ -202,6 +202,32 @@ docker compose up -d          # http://localhost:8787/admin
 
 ## Deploy on your own server
 
+### One command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mnochernadi/router/main/install.sh \
+  | sudo bash -s -- --domain router.example.com --email you@example.com
+```
+
+[install.sh](install.sh) does the whole job: detects the distro → installs `git`/`curl`/Node.js 20 → creates a system user → clones into `/opt/llm-router` → generates `ADMIN_KEY` into `/etc/llm-router.env` (mode 600) → creates `config.json` → installs and starts a systemd unit (or `docker compose` if Docker exists) → configures nginx + Let's Encrypt → opens the firewall → waits for `/health` → prints the dashboard URL and the admin key.
+
+Useful flags (full list: `--help`):
+
+| Flag | Effect |
+|---|---|
+| `--domain <host>` + `--email <addr>` | nginx + Let's Encrypt; router binds `127.0.0.1` behind the proxy |
+| `--docker` / `--systemd` | force a layout (default: Docker when present, else systemd) |
+| `--port <n>` | router port (default 8787) |
+| `--admin-key <key>` | use your own dashboard key instead of generating one |
+| `--no-nginx`, `--no-firewall` | skip those steps |
+| `--dry-run` | print every action, change nothing |
+| `--uninstall [--purge]` | remove the service/unit (and, with `--purge`, the files and keys) |
+| `-y` | non-interactive |
+
+Re-running the same command updates the code and restarts the service — it never rotates your key and never overwrites `config.json`.
+
+### Manual alternative
+
 Two supported layouts. Both end up at the same place: the router on `127.0.0.1:8787`, TLS in front of it, and clients pointed at `https://your-domain/v1`.
 
 ### A. Docker (fastest)
