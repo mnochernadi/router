@@ -110,7 +110,9 @@ function probeModelFor(provider) {
 function retryAfterOf(text, res) {
   const header = res.headers.get('retry-after');
   if (header && Number.isFinite(Number(header))) return Number(header);
-  const m = /"retry_after"\s*:\s*(\d+)|retry-after[:=]\s*(\d+)/i.exec(text || '');
+  // the router reports its own cooldown as retryAfterSeconds; upstream bodies
+  // (and some proxies) spell it retry_after / retry-after.
+  const m = /"retry_?after(?:_?seconds)?"\s*:\s*(\d+)|retry-after[:=]\s*(\d+)/i.exec(text || '');
   return m ? Number(m[1] || m[2]) : 0;
 }
 
