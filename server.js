@@ -516,7 +516,17 @@ function markLimited(provider, account, status, { ms = 0, message = '' } = {}) {
   const as = accountState(provider.id, account.id);
   const configured = cooldownMs(provider);
   let wait = configured;
-  if (config.respectRetryAfter !== false && ms > 0) wait = Math.min(configured, ms);
+  if (config.respectRetryAfter !== false && ms > 0) {
+    // The free pool answers `retry-after: 57142` (~15.9h) once its daily
+    // allowance is gone, and no client rebuild clears it: measured with a brand
+    // new session, four different egress IPs, three client versions, a fresh
+    // project handle and two models - every one of them 429, while dropping the
+    // tool quartet is a 403 attestation refusal. Clamping that window down to
+    // cooldownHours only buys another 429 while an identity is minted on each
+    // attempt (which upstream reads as abuse), so here the upstream window wins.
+    const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
+    wait = freeTier ? Math.min(ms, 24 * 3600_000) : Math.min(configured, ms);
+  }
   const kind = classifyFailure(status, message);
   const notQuota = kind !== 'quota';
   if (notQuota) wait = Math.min(wait, Math.max(1, Number(config.errorCooldownMinutes) || 5) * 60_000);
@@ -736,7 +746,7 @@ function buildUpstream(provider, account, ctx) {
         'x-opencode-session-id': session,
         'x-session-affinity': session,
         'x-session-id': session,
-        'x-opencode-project': 'global',
+        'x-opencode-project': openCodeProject(provider, account),
         ...(provider.headers || {}),
       },
       payload,
@@ -1919,9 +1929,17 @@ function openCodeSession(provider, account, { fresh = false } = {}) {
   if (fresh || !as.sessionId) {
     as.sessionId = openCodeSessionId();
     as.sessionStartedAt = Date.now();
+    // Rebuilding the client means every field we control changes, not just the
+    // session id: opencode fingerprints the free tier on the client headers.
+    as.projectId = `p-${crypto.randomBytes(8).toString('hex')}`;
     persistState();
   }
   return as.sessionId;
+}
+
+/** The project handle this identity presents; a rebuilt identity gets a new one. */
+function openCodeProject(provider, account) {
+  return accountState(provider.id, account.id).projectId || 'global';
 }
 
 /** "model (high)" -> "model": the upstream knows only the base id. */

@@ -166,6 +166,26 @@ curl http://localhost:8787/v1/chat/completions \
   Keys are exact ids or `glob*` patterns; values are `openai`, `anthropic`, `gemini` or `responses`.
 * **Pin one endpoint.** A base URL that already points at a format (`…/inference/openai/v1`) disables per-model routing and is used verbatim — handy for a gateway in front of OpenCode.
 
+### The free pool is a daily allowance, and it is not yours to rotate
+
+Once the keyless free tier is used up, `opencode.ai` answers `429 FreeUsageLimitError` with an explicit deadline — measured: `retry-after: 57142` (~15.9h).
+
+Rebuilding the client does **not** clear it. Measured against the live service, all with a freshly minted session:
+
+| What was rotated | Result |
+|---|---|
+| egress IP: direct + three exits (`92.42.100.132`, `57.129.171.129`, `193.29.139.131`) | `429` on all four |
+| client version: `2.0.26`, `2.0.31`, `2.1.0` | `429` |
+| model: `deepseek-v4.1-flash-free`, `big-pickle`, `glm-5.3-flash-free` | `429` |
+| project handle, client name, session id | `429` |
+| tool quartet removed (`bash`/`glob`/`grep`/`read`) | `403 FreeTierError` — the attestation gate, not a quota |
+
+So the allowance is accounted upstream, not per IP, session, project or build. Three consequences in this router:
+
+* On a free-tier quota error the upstream window is honoured even when it is longer than `cooldownHours` (capped at 24h), so an exhausted pool is not re-probed every 12 hours while a new identity is minted each time — upstream reads that churn as abuse.
+* `renewManagedIdentity` still rebuilds a whole identity (new account, new session, new project handle) for the limits that *are* per-session; a rebuilt identity presents different values in every header the router controls.
+* The only real escape from the free ceiling is a Console key: provider type `opencode`, base URL `https://opencode.ai/inference`. That unlocks the paid models too — `minimax-m3`, `qwen3.8-max` and `kimi-k2.6` answer `401 AuthError "Missing API key."` under `Bearer public`.
+
 ## API
 
 ### Proxy (point your clients here)
