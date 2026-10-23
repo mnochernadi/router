@@ -198,8 +198,8 @@
             <button class="btn" x-show="p.proxy === 'rotate'" @click="nextExit(p)" title="Switch this provider to the next exit now">
               <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Next IP</button>
             <button class="btn" @click="openModels(p)" title="List the models this provider serves"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
-            <button class="btn" x-show="p.managed" @click="renewIdentity(p)" title="Replace the identity now (new session + new exit)">
-              <i data-lucide="dna" class="h-3.5 w-3.5"></i>New identity</button>
+            <button class="btn" x-show="p.managed" @click="renewIdentity(p)" title="Reinstall the client now: new identity, session, project handle and client version, cooldown cleared">
+              <i data-lucide="dna" class="h-3.5 w-3.5"></i>Reinstall client</button>
             <button class="btn" x-show="!p.managed" @click="openAccount(p, null)" title="Add account"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Account</button>
             <button class="btn" @click="openProvider(p)" title="Edit provider"><i data-lucide="pencil" class="h-3.5 w-3.5"></i></button>
             <button class="btn btn-danger" @click="deleteProvider(p)" title="Delete provider"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -860,7 +860,7 @@
       <button class="btn btn-primary ml-auto" x-show="pd && (pd.type === 'freebuff' || pd.type === 'opencode-free')" @click="startFreebuffLogin(pd)">
         <i data-lucide="log-in" class="h-3.5 w-3.5"></i><span x-text="pd && pd.type === 'freebuff' ? 'Authorize freebuff' : 'Get a Console key'"></span></button>
       <button class="btn" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
-      <button class="btn" x-show="pd && pd.managed" @click="renewIdentity(pd)"><i data-lucide="dna" class="h-3.5 w-3.5"></i>New identity</button>
+      <button class="btn" x-show="pd && pd.managed" @click="renewIdentity(pd)" title="Reinstall the client now: new identity, session, project handle and client version, cooldown cleared"><i data-lucide="dna" class="h-3.5 w-3.5"></i>Reinstall client</button>
       <button class="btn" x-show="pd && !pd.managed" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
       <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
       <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -1484,10 +1484,16 @@ function app() {
         }
       } catch (err) { this.lf.error = err.message; if (!silent) this.lf.status = ''; }
     },
+    // Reinstall the client: a new identity that presents a different session,
+    // project handle and client version, with any cooldown cleared.
     async renewIdentity(p) {
       try {
-        const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/renew', { method: 'POST', body: {} });
-        this.toast(r.account ? `${p.id}: new identity ${r.account.name}` : 'No identity to renew', r.account ? 'ok' : 'warn');
+        const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/reinstall', { method: 'POST', body: {} });
+        if (!r.account) { this.toast('No identity to reinstall', 'warn'); }
+        else {
+          const c = r.client || {};
+          this.toast(`${p.id}: reinstalled as ${r.account.name} (${c.userAgent || 'client'}, ${c.project || 'project'})`, 'ok');
+        }
         await this.load(true);
         await this.loadProxies(true);
       } catch (err) { this.toast(err.message, 'err'); }

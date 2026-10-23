@@ -16,6 +16,7 @@
     "dev": "node --watch server.js",
     "smoke": "node test/smoke.js",
     "test": "node test/smoke.js",
+    "reinstall-client": "node scripts/reinstall-client.js",
     "health": "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>r.text()).then(t=>console.log(t)).catch(e=>{console.error(e.message);process.exit(1)})\""
   },
   "dependencies": {},

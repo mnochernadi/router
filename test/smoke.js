@@ -1108,6 +1108,21 @@ async function memOf() {
     const renewBody = await renew.json();
     check('managed: the dashboard can force a new identity', renew.status === 200 && renewBody.account && renewBody.account.keyless === true, JSON.stringify(renewBody).slice(0, 160));
 
+    // reinstalling means a different client in every field the router controls,
+    // not just a new token: project handle, client version and the session.
+    const first = await (await fetch(routerUrl('/admin/api/proxies/provider/managed-test/reinstall'), { method: 'POST', headers: ADMIN, body: '{}' })).json();
+    const second = await (await fetch(routerUrl('/admin/api/proxies/provider/managed-test/reinstall'), { method: 'POST', headers: ADMIN, body: '{}' })).json();
+    check('reinstall: returns the rebuilt client fingerprint',
+      /^p-[0-9a-f]{16}$/.test(String(first.client && first.client.project))
+      && /^opencode\/latest\//.test(String(first.client && first.client.userAgent))
+      && String(first.client && first.client.session).length > 0,
+      JSON.stringify(first).slice(0, 200));
+    check('reinstall: two rebuilds present a different project handle and client version',
+      first.client.project !== second.client.project && first.client.userAgent !== second.client.userAgent,
+      `${first.client.project}/${first.client.userAgent} vs ${second.client.project}/${second.client.userAgent}`);
+    check('reinstall: the cooldown is cleared and the rebuild is counted',
+      first.client.cooldownCleared === true && second.reinstalls > first.reinstalls, `cleared=${first.client.cooldownCleared} ${first.reinstalls}->${second.reinstalls}`);
+
     // a managed provider that lost its identity gets one on the next request
     const st = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
     const target = st.providers.find((p) => p.id === 'managed-test');

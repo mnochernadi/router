@@ -186,6 +186,36 @@ So the allowance is accounted upstream, not per IP, session, project or build. T
 * `renewManagedIdentity` still rebuilds a whole identity (new account, new session, new project handle) for the limits that *are* per-session; a rebuilt identity presents different values in every header the router controls.
 * The only real escape from the free ceiling is a Console key: provider type `opencode`, base URL `https://opencode.ai/inference`. That unlocks the paid models too — `minimax-m3`, `qwen3.8-max` and `kimi-k2.6` answer `401 AuthError "Missing API key."` under `Bearer public`.
 
+### Reinstalling the client (automatic, and on demand)
+
+The router reinstalls the client by itself. Whenever a managed provider answers a cooldown status, `reinstallManagedClient` drops that identity and mints one that differs in **every** field the router controls:
+
+| Field | Before -> after |
+|---|---|
+| account | `identity-N` -> `identity-N+1` |
+| session (`x-opencode-session` + 3 aliases) | freshly minted `ses_<12 hex><14 base62>` |
+| project (`x-opencode-project`) | `p-<16 hex>`, freshly minted |
+| client version (`user-agent`) | next entry of the validated list (`2.0.26` -> `2.0.31` -> `2.1.0`) |
+| cooldown | cleared |
+| exit IP | rotated when the provider opted into the pool (`proxy: rotate`) |
+
+It runs at most once per request and never more often than `reinstallGapMinutes` (default `10`), so upstream does not read the churn as abuse.
+
+On demand — the dashboard's **Reinstall client** button, or the bundled CLI:
+
+```bash
+# every managed provider, with a probe that reports the upstream verdict
+node scripts/reinstall-client.js --url http://127.0.0.1:8787 --key "$ADMIN_KEY"
+
+# one provider, no request spent, machine-readable
+node scripts/reinstall-client.js --provider opencode-free --no-probe --json
+
+# cron-friendly: exits 1 while upstream still refuses the rebuilt client
+ADMIN_KEY=... ROUTER_URL=http://127.0.0.1:8787 npm run reinstall-client
+```
+
+The probe is the honest part: when upstream answers `429` with a `retry-after` measured in hours, the script prints that deadline and says the ceiling did not move, instead of reporting a fake success. Same action over HTTP: `POST /admin/api/proxies/provider/<id>/reinstall` (`/renew` still works as the historical path).
+
 ## API
 
 ### Proxy (point your clients here)
@@ -534,10 +564,10 @@ The deployment budget was raised for this workload: 512 MB RAM and 1 vCPU is com
 ## Verification
 
 ```bash
-npm run smoke     # 104 checks, no network, no API keys, all in a temp dir (SMOKE_STRICT_MEM=1 for tight memory bounds)
+npm run smoke     # 107 checks, no network, no API keys, all in a temp dir (SMOKE_STRICT_MEM=1 for tight memory bounds)
 ```
 
-It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; **a policy `403` that reproduces on every exit: no rotation storm, no 12h ban, the upstream message reaches the client**; **exit telemetry that classifies a self-egress measurement as a leak and keeps it out of the pool**; **inbound auth via `x-api-key`**; **a provider with no enabled account getting its own error type**; **V2Ray exit rotation retrying an IP-bound 429 through a second CONNECT proxy without cooling the account**; **the freebuff Ed25519 handshake verified against a protocol-enforcing mock**; and the memory behaviour in the table above.
+It boots a mock upstream plus the real `server.js` and asserts, among others: 429 → failover → success in one client-visible response (`x-router-attempts: 2`); the 12-hour deadline persisted to `state.json`; `sequential` sticking to the first healthy account; `round-robin` covering all accounts evenly; `402`/`403` cooling down while `500` does not; 250-chunk SSE passthrough byte-for-byte; Anthropic and Gemini translation for both streaming and non-streaming; admin auth rejection and key masking; strategy changes written to `config.json`; **a provider edit keeping its accounts and custom headers**; OmniRoute import; **OpenCode routing for all four wire formats, keyless accounts and live model discovery**; **a policy `403` that reproduces on every exit: no rotation storm, no 12h ban, the upstream message reaches the client**; **exit telemetry that classifies a self-egress measurement as a leak and keeps it out of the pool**; **inbound auth via `x-api-key`**; **a provider with no enabled account getting its own error type**; **V2Ray exit rotation retrying an IP-bound 429 through a second CONNECT proxy without cooling the account**; **the freebuff Ed25519 handshake verified against a protocol-enforcing mock**; **a client reinstall presenting a different session, project handle and client version while clearing the cooldown**; and the memory behaviour in the table above.
 
 ## License
 

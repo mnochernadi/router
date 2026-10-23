@@ -374,7 +374,7 @@ function findProvider(id) {
 let state = {
   version: 1,
   startedAt: now(),
-  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0 },
+  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0, reinstalls: 0 },
   providers: {},
   events: [],
   mem: { rss: 0, heapUsed: 0, samples: [] },
@@ -740,7 +740,7 @@ function buildUpstream(provider, account, ctx) {
         'content-type': 'application/json',
         accept: 'text/event-stream',
         authorization: 'Bearer public',
-        'user-agent': OPENCODE_FREE_UA,
+        'user-agent': openCodeUA(provider, account),
         'x-opencode-client': 'cli',
         'x-opencode-session': session,
         'x-opencode-session-id': session,
@@ -1563,8 +1563,23 @@ function ensureManagedAccount(provider) {
   return created;
 }
 
-/** Drop an exhausted identity and mint a replacement (new session, new exit). */
-function renewManagedIdentity(provider, oldAccount, reason) {
+/**
+ * Reinstall the client: drop a spent identity and mint a replacement that
+ * presents a *completely* different client, not just a new token.
+ *
+ * What changes: account id and name, session id, `x-opencode-project` handle and
+ * the client version (`user-agent`), plus the previous cooldown and (when the
+ * provider opted into the pool) the exit IP. A quota that is accounted per
+ * session/instance is cleared by this; a quota accounted upstream against the
+ * whole free pool is not - measured against the live service, a freshly minted
+ * session with a fresh project handle, three client versions, three models and
+ * four egress IPs all answer `429 FreeUsageLimitError` with
+ * `retry-after: 57142` (~15.9h). That is why the caller also honours the
+ * upstream window instead of reinstalling in a loop.
+ */
+function reinstallManagedClient(provider, oldAccount, reason, { rotateExit = false } = {}) {
+  const prevAs = accountState(provider.id, oldAccount.id);
+  const prevUa = Number(prevAs.uaIndex || 0);
   const idx = (provider.accounts || []).findIndex((a) => a.id === oldAccount.id);
   if (idx !== -1) provider.accounts.splice(idx, 1);
   const ps = providerState(provider.id);
@@ -1572,15 +1587,32 @@ function renewManagedIdentity(provider, oldAccount, reason) {
   const fresh = newManagedAccount(provider);
   provider.accounts.push(fresh);
   state.totals.renewals = (state.totals.renewals || 0) + 1;
-  // the old session is gone with its account, so the next request signs with a new one
+  state.totals.reinstalls = (state.totals.reinstalls || 0) + 1;
+  // The old session is gone with its account, so the next request signs with a
+  // new one; every other fingerprint the router controls is rotated here too.
   const as = accountState(provider.id, fresh.id);
+  as.uaIndex = (prevUa + 1) % OPENCODE_FREE_UAS.length;
+  as.lastRenewAt = Date.now();
+  as.reinstalledAt = Date.now();
+  as.reinstallReason = String(reason || '').slice(0, 120);
+  as.limitedUntil = 0;
+  // Mint the session now instead of lazily on the next request, so the rebuilt
+  // client is complete and observable the moment this returns (and the admin
+  // API can hand back the session it will actually use).
   as.sessionId = '';
-  pushEvent({ kind: 'renew', pid: provider.id, aid: fresh.id, reason });
-  console.warn(`[proxy] ${provider.id}: identity ${oldAccount.name} exhausted (${reason}); replaced with ${fresh.name}, session and exit reset`);
+  openCodeSession(provider, fresh);
+  if (rotateExit && provider.proxy === 'rotate' && proxies && proxies.activeExits().length > 1) {
+    proxies.rotate(`reinstall after ${reason}`, provider.id);
+  }
+  pushEvent({ kind: 'reinstall', pid: provider.id, aid: fresh.id, reason });
+  console.warn(`[proxy] ${provider.id}: client reinstalled (${reason}); ${oldAccount.name} -> ${fresh.name}, new session, new project, client ${OPENCODE_FREE_UAS[as.uaIndex]}`);
   saveConfig().catch(() => {});
   persistState();
   return fresh;
 }
+
+// The historical name: the request path, the admin API and the tests use it.
+const renewManagedIdentity = reinstallManagedClient;
 
 async function handleProxy(req, res, url) {
   const t0 = now();
@@ -1726,19 +1758,15 @@ async function handleProxy(req, res, url) {
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
         if (isManagedProvider(provider) && renewals < 1) {
-          // One renewal per request, and not more often than every 10 minutes:
+          // One reinstall per request, and not more often than every 10 minutes:
           // minting an identity on every 429 looked like abuse upstream and got
-          // our TLS handshakes dropped. Between renewals the provider backs off.
+          // our TLS handshakes dropped. Between reinstalls the provider backs off.
           const rt = accountState(provider.id, account.id);
+          const gapMs = Number(config.reinstallGapMinutes) > 0 ? Number(config.reinstallGapMinutes) * 60_000 : MANAGED_RENEW_GAP_MS;
           const since = Date.now() - (rt.lastRenewAt || 0);
-          if (since > MANAGED_RENEW_GAP_MS) {
-            const fresh = renewManagedIdentity(provider, account, `HTTP ${upstream.status}`);
-            accountState(provider.id, fresh.id).lastRenewAt = Date.now();
+          if (since > gapMs) {
+            const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status}`, { rotateExit: true });
             renewals += 1;
-            // Only a provider that opted into the pool follows the exit rotation.
-            if (provider.proxy === 'rotate' && proxies && proxies.activeExits().length > 1) {
-              proxies.rotate(`renewal after ${upstream.status}`, provider.id);
-            }
             account = fresh;
             continue;
           }
@@ -1911,6 +1939,14 @@ function touchProvider(provider) {
 //   * stream is always true upstream
 // Quota is accounted per session, so a fresh session is a fresh allowance.
 const OPENCODE_FREE_UA = 'opencode/latest/2.0.26/cli';
+// Client versions that pass the free tier's attestation gate (measured: each
+// answers a quota error rather than a 403 "only from within OpenCode"). A
+// reinstalled identity steps to the next one.
+const OPENCODE_FREE_UAS = [
+  'opencode/latest/2.0.26/cli',
+  'opencode/latest/2.0.31/cli',
+  'opencode/latest/2.1.0/cli',
+];
 const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
@@ -1940,6 +1976,12 @@ function openCodeSession(provider, account, { fresh = false } = {}) {
 /** The project handle this identity presents; a rebuilt identity gets a new one. */
 function openCodeProject(provider, account) {
   return accountState(provider.id, account.id).projectId || 'global';
+}
+
+/** The client version this identity presents; a rebuilt identity steps to the next. */
+function openCodeUA(provider, account) {
+  const i = Number(accountState(provider.id, account.id).uaIndex || 0);
+  return OPENCODE_FREE_UAS[i % OPENCODE_FREE_UAS.length];
 }
 
 /** "model (high)" -> "model": the upstream knows only the base id. */
@@ -2319,14 +2361,28 @@ async function handleAdmin(req, res, url) {
       const res2 = await proxies.apply();
       return sendJson(res, 200, { ok: true, ...res2, snapshot: proxies.snapshot() });
     }
-    if (method === 'POST' && b === 'provider' && c && d === 'renew') {
+    // Reinstall the client: new identity, session, project handle and client
+    // version, with any cooldown cleared. `renew` stays as the historical path.
+    if (method === 'POST' && b === 'provider' && c && (d === 'reinstall' || d === 'renew')) {
       const provider = findProvider(c);
       if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
       if (!isManagedProvider(provider)) return sendJson(res, 409, { error: { message: `provider "${provider.id}" does not manage its identities`, type: 'not_managed' } });
       const old = (provider.accounts || [])[0];
-      const fresh = old ? renewManagedIdentity(provider, old, 'manual') : ensureManagedAccount(provider);
+      const fresh = old ? reinstallManagedClient(provider, old, 'manual') : ensureManagedAccount(provider);
       await saveConfig();
-      return sendJson(res, 200, { ok: true, account: fresh ? accountSummary(provider, fresh) : null });
+      const as = fresh ? accountState(provider.id, fresh.id) : {};
+      return sendJson(res, 200, {
+        ok: true,
+        account: fresh ? accountSummary(provider, fresh) : null,
+        client: fresh ? {
+          name: fresh.name,
+          session: maskKey(as.sessionId || ''),
+          project: as.projectId || 'global',
+          userAgent: openCodeUA(provider, fresh),
+          cooldownCleared: !(as.limitedUntil > now()),
+        } : null,
+        reinstalls: state.totals.reinstalls || 0,
+      });
     }
 
     if (method === 'POST' && b === 'provider' && c && d === 'rotate-exit') {
