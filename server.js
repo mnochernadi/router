@@ -1742,7 +1742,8 @@ async function handleProxy(req, res, url) {
     ? (provider.freeFallbackModels
       || (Array.isArray(config.freeFallbackModels) && config.freeFallbackModels.length ? config.freeFallbackModels : OPENCODE_FREE_FALLBACK_MODELS))
     : [];
-  const triedModels = new Set([String(model || '')]);
+  const requestedModel = String(model || '');
+  const triedModels = new Set([requestedModel]);
   let modelFallbacks = 0;
   // /v1/messages is anthropic-shaped: only translated when the target speaks OpenAI/Gemini.
   const wantAnthropicIn = url.pathname === '/v1/messages';
@@ -1803,6 +1804,7 @@ async function handleProxy(req, res, url) {
     let lastFailureKey = '';
     let netRetries = 0;
     let sessionRetries = 0;
+    let modelsThisIp = 0;
 
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
@@ -1878,20 +1880,44 @@ async function handleProxy(req, res, url) {
         if (freeTier && kind === 'quota') {
           // The free allowance is accounted per IP *and* per model. Measured in
           // the same minute, on the same models: an exhausted server IP answered
-          // 200 from a fresh IP while the old one had been 429 for hours. So the
-          // escalation keeps the requested model for as long as possible:
-          //   1. same model on the next exit IP (only when the operator opted the
-          //      provider into the pool - shared exit IPs can be dry too),
-          //   2. same IP with a rebuilt session,
-          //   3. the next free model that has allowance,
+          // 200 from a fresh IP while the old one had been 429 for hours. The
+          // other half of that measurement matters just as much - the shared
+          // subscription exits are themselves burned for the popular models, so
+          // leaving the host IP too early is slower than trying the model pool on
+          // the IP we already have. Escalation, bounded to about 2 models per IP:
+          //   1. another free model on this IP (usually the one that saves it),
+          //   2. the next exit IP, restarting the model walk with the model the
+          //      client actually asked for (only when the operator opted in),
+          //   3. a rebuilt session,
           //   4. the caller then tries the configured fallback provider.
           // Nothing here cools the account: the free tier carries no timer.
+          const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
+          // On the host's own IP walk the whole pool (it is the IP we know is
+          // clean); once we are on a shared exit, two models is enough before
+          // moving on.
+          const modelsPerIp = ctx.forceDirect ? freeFallbacks.length : 2;
+          if (modelsThisIp < modelsPerIp && nextModel && modelFallbacks < freeFallbacks.length) {
+            const dryModel = ctx.model;
+            triedModels.add(nextModel);
+            modelFallbacks += 1;
+            modelsThisIp += 1;
+            ctx.model = nextModel;
+            state.totals.modelFallbacks = (state.totals.modelFallbacks || 0) + 1;
+            pushEvent({ kind: 'model-fallback', pid: provider.id, aid: account.id, from: dryModel, to: nextModel });
+            console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
+            continue;
+          }
           if (rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
             if (call.exit) proxies.noteResult(call.exit.id, false);
             ctx.forceDirect = false; // leave the host IP and start using the pool
             const next = proxies.rotate(`quota on ${provider.id}`, provider.id);
             rotations += 1;
-            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; keeping ${ctx.model} but moving to exit ${next ? next.id : '?'} (${rotations}/${Math.max(1, rotateMax)})`);
+            // A fresh IP gets the requested model again, not the tail of the walk.
+            triedModels.clear();
+            triedModels.add(requestedModel);
+            ctx.model = requestedModel;
+            modelsThisIp = 0;
+            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; retrying ${requestedModel} on exit ${next ? next.id : '?'} (${rotations}/${Math.max(1, rotateMax)})`);
             continue;
           }
           if (sessionRetries < 1) {
@@ -1899,19 +1925,6 @@ async function handleProxy(req, res, url) {
             sessionRetries += 1;
             ctx.freshSession = true;
             console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying`);
-            continue;
-          }
-          // The account is fine - only this model is dry. Move to the next free
-          // model that has allowance and keep the identity (nothing is cooled).
-          const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
-          if (nextModel && modelFallbacks < freeFallbacks.length) {
-            const dryModel = ctx.model;
-            triedModels.add(nextModel);
-            modelFallbacks += 1;
-            ctx.model = nextModel;
-            state.totals.modelFallbacks = (state.totals.modelFallbacks || 0) + 1;
-            pushEvent({ kind: 'model-fallback', pid: provider.id, aid: account.id, from: dryModel, to: nextModel });
-            console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
             continue;
           }
         }
