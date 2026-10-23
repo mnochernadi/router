@@ -720,6 +720,8 @@ function buildUpstream(provider, account, ctx) {
     const session = openCodeSession(provider, account, { fresh: !!ctx.freshSession });
     if (ctx.freshSession) ctx.freshSession = false;
     const baseModel = stripThinkingSuffix(ctx.model || (ctx.body || {}).model);
+  // Answer with the id the model actually has, not the UI's "(high)" variant.
+  ctx.model = baseModel;
   const payload = ensureFingerprintTools({ ...(ctx.body || {}), model: baseModel });
     return {
       style, responseStyle: 'openai',
