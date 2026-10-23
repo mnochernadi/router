@@ -313,6 +313,10 @@ function writeConfig() {
         strategy: 'round-robin', timeoutMs: 10000, accounts: [{ id: 'ocf-1', name: 'keyless', apiKey: '', enabled: true }],
       },
       {
+        id: 'empty-managed', name: 'Empty Managed', type: 'opencode-free', baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`,
+        strategy: 'sequential', timeoutMs: 10000, accounts: [],
+      },
+      {
         id: 'proxy-test', name: 'Proxy Rotation Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
         strategy: 'round-robin', timeoutMs: 10000, proxy: 'rotate',
         accounts: [{ id: 'pt-1', name: 'ip-limited-key', apiKey: 'key-ip-limit', enabled: true }],
@@ -1103,6 +1107,14 @@ async function memOf() {
     });
     const manualBody = await manual.json();
     check('managed: adding an identity by hand is refused', manual.status === 409 && manualBody.error.type === 'accounts_managed', `${manual.status} ${JSON.stringify(manualBody).slice(0, 140)}`);
+
+    // A managed provider created a second ago has no identity yet: the first
+    // request has to mint one instead of answering router_no_account.
+    const emptyReq = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'empty-managed' } });
+    check('managed: a provider with no identity mints one on the first request',
+      emptyReq.status === 200, `${emptyReq.status} ${emptyReq.text.slice(0, 160)}`);
+    const seeded = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json()).providers.find((p) => p.id === 'empty-managed');
+    check('managed: exactly one identity was minted', !!seeded && seeded.accountCount === 1, JSON.stringify(seeded && seeded.accountCount));
 
     const before = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json());
     const beforeIds = before.providers.find((p) => p.id === 'managed-test').accounts.map((a) => a.id);

@@ -1731,6 +1731,11 @@ async function handleProxy(req, res, url) {
     });
   }
   if (!(provider.accounts || []).length) {
+    // A managed provider created a second ago has no identity yet; mint it here
+    // so "add provider, send a request" works instead of answering 503.
+    if (isManagedProvider(provider)) ensureManagedAccount(provider);
+  }
+  if (!(provider.accounts || []).length) {
     state.totals.failed += 1;
     return sendJson(res, 503, { error: { message: `Provider "${provider.id}" has no accounts configured.`, type: 'router_no_account' } });
   }
