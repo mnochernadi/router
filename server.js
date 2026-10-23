@@ -1108,6 +1108,38 @@ function fromUpstreamResponse(style, json, model) {
   return fromGeminiResponse(json, model);
 }
 
+/**
+ * Streaming guard: pass frames through untouched, except a usage-only frame
+ * (empty choices) that the client never asked for.
+ */
+function usageFrameFilter(includeUsage) {
+  let buf = '';
+  const write = (push, line) => { push(`${line}\n`); };
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      buf += chunk.toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        const trimmed = line.trim();
+        if (!includeUsage && trimmed.startsWith('data:')) {
+          const d = trimmed.slice(5).trim();
+          if (d && d !== '[DONE]') {
+            try {
+              const j = JSON.parse(d);
+              if (Array.isArray(j.choices) && j.choices.length === 0) continue;
+            } catch { /* not our business */ }
+          }
+        }
+        write((l) => this.push(l), line);
+      }
+      cb();
+    },
+    flush(cb) { if (buf) this.push(buf); cb(); },
+  });
+}
+
 function openAiChunk(model, delta, finishReason, extra) {
   const payload = {
     id: extra?.id || chunkId(),
@@ -1387,7 +1419,11 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     translator.on('error', fail);
     source.pipe(translator).pipe(res);
   } else {
-    source.pipe(res);
+    // Strict clients index choices[0] on every frame, so a usage-only frame is
+    // only forwarded when it was requested.
+    const filtered = ctx.stream ? source.pipe(usageFrameFilter(!!ctx.includeUsage)) : source;
+    filtered.on('error', fail);
+    filtered.pipe(res);
   }
 }
 
@@ -1599,6 +1635,7 @@ async function handleProxy(req, res, url) {
   }
 
   if (isManagedProvider(provider)) ensureManagedAccount(provider);
+  ctx.includeUsage = !!(body && body.stream_options && body.stream_options.include_usage);
   const tried = new Set();
   const maxAttempts = provider.maxAttempts > 0 ? provider.maxAttempts : Math.max(1, (provider.accounts || []).length);
   let sawLimit = false;
