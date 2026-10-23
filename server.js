@@ -524,17 +524,23 @@ async function peekError(upstream, maxBytes = 1024) {
 function markLimited(provider, account, status, { ms = 0, message = '' } = {}) {
   const as = accountState(provider.id, account.id);
   const configured = cooldownMs(provider);
+  const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
   let wait = configured;
-  if (config.respectRetryAfter !== false && ms > 0) {
-    // The free pool answers `retry-after: 57142` (~15.9h) once its daily
-    // allowance is gone, and no client rebuild clears it: measured with a brand
-    // new session, four different egress IPs, three client versions, a fresh
-    // project handle and two models - every one of them 429, while dropping the
-    // tool quartet is a 403 attestation refusal. Clamping that window down to
-    // cooldownHours only buys another 429 while an identity is minted on each
-    // attempt (which upstream reads as abuse), so here the upstream window wins.
-    const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
-    wait = freeTier ? Math.min(ms, 24 * 3600_000) : Math.min(configured, ms);
+  if (freeTier) {
+    // The free tier gets no timer. Its allowance is accounted per model, so the
+    // router answers from the next free model immediately (and reinstalls the
+    // client) instead of sitting out the upstream's ~16h retry-after - a window
+    // that no rebuild clears anyway. `freeTierCooldownMinutes` (default 0, i.e.
+    // retry at once) exists only to throttle upstream churn if that is ever
+    // needed; it is deliberately not derived from the upstream retry-after.
+    const minutes = config.freeTierCooldownMinutes === undefined || config.freeTierCooldownMinutes === null
+      ? 0 : Math.max(0, Number(config.freeTierCooldownMinutes) || 0);
+    wait = minutes * 60_000;
+  } else if (config.respectRetryAfter !== false && ms > 0) {
+    // Everywhere else a provider-supplied retry-after shortens the wait
+    // (freebuff answers 60s, OpenCode often minutes) instead of burning the full
+    // cooldownHours.
+    wait = Math.min(configured, ms);
   }
   const kind = classifyFailure(status, message);
   const notQuota = kind !== 'quota';
@@ -1840,9 +1846,14 @@ async function handleProxy(req, res, url) {
           // minting an identity on every 429 looked like abuse upstream and got
           // our TLS handshakes dropped. Between reinstalls the provider backs off.
           const rt = accountState(provider.id, account.id);
-          const gapMs = Number(config.reinstallGapMinutes) > 0 ? Number(config.reinstallGapMinutes) * 60_000 : MANAGED_RENEW_GAP_MS;
+          // 0 means "reinstall at once"; unset keeps the conservative spacing
+          // that stops an identity being minted on every single 429.
+          const rawGap = config.reinstallGapMinutes;
+          const gapMs = (rawGap === undefined || rawGap === null || rawGap === '')
+            ? MANAGED_RENEW_GAP_MS
+            : Math.max(0, Number(rawGap) || 0) * 60_000;
           const since = Date.now() - (rt.lastRenewAt || 0);
-          if (since > gapMs) {
+          if (since >= gapMs) {
             const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status}`, { rotateExit: true });
             renewals += 1;
             account = fresh;

@@ -1169,6 +1169,13 @@ async function memOf() {
     const afterHop = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
     check('provider fallback: the hop is counted', (afterHop.totals.providerFallbacks || 0) >= 1, `providerFallbacks=${afterHop.totals.providerFallbacks}`);
 
+    // No timer on the free tier: even the worst case must leave the account
+    // retryable immediately (the upstream's ~16h retry-after is not adopted).
+    const hopAccount = (afterHop.providers.find((p) => p.id === 'managed-test').accounts || [])[0] || {};
+    const cooldownLeftMs = Number(hopAccount.limitedUntil || 0) - Date.now();
+    check('free tier: a quota answer leaves no cooldown standing',
+      cooldownLeftMs < 5000, `limitedUntil in ${Math.round(cooldownLeftMs / 1000)}s`);
+
     // a managed provider that lost its identity gets one on the next request
     const st = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
     const target = st.providers.find((p) => p.id === 'managed-test');

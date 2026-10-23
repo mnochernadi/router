@@ -221,7 +221,7 @@ Only plain OpenAI-compatible targets are used, so the hop never changes the wire
 
 Three consequences in this router:
 
-* On a free-tier quota error the upstream window is honoured even when it is longer than `cooldownHours` (capped at 24h), so an exhausted pool is not re-probed every 12 hours while a new identity is minted each time — upstream reads that churn as abuse.
+* The free tier carries **no timer**. A quota answer does not cool the account — the upstream's ~16h `retry-after` is deliberately ignored for this provider type — so the very next request tries again at once: it reinstalls the client, walks the free-model pool, and answers. `freeTierCooldownMinutes` (default `0`, retry immediately) exists only to throttle upstream churn if that is ever needed, and `reinstallGapMinutes: 0` reinstalls on every limit instead of at most every 10 minutes. Every other provider type still honours `retry-after`.
 * `renewManagedIdentity` still rebuilds a whole identity (new account, new session, new project handle) for the limits that *are* per-session; a rebuilt identity presents different values in every header the router controls.
 * The only real escape from the free ceiling is a Console key: provider type `opencode`, base URL `https://opencode.ai/inference`. That unlocks the paid models too — `minimax-m3`, `qwen3.8-max` and `kimi-k2.6` answer `401 AuthError "Missing API key."` under `Bearer public`.
 
