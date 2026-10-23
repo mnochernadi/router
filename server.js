@@ -277,6 +277,13 @@ function normalizeProvider(p) {
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
     proxy: forceDirect ? 'direct' : String(p.proxy || 'direct'),
+    // Per-model fallback inside the free tier (see OPENCODE_FREE_FALLBACK_MODELS).
+    // Default on for opencode-free; `freeFallback: false` turns it off, and
+    // `freeFallbackModels` overrides the order.
+    freeFallback: p.freeFallback === false ? false : undefined,
+    freeFallbackModels: Array.isArray(p.freeFallbackModels) && p.freeFallbackModels.length
+      ? p.freeFallbackModels.map(String).filter(Boolean)
+      : undefined,
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     accounts,
@@ -374,7 +381,7 @@ function findProvider(id) {
 let state = {
   version: 1,
   startedAt: now(),
-  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0, reinstalls: 0 },
+  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0, reinstalls: 0, modelFallbacks: 0 },
   providers: {},
   events: [],
   mem: { rss: 0, heapUsed: 0, samples: [] },
@@ -1304,7 +1311,7 @@ function baseResponseHeaders(status, contentType, provider) {
   };
   if (config.cors) {
     headers['access-control-allow-origin'] = '*';
-    headers['access-control-expose-headers'] = 'x-router-provider,x-router-account,x-router-attempts';
+    headers['access-control-expose-headers'] = 'x-router-provider,x-router-account,x-router-attempts,x-router-model';
   }
   headers['x-router-provider'] = String(provider?.id || '');
   return headers;
@@ -1335,6 +1342,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     }
     const headers = baseResponseHeaders(status, 'application/json; charset=utf-8', provider);
     headers['x-router-account'] = String(account?.id || '');
+    headers['x-router-model'] = String(ctx.model || '');
     headers['x-router-attempts'] = String(attempts);
     headers['content-length'] = Buffer.byteLength(payload);
     res.writeHead(status, headers);
@@ -1356,6 +1364,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     const hint = upstreamHint(upstream.status, message);
     const headers = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
     headers['x-router-account'] = String(account?.id || '');
+    headers['x-router-model'] = String(ctx.model || '');
     headers['x-router-attempts'] = String(attempts);
     headers['x-router-exit'] = 'direct';
     res.writeHead(upstream.status, headers);
@@ -1368,6 +1377,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     let payload = '';
     const early = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
     early['x-router-account'] = String(account?.id || '');
+    early['x-router-model'] = String(ctx.model || '');
     early['x-router-attempts'] = String(attempts);
     early['x-router-exit'] = ctx.exitId || 'direct';
     early['x-router-rotations'] = String(ctx.rotations || 0);
@@ -1390,6 +1400,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     keepWarm.stop();
     const headers2 = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
     headers2['x-router-account'] = String(account?.id || '');
+    headers2['x-router-model'] = String(ctx.model || '');
     headers2['x-router-attempts'] = String(attempts);
     headers2['x-router-exit'] = ctx.exitId || 'direct';
     headers2['x-router-rotations'] = String(ctx.rotations || 0);
@@ -1651,6 +1662,14 @@ async function handleProxy(req, res, url) {
   }
 
   const style = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style;
+  // Per-model fallback inside the free tier: the requested model is tried first,
+  // then the next free model that still has allowance (see the constant above).
+  const freeFallbacks = style === 'opencode-free' && provider.freeFallback !== false
+    ? (provider.freeFallbackModels
+      || (Array.isArray(config.freeFallbackModels) && config.freeFallbackModels.length ? config.freeFallbackModels : OPENCODE_FREE_FALLBACK_MODELS))
+    : [];
+  const triedModels = new Set([String(model || '')]);
+  let modelFallbacks = 0;
   // /v1/messages is anthropic-shaped: only translated when the target speaks OpenAI/Gemini.
   const wantAnthropicIn = url.pathname === '/v1/messages';
   const suffix = isChat ? '/chat/completions' : url.pathname;
@@ -1779,6 +1798,21 @@ async function handleProxy(req, res, url) {
           rotations += 1;
           console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying (${rotations}/${Math.max(1, rotateMax)})`);
           continue;
+        }
+        // The account is fine - only this model is dry. Move to the next free
+        // model that has allowance and keep the identity (nothing is cooled).
+        if (freeTier && kind === 'quota') {
+          const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
+          if (nextModel && modelFallbacks < freeFallbacks.length) {
+            const dryModel = ctx.model;
+            triedModels.add(nextModel);
+            modelFallbacks += 1;
+            ctx.model = nextModel;
+            state.totals.modelFallbacks = (state.totals.modelFallbacks || 0) + 1;
+            pushEvent({ kind: 'model-fallback', pid: provider.id, aid: account.id, from: dryModel, to: nextModel });
+            console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
+            continue;
+          }
         }
         if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
@@ -1939,6 +1973,20 @@ function touchProvider(provider) {
 //   * stream is always true upstream
 // Quota is accounted per session, so a fresh session is a fresh allowance.
 const OPENCODE_FREE_UA = 'opencode/latest/2.0.26/cli';
+// A dry model is not a dry provider: the free allowance is accounted per model.
+// Measured on the same exhausted identity within one minute - deepseek-v4.1-flash-free,
+// glm-5.3-flash-free, big-pickle, mimo-v2.6-flash-free and nemotron-3.5-super-vl-free
+// answered 429 (retry-after ~16h) while beam-free and nemotron-3.5-lightning-free
+// answered 200. So when the requested free model is out of allowance the router
+// answers with the next free model that still has some, instead of cooling the
+// account and failing the client.
+const OPENCODE_FREE_FALLBACK_MODELS = [
+  'nemotron-3.5-lightning-free',
+  'beam-free',
+  'flint-40b-free',
+  'mimo-v2.6-flash-free',
+  'nemotron-3.5-super-vl-free',
+];
 // Client versions that pass the free tier's attestation gate (measured: each
 // answers a quota error rather than a 403 "only from within OpenCode"). A
 // reinstalled identity steps to the next one.

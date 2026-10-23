@@ -150,6 +150,13 @@ const mock = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeTierError', message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai", problems } }));
     }
     fb.freeTierAccepted += 1;
+    // Per-model allowance, like the live service: an id listed here is dry while
+    // every other model on the same identity keeps answering.
+    if (Array.isArray(fb.modelQuotaExhausted) && fb.modelQuotaExhausted.includes(String(json.model))) {
+      fb.modelQuota429 += 1;
+      res.writeHead(429, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached. Subscribe to OpenCode Go to keep going.' } }));
+    }
     if (fb.burn429 > 0) {
       fb.burn429 -= 1;
       res.writeHead(429, { 'content-type': 'application/json' });
@@ -348,6 +355,8 @@ const fb = {
   modelKey: 'm-test1',
   freeTierAccepted: 0,
   freeTierRejects: 0,
+  modelQuotaExhausted: [],
+  modelQuota429: 0,
   burn429: 0,
 };
 
@@ -1122,6 +1131,25 @@ async function memOf() {
       `${first.client.project}/${first.client.userAgent} vs ${second.client.project}/${second.client.userAgent}`);
     check('reinstall: the cooldown is cleared and the rebuild is counted',
       first.client.cooldownCleared === true && second.reinstalls > first.reinstalls, `cleared=${first.client.cooldownCleared} ${first.reinstalls}->${second.reinstalls}`);
+
+    // The free allowance is accounted per model, so a dry model must not cost
+    // the client an error: the router answers with the next free model that has
+    // allowance and keeps the identity (nothing is cooled down).
+    fb.modelQuotaExhausted = ['big-pickle'];
+    const dry = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'managed-test' } });
+    fb.modelQuotaExhausted = [];
+    let dryBody = {};
+    try { dryBody = JSON.parse(dry.text); } catch { /* reported below */ }
+    check('free fallback: a dry model is answered by another free model',
+      dry.status === 200
+      && dry.headers.get('x-router-model') === 'nemotron-3.5-lightning-free'
+      && String(dryBody?.choices?.[0]?.message?.content || '').length > 0,
+      `${dry.status} x-router-model=${dry.headers.get('x-router-model')} body=${dry.text.slice(0, 120)}`);
+    const afterFallback = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const mpFallback = afterFallback.providers.find((p) => p.id === 'managed-test');
+    check('free fallback: a dry model does not cool the account down',
+      mpFallback.limitedCount === 0 && (afterFallback.totals.modelFallbacks || 0) >= 1,
+      `limited=${mpFallback.limitedCount} fallbacks=${afterFallback.totals.modelFallbacks}`);
 
     // a managed provider that lost its identity gets one on the next request
     const st = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
