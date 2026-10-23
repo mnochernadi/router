@@ -886,7 +886,12 @@ async function callUpstream(provider, account, ctx) {
   }
 
   const freeTierStyle = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
-  const picked = proxies && !freeTierStyle ? proxies.pick(provider) : null;
+  // The host's own IP can be a clean one (measured: a fresh server IP answered
+  // models that were 429 from an older IP for hours), so a free-tier request
+  // starts direct and only moves into the exit pool after a quota answer - that
+  // is what ctx.forceDirect tracks and what the quota branch clears. Every other
+  // provider picks from the pool exactly as configured.
+  const picked = proxies && !ctx.forceDirect ? proxies.pick(provider) : null;
   let upstream;
   try {
     if (picked) {
@@ -1752,6 +1757,8 @@ async function handleProxy(req, res, url) {
     anthropicInbound: wantAnthropicIn,
     translate: isChat && style !== 'openai' && style !== 'opencode-free' && style !== 'freebuff',
   };
+  // Free tier: first attempt from the host's own IP, then the pool (see above).
+  if (style === 'opencode-free') ctx.forceDirect = true;
   if (style === 'freebuff') ctx.responseStyle = 'openai';
   if (style === 'anthropic' && wantAnthropicIn) {
     ctx.suffix = '/messages';
@@ -1859,7 +1866,9 @@ async function handleProxy(req, res, url) {
             : Math.max(0, Number(rawGap) || 0) * 60_000;
           const since = Date.now() - (rt.lastRenewAt || 0);
           if (since >= gapMs) {
-            const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status}`, { rotateExit: true });
+            // Reinstall the identity only; moving the exit IP is the quota
+            // branch's job below, so the two mechanisms do not fight.
+            const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status}`);
             renewals += 1;
             account = fresh;
             continue;
@@ -1879,6 +1888,7 @@ async function handleProxy(req, res, url) {
           // Nothing here cools the account: the free tier carries no timer.
           if (rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
             if (call.exit) proxies.noteResult(call.exit.id, false);
+            ctx.forceDirect = false; // leave the host IP and start using the pool
             const next = proxies.rotate(`quota on ${provider.id}`, provider.id);
             rotations += 1;
             console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; keeping ${ctx.model} but moving to exit ${next ? next.id : '?'} (${rotations}/${Math.max(1, rotateMax)})`);
