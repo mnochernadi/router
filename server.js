@@ -2105,6 +2105,17 @@ async function handleAdmin(req, res, url) {
     const accounts = provider.accounts || [];
     const account = accounts.find((x) => x.enabled !== false && !isLimited(accountState(provider.id, x.id))) || accounts[0] || { apiKey: '' };
     if (provider.type === 'freebuff') {
+      const token = usableKey(account.apiKey);
+      const st = freebuff.accountState(provider.id, account.id);
+      if (!token || st.needsReauth) {
+        return sendJson(res, 200, {
+          ok: true, status: 200, source: 'freebuff (no session yet)', provider: provider.id,
+          count: 0, models: [],
+          raw: st.needsReauth
+            ? 'The stored freebuff token was rejected. Press "Authorize freebuff" to sign in again � nothing to paste.'
+            : 'Not authorized yet. Press "Authorize freebuff" on this provider: a freebuff tab opens, you approve it, and the account is created here automatically.',
+        });
+      }
       try {
         const models = await freebuff.listModels({ provider, account });
         return sendJson(res, 200, { ok: true, status: 200, source: 'freebuff catalog (signed)', provider: provider.id, count: models.length, models });

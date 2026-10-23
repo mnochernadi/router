@@ -690,7 +690,7 @@
         </div>
       </template>
       <template x-if="!mf.loading && !filteredModels().length">
-        <div class="px-2 py-6 text-center text-xs text-slate-500">nothing to show</div>
+        <div class="px-2 py-6 text-center text-xs text-slate-500" x-text="mf.error || 'nothing to show'"></div>
       </template>
     </div>
 
