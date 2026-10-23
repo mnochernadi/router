@@ -1356,6 +1356,12 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   // ---- upstream streams, client asked for one JSON object ------------------
   if (ctx.aggregate && upstream.body && upstream.status < 300) {
     let payload = '';
+    const early = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
+    early['x-router-account'] = String(account?.id || '');
+    early['x-router-attempts'] = String(attempts);
+    early['x-router-exit'] = ctx.exitId || 'direct';
+    early['x-router-rotations'] = String(ctx.rotations || 0);
+    const keepWarm = armSlowResponse(res, upstream.status, early);
     try {
       const agg = sseAggregator(ctx.model);
       const done = new Promise((resolve, reject) => {
@@ -1366,16 +1372,21 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
       Readable.fromWeb(upstream.body).pipe(agg);
       await done;
     } catch (err) {
+      keepWarm.stop();
       if (!res.headersSent) sendJson(res, 502, { error: { message: `aggregating the upstream stream failed: ${err.message}`, type: 'router_relay_error' } });
+      else if (!res.writableEnded) res.end(JSON.stringify({ error: { message: `aggregating the upstream stream failed: ${err.message}`, type: 'router_relay_error' } }));
       return;
     }
+    keepWarm.stop();
     const headers2 = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
     headers2['x-router-account'] = String(account?.id || '');
     headers2['x-router-attempts'] = String(attempts);
     headers2['x-router-exit'] = ctx.exitId || 'direct';
     headers2['x-router-rotations'] = String(ctx.rotations || 0);
-    headers2['content-length'] = Buffer.byteLength(payload);
-    res.writeHead(upstream.status, headers2);
+    if (!keepWarm.opened()) {
+      headers2['content-length'] = Buffer.byteLength(payload);
+      res.writeHead(upstream.status, headers2);
+    }
     res.end(payload);
     return;
   }
@@ -1938,6 +1949,28 @@ function ensureFingerprintTools(body) {
 }
 
 /** Aggregate an upstream SSE stream into one chat.completion (for non-stream clients). */
+/**
+ * If a buffered response is going to be slow, open it early and send a
+ * newline every few seconds: JSON allows leading whitespace, and an idle
+ * socket is what gets reset by proxies on the client's side of the world.
+ */
+function armSlowResponse(res, status, headers, delayMs = 7000, everyMs = 4000) {
+  const state = { opened: false, timer: null };
+  const arm = setTimeout(() => {
+    if (res.writableEnded || res.headersSent) return;
+    res.writeHead(status, headers);
+    state.opened = true;
+    res.write(' \n');
+    state.timer = setInterval(() => { if (!res.writableEnded) { try { res.write(' \n'); } catch { /* closed */ } } }, everyMs);
+    if (state.timer.unref) state.timer.unref();
+  }, delayMs);
+  if (arm.unref) arm.unref();
+  return {
+    opened: () => state.opened,
+    stop() { clearTimeout(arm); if (state.timer) clearInterval(state.timer); },
+  };
+}
+
 function sseAggregator(model) {
   let buf = '';
   let content = '';
