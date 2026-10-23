@@ -759,17 +759,19 @@ class ProxyManager {
   /**
    * Epoch ms of the next scheduled cycle (0 = disabled). The clock is anchored
    * to the newest thing that actually happened — the last cycle, the last
-   * subscription fetch, or the last pool write — so a deploy or a manual
-   * refresh an hour ago does not buy the box another full interval.
+   * subscription fetch, or the last exit test — so a deploy or a manual
+   * refresh an hour ago does not buy the box another full interval. The
+   * generic `updatedAt` is deliberately not used: the process saves state on
+   * boot, and every save would push the next run out.
    */
   nextAutoRunAt() {
     const s = this.state.settings;
     if (!s.autoRefresh) return 0;
     const hours = Number(s.refreshIntervalHours);
     if (!(hours > 0)) return 0;
-    const auto = this.state.auto || {};
-    let last = Math.max(Number(auto.lastRun) || 0, Number(this.state.updatedAt) || 0);
+    let last = Number((this.state.auto || {}).lastRun) || 0;
     for (const src of this.state.sources) last = Math.max(last, Number(src.lastFetched) || 0);
+    for (const exit of this.state.exits) last = Math.max(last, Number(exit.lastTested) || 0);
     return (last || Date.now()) + hours * 3600_000;
   }
 

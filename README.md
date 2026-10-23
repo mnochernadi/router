@@ -546,7 +546,7 @@ The pool refreshes itself, so a subscription that publishes new configs does not
 2. the **new** exits (status `untested`) are batched through the throwaway xray and measured like a manual test — latency and real exit IP, leaks excluded,
 3. the working ones are folded into the pool and `apply()` puts the best `maxActive` live.
 
-The clock is anchored to the last cycle, the last subscription fetch, or the last pool write — a restart or a manual refresh an hour ago does not buy another full interval. A cycle is skipped (and logged) while a manual test is running. Every cycle appends an `auto-refresh` event and stores `lastRefresh`/`lastTest`/`lastApplied` in `proxies.json`, and `GET /admin/api/proxies` reports `auto.nextRun`.
+The clock is anchored to the last cycle, the last subscription fetch, or the last exit test — a restart or a manual refresh an hour ago does not buy another full interval. A cycle is skipped (and logged) while a manual test is running. Every cycle appends an `auto-refresh` event and stores `lastRefresh`/`lastTest`/`lastApplied` in `proxies.json`, and `GET /admin/api/proxies` reports `auto.nextRun`.
 
 ```bash
 curl -X POST localhost:8787/admin/api/proxies/settings -H "$K" \

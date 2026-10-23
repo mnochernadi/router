@@ -1211,14 +1211,20 @@ async function memOf() {
     pm.state.settings.refreshIntervalHours = 12;
     // The clock is anchored to real events: the last fetch beats an older
     // lastRun, so a deploy does not reset the interval, and a stale fetch makes
-    // the cycle due right away.
+    // the cycle due right away. A bare save (updatedAt) must not move it.
     pm.state.auto = { lastRun: 0 };
-    pm.state.updatedAt = 0;
+    pm.state.exits = [];
+    pm.state.updatedAt = Date.now();
     pm.state.sources = [{ id: 's1', url: 'https://example.invalid/sub', enabled: true, lastFetched: Date.now() - 10 * 3600_000, count: 0, error: '' }];
-    check('scheduler: anchors to the newest subscription fetch', pm.isAutoRunDue() === false
+    check('scheduler: anchors to the newest subscription fetch, not the last save', pm.isAutoRunDue() === false
       && Math.abs(pm.nextAutoRunAt() - (Date.now() + 2 * 3600_000)) < 5000, `next=${pm.nextAutoRunAt()}`);
     pm.state.sources[0].lastFetched = Date.now() - 13 * 3600_000;
     check('scheduler: a stale fetch makes it due', pm.isAutoRunDue() === true);
+    // A test that ran later than the fetch anchors it as well.
+    pm.state.exits = [{ id: 'x', status: 'ok', lastTested: Date.now() - 3600_000 }];
+    check('scheduler: the newest exit test wins over an older fetch', pm.isAutoRunDue() === false);
+    pm.state.exits = [{ id: 'x', status: 'ok', lastTested: Date.now() - 14 * 3600_000 }];
+    check('scheduler: a stale test is due too', pm.isAutoRunDue() === true);
     check('scheduler: a disabled source still anchors the clock', pm.nextAutoRunAt() > 0);
     // The guards run before any fetch, so this stays offline.
     pm.test.running = true;
