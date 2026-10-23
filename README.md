@@ -538,6 +538,25 @@ Notes that save time:
 * The `xray` binary: `install.sh --with-xray` installs it, the Docker image already contains it, or install it from your package manager. No binary = no pool, and the router reports that instead of failing requests.
 * `testUrl` defaults to `https://api.ipify.org?format=json` because it returns the exit IP; any JSON endpoint with an `ip` field works.
 
+### Scheduled upkeep (on by default, every 12 h)
+
+The pool refreshes itself, so a subscription that publishes new configs does not need a human:
+
+1. every `refreshIntervalHours` (default `12`) the router re-downloads each enabled source,
+2. the **new** exits (status `untested`) are batched through the throwaway xray and measured like a manual test — latency and real exit IP, leaks excluded,
+3. the working ones are folded into the pool and `apply()` puts the best `maxActive` live.
+
+The clock is anchored to the last cycle, the last subscription fetch, or the last pool write — a restart or a manual refresh an hour ago does not buy another full interval. A cycle is skipped (and logged) while a manual test is running. Every cycle appends an `auto-refresh` event and stores `lastRefresh`/`lastTest`/`lastApplied` in `proxies.json`, and `GET /admin/api/proxies` reports `auto.nextRun`.
+
+```bash
+curl -X POST localhost:8787/admin/api/proxies/settings -H "$K" \
+  -d '{"autoRefresh":false}'                    # off
+curl -X POST localhost:8787/admin/api/proxies/settings -H "$K" \
+  -d '{"autoRefresh":true,"refreshIntervalHours":6}'   # faster
+```
+
+`refreshIntervalHours: 0` also disables it. The **Network** tab carries both fields and the next-run countdown.
+
 ## freebuff (Codebuff) as a provider
 
 freebuff is OpenAI-shaped (`POST /api/v1/chat/completions`) but will not answer a plain API-key call. `freebuff-driver.js` performs the whole handshake, so from the router's point of view it is just another provider:

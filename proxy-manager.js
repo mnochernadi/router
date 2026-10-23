@@ -51,6 +51,10 @@ const DEFAULT_SETTINGS = {
   rotateAttempts: 3,
   markDeadAfter: 3,
   insecure: false,
+  // Keep the pool fresh on its own: re-fetch the subscriptions, test whatever is
+  // new, and fold the working ones into the pool. 0 disables the timer.
+  autoRefresh: true,
+  refreshIntervalHours: 12,
 };
 
 const EVENT_LIMIT = 40;
@@ -312,6 +316,8 @@ class ProxyManager {
       sources: DEFAULT_SOURCES.map((s, i) => ({ id: `s${i + 1}`, url: s.url, enabled: s.enabled, lastFetched: 0, count: 0, error: '' })),
       exits: [],
       active: [],
+      // Scheduled-upkeep bookkeeping (last run, what it found) survives restarts.
+      auto: { lastRun: 0 },
       updatedAt: 0,
     };
     this.xray = { running: false, pid: 0, startedAt: 0, error: '', version: '', ports: [] };
@@ -336,6 +342,7 @@ class ProxyManager {
       if (Array.isArray(raw.sources) && raw.sources.length) this.state.sources = raw.sources;
       if (Array.isArray(raw.exits)) this.state.exits = raw.exits;
       if (Array.isArray(raw.active)) this.state.active = raw.active;
+      if (raw.auto && typeof raw.auto === 'object') this.state.auto = raw.auto;
       this.state.updatedAt = raw.updatedAt || 0;
     } catch { /* first boot */ }
     // Anything measured by an older schema is untested, not 'ok'.
@@ -385,6 +392,8 @@ class ProxyManager {
     if (patch.testUrl) s.testUrl = String(patch.testUrl);
     if (Array.isArray(patch.rotateOnStatuses) && patch.rotateOnStatuses.length) s.rotateOnStatuses = patch.rotateOnStatuses.map(Number);
     if (patch.insecure != null) s.insecure = !!patch.insecure;
+    if (patch.autoRefresh != null) s.autoRefresh = !!patch.autoRefresh;
+    if (patch.refreshIntervalHours != null) s.refreshIntervalHours = Math.max(0, Number(patch.refreshIntervalHours) || 0);
     this.save();
     return s;
   }
@@ -745,6 +754,118 @@ class ProxyManager {
     return this.startMain();
   }
 
+  // ---- scheduled upkeep: fetch -> test what is new -> fold into the pool -----
+
+  /**
+   * Epoch ms of the next scheduled cycle (0 = disabled). The clock is anchored
+   * to the newest thing that actually happened — the last cycle, the last
+   * subscription fetch, or the last pool write — so a deploy or a manual
+   * refresh an hour ago does not buy the box another full interval.
+   */
+  nextAutoRunAt() {
+    const s = this.state.settings;
+    if (!s.autoRefresh) return 0;
+    const hours = Number(s.refreshIntervalHours);
+    if (!(hours > 0)) return 0;
+    const auto = this.state.auto || {};
+    let last = Math.max(Number(auto.lastRun) || 0, Number(this.state.updatedAt) || 0);
+    for (const src of this.state.sources) last = Math.max(last, Number(src.lastFetched) || 0);
+    return (last || Date.now()) + hours * 3600_000;
+  }
+
+  /** Sources that a cycle would actually fetch from. */
+  enabledSources() {
+    return this.state.sources.filter((s) => s.enabled);
+  }
+
+  isAutoRunDue(nowMs = Date.now()) {
+    const next = this.nextAutoRunAt();
+    return !!next && nowMs >= next;
+  }
+
+  /**
+   * One scheduled cycle: re-fetch every enabled subscription, test only the
+   * exits that have never been tested (so the pool keeps growing as the
+   * subscription publishes new configs), then fold the working ones into the
+   * active pool. Refuses to run while a manual test is in flight.
+   */
+  async runAutoRefresh(reason = 'scheduled') {
+    if (this.test.running) return { skipped: 'a test run is already in progress' };
+    const sources = this.enabledSources();
+    if (!sources.length) {
+      this.state.auto = { ...(this.state.auto || {}), lastRun: Date.now(), lastReason: reason, lastSkipped: 'no enabled subscription source' };
+      this.save();
+      return { skipped: 'no enabled subscription source' };
+    }
+    const started = Date.now();
+    const untestedBefore = this.state.exits.filter((e) => e.status === 'untested').length;
+    this.log(`[pool] auto refresh (${reason}): fetching ${sources.length} source(s)`);
+    const refresh = await this.refresh({});
+    const untested = this.state.exits.filter((e) => e.status === 'untested').length;
+    let applied = null;
+    if (untested > 0) {
+      this.log(`[pool] auto refresh: testing ${untested} new exit(s)`);
+      const startedTest = await this.testAll({ retest: false });
+      if (startedTest && startedTest.started) {
+        // testAll schedules the loop and returns; wait for it so the pool is
+        // applied only once the results are in. The loop applies by itself.
+        const deadline = Date.now() + 2 * 3600_000;
+        while (this.test.running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 2000));
+        applied = { running: !!this.xray.running, exits: this.state.active.length, reason: 'test-loop' };
+      } else {
+        if (startedTest && startedTest.error) this.log(`[pool] auto refresh: test refused (${startedTest.error})`);
+        applied = await this.apply();
+      }
+    } else {
+      this.log('[pool] auto refresh: no untested exits, nothing to test');
+      applied = await this.apply();
+    }
+    this.state.auto = {
+      lastRun: Date.now(),
+      lastDurationMs: Date.now() - started,
+      lastReason: reason,
+      lastRefresh: { parsed: refresh.parsed, added: refresh.added, updated: refresh.updated, errors: (refresh.errors || []).length },
+      lastTest: { total: this.test.total, ok: this.test.ok, dead: this.test.dead, error: this.test.error || '', newCandidates: untestedBefore },
+      lastApplied: { running: !!applied.running, exits: (applied.exits != null ? applied.exits : this.state.active.length), reason: applied.reason || '' },
+    };
+    this.save();
+    this.pushEvent({ kind: 'auto-refresh', parsed: refresh.parsed, added: refresh.added, ok: this.test.ok, dead: this.test.dead });
+    this.log(`[pool] auto refresh done in ${Math.round((Date.now() - started) / 1000)}s: +${refresh.added} new, ${this.test.ok} working, ${this.state.active.length} active, next in ${this.state.settings.refreshIntervalHours}h`);
+    return { ok: true, ...this.state.auto };
+  }
+
+  async maybeAutoRefresh() {
+    if (!this.isAutoRunDue()) return false;
+    await this.runAutoRefresh('scheduled');
+    return true;
+  }
+
+  /** Cheap check every 5 minutes; real work only when a cycle is due. */
+  startScheduler({ checkMs = 5 * 60_000 } = {}) {
+    if (this._sched) return;
+    if (!this.state.auto) this.state.auto = { lastRun: 0 };
+    this._sched = setInterval(() => {
+      this.maybeAutoRefresh().catch((err) => this.log(`[pool] auto refresh failed: ${err.message}`));
+    }, checkMs);
+    if (this._sched.unref) this._sched.unref();
+    const s = this.state.settings;
+    if (!(s.autoRefresh && Number(s.refreshIntervalHours) > 0)) {
+      this.log('[pool] auto refresh disabled');
+      return;
+    }
+    if (!this.enabledSources().length) {
+      this.log('[pool] auto refresh armed, but no subscription source is enabled');
+      return;
+    }
+    const next = this.nextAutoRunAt();
+    const mins = Math.max(0, Math.round((next - Date.now()) / 60_000));
+    this.log(`[pool] auto refresh every ${s.refreshIntervalHours}h - next in ${mins}m (${new Date(next).toISOString()})`);
+  }
+
+  stopScheduler() {
+    if (this._sched) { clearInterval(this._sched); this._sched = null; }
+  }
+
   /** Choose the local proxy for a provider, honouring direct / rotate / pinned. */
   pick(provider) {
     const mode = (provider && provider.proxy) || 'direct';
@@ -815,6 +936,13 @@ class ProxyManager {
       cursors: Object.fromEntries(this.cursors),
       xray: { running: this.xray.running, pid: this.xray.pid, version: this.xray.version, error: this.xray.error, ports: this.xray.ports.length },
       test: this.testStatus(),
+      auto: {
+        enabled: !!this.state.settings.autoRefresh && Number(this.state.settings.refreshIntervalHours) > 0,
+        intervalHours: Number(this.state.settings.refreshIntervalHours) || 0,
+        lastRun: (this.state.auto && this.state.auto.lastRun) || 0,
+        nextRun: this.nextAutoRunAt(),
+        summary: (this.state.auto && this.state.auto.lastRefresh) || null,
+      },
       events: this.events.slice(0, 20),
       updatedAt: this.state.updatedAt,
       exits: this.state.exits.slice(0, 400).map((e) => ({

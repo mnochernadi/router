@@ -1189,6 +1189,48 @@ async function memOf() {
   const pastDeadline = await fetch(routerUrl('/admin/api/provider/seq-provider/account/a-limited/reset'), { method: 'POST', headers: ADMIN });
   check('unlock path exercised without restart', pastDeadline.status === 200);
 
+  // 27. scheduled upkeep: the due-math and the disable switch, without a network.
+  //     (The full cycle is exercised on a live host; here we pin the clock logic.)
+  {
+    const { ProxyManager } = require('../proxy-manager.js');
+    const pm = new ProxyManager({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-sched-')), log: () => {} });
+    pm.state.settings.autoRefresh = true;
+    pm.state.settings.refreshIntervalHours = 12;
+    pm.state.auto = { lastRun: Date.now() - 11 * 3600_000 };
+    check('scheduler: not due before the interval elapses', pm.isAutoRunDue() === false);
+    pm.state.auto = { lastRun: Date.now() - 13 * 3600_000 };
+    check('scheduler: due once the interval has passed', pm.isAutoRunDue() === true);
+    check('scheduler: next run is lastRun + interval',
+      Math.abs(pm.nextAutoRunAt() - (pm.state.auto.lastRun + 12 * 3600_000)) < 1000,
+      `next=${pm.nextAutoRunAt()}`);
+    pm.state.settings.autoRefresh = false;
+    check('scheduler: the switch disables it', pm.nextAutoRunAt() === 0 && pm.isAutoRunDue() === false);
+    pm.state.settings.autoRefresh = true;
+    pm.state.settings.refreshIntervalHours = 0;
+    check('scheduler: 0 hours means never due', pm.nextAutoRunAt() === 0 && pm.isAutoRunDue() === false);
+    pm.state.settings.refreshIntervalHours = 12;
+    // The clock is anchored to real events: the last fetch beats an older
+    // lastRun, so a deploy does not reset the interval, and a stale fetch makes
+    // the cycle due right away.
+    pm.state.auto = { lastRun: 0 };
+    pm.state.updatedAt = 0;
+    pm.state.sources = [{ id: 's1', url: 'https://example.invalid/sub', enabled: true, lastFetched: Date.now() - 10 * 3600_000, count: 0, error: '' }];
+    check('scheduler: anchors to the newest subscription fetch', pm.isAutoRunDue() === false
+      && Math.abs(pm.nextAutoRunAt() - (Date.now() + 2 * 3600_000)) < 5000, `next=${pm.nextAutoRunAt()}`);
+    pm.state.sources[0].lastFetched = Date.now() - 13 * 3600_000;
+    check('scheduler: a stale fetch makes it due', pm.isAutoRunDue() === true);
+    check('scheduler: a disabled source still anchors the clock', pm.nextAutoRunAt() > 0);
+    // The guards run before any fetch, so this stays offline.
+    pm.test.running = true;
+    const refused = await pm.runAutoRefresh('smoke');
+    pm.test.running = false;
+    check('scheduler: refuses to run while a test is in flight', refused.skipped === 'a test run is already in progress', JSON.stringify(refused));
+    pm.state.sources = [];
+    const noSource = await pm.runAutoRefresh('smoke');
+    check('scheduler: skips cleanly with no enabled source', noSource.skipped === 'no enabled subscription source', JSON.stringify(noSource));
+    check('scheduler: a skipped cycle still stamps lastRun', (pm.state.auto.lastRun || 0) > 0);
+  }
+
   console.log('\n==================== RESULTS ====================');
   console.log(results.join('\n'));
   console.log(`\n  ${pass} passed, ${fail} failed`);

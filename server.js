@@ -3051,6 +3051,9 @@ function boot() {
   } else if (proxies.state.settings.enabled) {
     console.warn('[proxy] no working exits yet - open the dashboard Network tab and run a proxy test');
   }
+  // Scheduled upkeep: re-fetch the subscriptions, test what is new, fold the
+  // working exits into the pool. Default every 12h; see the Network tab.
+  proxies.startScheduler();
 }
 
 async function shutdown(signal) {

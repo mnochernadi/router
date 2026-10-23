@@ -393,6 +393,20 @@
             <label class="fld">Parallel tests</label>
             <input class="input mono" type="number" min="1" max="64" x-model.number="nps.testConcurrency" @change="saveProxySettings()" />
           </div>
+          <div>
+            <label class="fld">Auto-refresh every (hours, 0 = off)</label>
+            <input class="input mono" type="number" min="0" max="168" x-model.number="nps.refreshIntervalHours" @change="saveProxySettings()" />
+          </div>
+          <label class="col-span-2 flex items-start gap-2 rounded-lg border border-ink-700 bg-ink-900/40 px-2.5 py-2 text-[11px] text-slate-400">
+            <input type="checkbox" x-model="nps.autoRefresh" class="mt-0.5 h-3.5 w-3.5 rounded border-ink-600 bg-ink-900" @change="saveProxySettings()" />
+            <span>
+              Re-download the subscriptions, test only the configs that are new, and fold the working ones into the pool.
+              <span class="block text-slate-500" x-show="nps.autoRefresh && nps.refreshIntervalHours > 0"
+                x-text="np && np.auto && np.auto.nextRun ? 'Next run ' + fmtWhen(np.auto.nextRun) + (np.auto.lastRun ? ' · last ' + fmtWhen(np.auto.lastRun) : '') : 'Waiting for the first cycle'"></span>
+              <span class="block text-slate-500" x-show="np && np.auto && np.auto.summary && np.auto.summary.added != null"
+                x-text="'Last cycle: +' + (np.auto.summary.added || 0) + ' new, ' + (np.auto.summary.errors || 0) + ' source error(s)'"></span>
+            </span>
+          </label>
           <div class="col-span-2">
             <label class="fld">xray binary path</label>
             <div class="flex gap-2">
@@ -1083,7 +1097,7 @@ function app() {
     s: { providers: [], totals: {}, memory: { samples: [] }, events: [], proxies: {} },
     tab: 'providers',
     np: null,
-    nps: { maxActive: 24, rotateAttempts: 3, testUrl: '', testBatchSize: 40, testConcurrency: 8, xrayPath: 'xray' },
+    nps: { maxActive: 24, rotateAttempts: 3, testUrl: '', testBatchSize: 40, testConcurrency: 8, xrayPath: 'xray', autoRefresh: true, refreshIntervalHours: 12 },
     nf: '',
     nstatus: 'all',
     srcText: '',
@@ -1126,6 +1140,11 @@ function app() {
     num(n) { return Number(n || 0).toLocaleString(); },
     clock(t) { return new Date(t).toLocaleTimeString([], { hour12: false }); },
     ago(t) { const d = Math.max(0, Math.round((Date.now() - t) / 1000)); if (d < 60) return d + 's ago'; if (d < 3600) return Math.round(d / 60) + 'm ago'; return Math.round(d / 3600) + 'h ago'; },
+    fmtWhen(t) {
+      const left = Math.round((t - Date.now()) / 1000);
+      if (left > 0) return 'in ' + this.uptime(left);
+      return this.ago(t);
+    },
     uptime(sec) { const s = Number(sec || 0); const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`; },
     providerIcon(type) { return (TYPES[type] || TYPES.custom).icon; },
     typeHint() { const t = TYPES[this.pf.type] || TYPES.custom; return t.baseUrl ? `Default for ${t.label}: ${t.baseUrl} — upstream API style: ${t.style}` : 'Set the full base URL of your OpenAI-compatible endpoint.'; },
@@ -1517,6 +1536,7 @@ function app() {
           maxActive: np.settings.maxActive, rotateAttempts: np.settings.rotateAttempts,
           testUrl: np.settings.testUrl, testBatchSize: np.settings.testBatchSize,
           testConcurrency: np.settings.testConcurrency, xrayPath: np.xrayPath || 'xray',
+          autoRefresh: np.settings.autoRefresh !== false, refreshIntervalHours: np.settings.refreshIntervalHours ?? 12,
         };
         if (!this.srcText || force) this.srcText = (np.sources || []).map((s) => s.url).join('\n');
         if (np.test && np.test.running) this.startPolling();
