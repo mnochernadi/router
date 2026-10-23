@@ -436,6 +436,14 @@ install_docker() {
 
   say "starting containers"
   run docker compose -f "$INSTALL_DIR/docker-compose.yml" --env-file "$ENV_FILE" up -d --build
+  # A crash-looping container used to be reported as a successful install: the
+  # build succeeds even when the image is missing a file the code requires.
+  # Verify it here and say what to do, instead of leaving a restart loop behind.
+  if ! wait_healthy; then
+    warn "the container never answered; its last log lines:"
+    docker logs --tail 30 llm-api-router 2>&1 | sed 's/^/    /' || true
+    die "docker mode did not bring the router up. Re-run with --systemd to install it as a host service instead."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -640,7 +648,15 @@ summary() {
 # ---------------------------------------------------------------------------
 install_node   # systemd mode needs the runtime on the host; docker mode does not
 if [ "$MODE" = "docker" ]; then install_docker; else install_systemd; fi
-wait_healthy || true
+# A silent broken install is the worst outcome: verify the service and, when it
+# does not answer, show where to look before failing.
+if ! wait_healthy; then
+  case "$MODE" in
+    docker) docker logs --tail 30 llm-api-router 2>&1 | sed 's/^/    /' || true ;;
+    *)      journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true ;;
+  esac
+  die "the router is not answering on 127.0.0.1:$PORT; the log excerpt is above"
+fi
 configure_nginx
 configure_firewall
 summary

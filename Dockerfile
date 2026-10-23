@@ -11,9 +11,12 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-# No package.json install step: the router has zero runtime dependencies.
-COPY package.json server.js ./
+# No package.json install step: the router has zero runtime dependencies, but
+# server.js does require these three modules, so they belong in the image.
+# Shipping only server.js made every container die with MODULE_NOT_FOUND.
+COPY package.json server.js proxy-manager.js proxy-client.js freebuff-driver.js ./
 COPY public ./public
+COPY scripts ./scripts
 COPY config.example.json ./
 
 RUN mkdir -p /data && chown -R node:node /data /app
