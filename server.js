@@ -261,6 +261,8 @@ function normalizeAccount(a, fallbackName = 'account') {
 function normalizeProvider(p) {
   const type = PROVIDER_TYPES[p.type] ? p.type : 'custom';
   const def = PROVIDER_TYPES[type];
+  // Session-quota providers are never routed through the exit pool.
+  const forceDirect = def.style === 'opencode-free';
   const accounts = Array.isArray(p.accounts) ? p.accounts.map((a, i) => normalizeAccount(a, `account-${i + 1}`)) : [];
   return {
     id: String(p.id || uid('prov')),
@@ -273,7 +275,7 @@ function normalizeProvider(p) {
     maxAttempts: Number(p.maxAttempts) > 0 ? Math.min(Number(p.maxAttempts), 32) : 0,
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
-    proxy: String(p.proxy || 'direct'),
+    proxy: forceDirect ? 'direct' : String(p.proxy || 'direct'),
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     accounts,
@@ -839,7 +841,8 @@ async function callUpstream(provider, account, ctx) {
     throw err;
   }
 
-  const picked = proxies ? proxies.pick(provider) : null;
+  const freeTierStyle = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
+  const picked = proxies && !freeTierStyle ? proxies.pick(provider) : null;
   let upstream;
   try {
     if (picked) {
