@@ -262,8 +262,12 @@ function normalizeAccount(a, fallbackName = 'account') {
 function normalizeProvider(p) {
   const type = PROVIDER_TYPES[p.type] ? p.type : 'custom';
   const def = PROVIDER_TYPES[type];
-  // Session-quota providers are never routed through the exit pool.
-  const forceDirect = def.style === 'opencode-free';
+  // The free tier's allowance is accounted per model *and* per IP (measured: a
+  // fresh server IP answered deepseek-v4.1-flash-free while the old IP was 429
+  // for hours), so the operator may route it through the exit pool on purpose.
+  // Default stays 'direct': rotating this provider costs its session affinity
+  // and previously ended in TLS resets, so it is an explicit choice, not a
+  // default. `proxy: 'rotate'` plus the dashboard's Next IP does the rest.
   const accounts = Array.isArray(p.accounts) ? p.accounts.map((a, i) => normalizeAccount(a, `account-${i + 1}`)) : [];
   return {
     id: String(p.id || uid('prov')),
@@ -276,7 +280,7 @@ function normalizeProvider(p) {
     maxAttempts: Number(p.maxAttempts) > 0 ? Math.min(Number(p.maxAttempts), 32) : 0,
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
-    proxy: forceDirect ? 'direct' : String(p.proxy || 'direct'),
+    proxy: String(p.proxy || 'direct'),
     // Per-model fallback inside the free tier (see OPENCODE_FREE_FALLBACK_MODELS).
     // Default on for opencode-free; `freeFallback: false` turns it off, and
     // `freeFallbackModels` overrides the order.
@@ -1791,6 +1795,7 @@ async function handleProxy(req, res, url) {
     let lastFailure = null;
     let lastFailureKey = '';
     let netRetries = 0;
+    let sessionRetries = 0;
 
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
@@ -1861,17 +1866,33 @@ async function handleProxy(req, res, url) {
           }
         }
         const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
-        if (freeTier && kind === 'quota' && rotations < Math.max(1, rotateMax)) {
-          // The free tier accounts quota per session, so a new session is a new
-          // allowance; that beats sitting out a cooldown.
-          ctx.freshSession = true;
-          rotations += 1;
-          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying (${rotations}/${Math.max(1, rotateMax)})`);
-          continue;
-        }
-        // The account is fine - only this model is dry. Move to the next free
-        // model that has allowance and keep the identity (nothing is cooled).
         if (freeTier && kind === 'quota') {
+          // The free allowance is accounted per IP *and* per model. Measured in
+          // the same minute, on the same models: an exhausted server IP answered
+          // 200 from a fresh IP while the old one had been 429 for hours. So the
+          // escalation keeps the requested model for as long as possible:
+          //   1. same model on the next exit IP (only when the operator opted the
+          //      provider into the pool - shared exit IPs can be dry too),
+          //   2. same IP with a rebuilt session,
+          //   3. the next free model that has allowance,
+          //   4. the caller then tries the configured fallback provider.
+          // Nothing here cools the account: the free tier carries no timer.
+          if (rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
+            if (call.exit) proxies.noteResult(call.exit.id, false);
+            const next = proxies.rotate(`quota on ${provider.id}`, provider.id);
+            rotations += 1;
+            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; keeping ${ctx.model} but moving to exit ${next ? next.id : '?'} (${rotations}/${Math.max(1, rotateMax)})`);
+            continue;
+          }
+          if (sessionRetries < 1) {
+            // A new session is a new allowance for per-session accounting.
+            sessionRetries += 1;
+            ctx.freshSession = true;
+            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying`);
+            continue;
+          }
+          // The account is fine - only this model is dry. Move to the next free
+          // model that has allowance and keep the identity (nothing is cooled).
           const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
           if (nextModel && modelFallbacks < freeFallbacks.length) {
             const dryModel = ctx.model;
