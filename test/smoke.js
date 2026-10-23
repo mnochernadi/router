@@ -326,6 +326,12 @@ function writeConfig() {
         id: 'managed-test', name: 'Managed Identity Test', type: 'opencode-free',
         baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000, proxy: 'direct',
         accounts: [{ id: 'mid-1', name: 'auto-1', apiKey: '', enabled: true }],
+        fallbackProviders: [{ provider: 'fallback-provider', model: 'fallback-model' }],
+      },
+      {
+        id: 'fallback-provider', name: 'Fallback Target', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
+        strategy: 'sequential', timeoutMs: 10000, maxAttempts: 0,
+        accounts: [{ id: 'fbk-1', name: 'fallback-ok', apiKey: 'key-ok-fallback', enabled: true }],
       },
       {
         id: 'gemini-test', name: 'Gemini Test', type: 'gemini', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1beta`,
@@ -1150,6 +1156,18 @@ async function memOf() {
     check('free fallback: a dry model does not cool the account down',
       mpFallback.limitedCount === 0 && (afterFallback.totals.modelFallbacks || 0) >= 1,
       `limited=${mpFallback.limitedCount} fallbacks=${afterFallback.totals.modelFallbacks}`);
+
+    // last resort: every free model dry -> the configured provider answers instead
+    fb.modelQuotaExhausted = ['big-pickle', 'nemotron-3.5-lightning-free', 'beam-free', 'flint-40b-free', 'mimo-v2.6-flash-free', 'nemotron-3.5-super-vl-free'];
+    const hop = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'managed-test' } });
+    fb.modelQuotaExhausted = [];
+    check('provider fallback: an exhausted free tier is answered by the configured provider',
+      hop.status === 200
+      && hop.headers.get('x-router-provider') === 'fallback-provider'
+      && hop.headers.get('x-router-model') === 'fallback-model',
+      `${hop.status} provider=${hop.headers.get('x-router-provider')} model=${hop.headers.get('x-router-model')} body=${hop.text.slice(0, 120)}`);
+    const afterHop = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    check('provider fallback: the hop is counted', (afterHop.totals.providerFallbacks || 0) >= 1, `providerFallbacks=${afterHop.totals.providerFallbacks}`);
 
     // a managed provider that lost its identity gets one on the next request
     const st = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));

@@ -284,6 +284,8 @@ function normalizeProvider(p) {
     freeFallbackModels: Array.isArray(p.freeFallbackModels) && p.freeFallbackModels.length
       ? p.freeFallbackModels.map(String).filter(Boolean)
       : undefined,
+    // Cross-provider last resort: [{ provider: 'pollinations', model: 'openai' }]
+    fallbackProviders: Array.isArray(p.fallbackProviders) && p.fallbackProviders.length ? p.fallbackProviders : undefined,
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     accounts,
@@ -381,7 +383,7 @@ function findProvider(id) {
 let state = {
   version: 1,
   startedAt: now(),
-  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0, reinstalls: 0, modelFallbacks: 0 },
+  totals: { requests: 0, success: 0, failed: 0, streamed: 0, failovers: 0, limitEvents: 0, unlocks: 0, bytesOut: 0, renewals: 0, reinstalls: 0, modelFallbacks: 0, providerFallbacks: 0 },
   providers: {},
   events: [],
   mem: { rss: 0, heapUsed: 0, samples: [] },
@@ -1625,6 +1627,63 @@ function reinstallManagedClient(provider, oldAccount, reason, { rotateExit = fal
 // The historical name: the request path, the admin API and the tests use it.
 const renewManagedIdentity = reinstallManagedClient;
 
+/**
+ * Last resort: answer from another provider when the chosen one has nothing left.
+ *
+ * Configured as `fallbackProviders: [{ provider: "pollinations", model: "openai" }, ...]`
+ * in config.json (or per provider with `fallbackProviders`). Only plain
+ * OpenAI-compatible targets are used, because the hop must not change the wire
+ * format the client is already streaming in. The response carries the real
+ * provider and model in `x-router-provider` / `x-router-model`, so a substituted
+ * answer is never silently mislabelled.
+ */
+function providerFallbackHops(provider) {
+  const list = (provider && Array.isArray(provider.fallbackProviders) && provider.fallbackProviders.length)
+    ? provider.fallbackProviders
+    : (Array.isArray(config.fallbackProviders) ? config.fallbackProviders : []);
+  return list
+    .map((h) => (typeof h === 'string'
+      ? { provider: String(h).split('/')[0], model: String(h).split('/').slice(1).join('/') }
+      : { provider: String(h && h.provider || ''), model: String(h && h.model || '') }))
+    .filter((h) => h.provider && h.model && h.provider !== (provider && provider.id));
+}
+
+async function relayViaFallback(hop, body, res) {
+  const fb = findProvider(hop.provider);
+  if (!fb) return false;
+  const account = (fb.accounts || []).find((a) => a.enabled !== false);
+  if (!account) return false;
+  if ((PROVIDER_TYPES[fb.type] || PROVIDER_TYPES.custom).style !== 'openai') return false;
+  const ctx2 = {
+    model: hop.model,
+    body: { ...(body || {}), model: hop.model },
+    stream: !!(body && body.stream),
+    suffix: '/chat/completions',
+    style: 'openai',
+    responseStyle: 'openai',
+    translate: false,
+    aggregate: !(body && body.stream),
+    includeUsage: !!(body && body.stream_options && body.stream_options.include_usage),
+  };
+  try {
+    const call = await callUpstream(fb, account, ctx2);
+    if (!call.upstream.ok) {
+      try { if (call.upstream.body && call.upstream.body.cancel) await call.upstream.body.cancel(); } catch { /* noop */ }
+      try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
+      return false;
+    }
+    ctx2.exitId = call.exit ? call.exit.id : 'direct';
+    state.totals.providerFallbacks = (state.totals.providerFallbacks || 0) + 1;
+    pushEvent({ kind: 'provider-fallback', pid: fb.id, to: hop.model });
+    console.warn(`[proxy] ${fb.id}: answering with ${hop.model} (configured fallback; the first-choice provider had nothing left)`);
+    await relay(fb, account, call.upstream, call.controller, ctx2, res, 1);
+    return true;
+  } catch (err) {
+    console.warn(`[proxy] ${fb.id}: fallback hop failed: ${err.message}`);
+    return false;
+  }
+}
+
 async function handleProxy(req, res, url) {
   const t0 = now();
   state.totals.requests += 1;
@@ -1879,6 +1938,15 @@ async function handleProxy(req, res, url) {
     if (relayed) return;
     if (rotations) pushEvent({ kind: 'rotated', pid: provider.id, aid: account.id, n: rotations });
     void lastExitId;
+  }
+
+  // Configured cross-provider fallback, tried only when nothing on this provider
+  // could answer (every model out of allowance or every account cooling).
+  if (!res.headersSent) {
+    for (const hop of providerFallbackHops(provider)) {
+      if (res.headersSent) break;
+      if (await relayViaFallback(hop, body, res)) return;
+    }
   }
 
   state.totals.failed += 1;
