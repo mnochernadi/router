@@ -445,6 +445,17 @@ const QUOTA_HINT = /quota|credit|rate.?limit|too many|exhaust|usage|spend|balanc
 // long cooldown only hides the real message.
 const POLICY_HINT = /free.?tier|policy|not allowed|country|region|geo|banned|suspended|unavailable in|download it at|client.?required/i;
 
+function upstreamHint(status, message) {
+  const m = String(message || '');
+  if (/missing api key|autherror/i.test(m)) {
+    return ' � this model is not in OpenCode\'s free tier. Add an OpenCode Console key (provider type "opencode") to use it; its *-free models still cost nothing.';
+  }
+  if (/maximum context length/i.test(m)) {
+    return ' � the free tier window is smaller than 1M tokens (measured: ~900KB of context passes, 2MB is refused). Compact the conversation or use a Console key for the 1M-context models.';
+  }
+  return '';
+}
+
 function classifyFailure(status, message) {
   const msg = String(message || '');
   if (POLICY_HINT.test(msg)) return 'policy';
@@ -1284,6 +1295,27 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     headers['content-length'] = Buffer.byteLength(payload);
     res.writeHead(status, headers);
     res.end(payload);
+    return;
+  }
+
+  // ---- upstream refused: pass the reason through, plus what to do about it --
+  if (!upstream.ok && ctx.style === 'opencode-free' && upstream.body) {
+    let raw = '';
+    try { raw = (await peekError(upstream, 4096)) || ''; } catch { /* noop */ }
+    let message = raw.slice(0, 300);
+    let type = 'upstream_error';
+    try {
+      const j = JSON.parse(raw);
+      message = j.error?.message || j.message || message;
+      type = j.error?.type || j.type || type;
+    } catch { /* keep the raw head */ }
+    const hint = upstreamHint(upstream.status, message);
+    const headers = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
+    headers['x-router-account'] = String(account?.id || '');
+    headers['x-router-attempts'] = String(attempts);
+    headers['x-router-exit'] = 'direct';
+    res.writeHead(upstream.status, headers);
+    res.end(JSON.stringify({ error: { message: `${message}${hint}`, type, upstreamStatus: upstream.status, provider: provider.id } }));
     return;
   }
 
