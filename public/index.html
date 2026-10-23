@@ -319,6 +319,8 @@
             <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Re-test all</button>
           <button class="btn" @click="applyPool()"><i data-lucide="power" class="h-3.5 w-3.5"></i>Apply best &amp; restart xray</button>
           <button class="btn" @click="rotateNow()"><i data-lucide="shuffle" class="h-3.5 w-3.5"></i>Rotate now</button>
+          <button class="btn" @click="replenishPool()" title="Drop the burned exits, test fresh candidates, refill the pool">
+            <i data-lucide="recycle" class="h-3.5 w-3.5"></i>Rebuild pool</button>
           <button class="btn" @click="xrayAction(np && np.xray.running ? 'stop' : 'start')">
             <i data-lucide="play" class="h-3.5 w-3.5"></i><span x-text="np && np.xray.running ? 'Stop xray' : 'Start xray'"></span></button>
           <button class="btn" @click="purgeDead()"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i>Drop dead</button>
@@ -374,7 +376,7 @@
 
         <div class="mt-4 grid grid-cols-2 gap-2">
           <div>
-            <label class="fld">Pool size</label>
+            <label class="fld">Pool size (auto-refilled when spent)</label>
             <input class="input mono" type="number" min="1" max="200" x-model.number="nps.maxActive" @change="saveProxySettings()" />
           </div>
           <div>
@@ -478,7 +480,7 @@
       </div>
       <p class="mt-2 text-[11px] text-slate-500">
         Testing walks the list in batches through a throwaway xray instance (one inbound per candidate), records latency + exit IP, marks the best
-        <span class="mono" x-text="nps.maxActive"></span> for the live pool and restarts xray with them. Dead exits are retried on the next run.
+        <span class="mono" x-text="nps.maxActive"></span> for the live pool and restarts xray with them. An exit that answers a rate limit is burned and leaves the pool; once it drains, the burn pile is deleted, new candidates are tested and the pool refills itself. Dead exits are retried on the next run.
       </p>
     </section>
   </div><!-- /network tab -->
@@ -1097,7 +1099,7 @@ function app() {
     s: { providers: [], totals: {}, memory: { samples: [] }, events: [], proxies: {} },
     tab: 'providers',
     np: null,
-    nps: { maxActive: 24, rotateAttempts: 3, testUrl: '', testBatchSize: 40, testConcurrency: 8, xrayPath: 'xray', autoRefresh: true, refreshIntervalHours: 12 },
+    nps: { maxActive: 15, rotateAttempts: 3, testUrl: '', testBatchSize: 40, testConcurrency: 8, xrayPath: 'xray', autoRefresh: true, refreshIntervalHours: 12 },
     nf: '',
     nstatus: 'all',
     srcText: '',
@@ -1602,6 +1604,13 @@ function app() {
       try {
         const r = await this.api('/proxies/rotate', { method: 'POST', body: {} });
         this.toast(r.exit ? `Rotated to ${r.exit.exitIp || r.exit.id}` : 'No working exits to rotate to', r.exit ? 'ok' : 'warn');
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+    async replenishPool() {
+      try {
+        const r = await this.api('/proxies/replenish', { method: 'POST', body: {} });
+        this.toast(r.ok ? `Pool rebuilt: ${r.active} exits in rotation` : `Nothing rebuilt: ${r.reason || r.skipped || 'unknown'}`, r.ok ? 'ok' : 'warn');
         await this.loadProxies(true);
       } catch (err) { this.toast(err.message, 'err'); }
     },

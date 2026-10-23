@@ -191,13 +191,16 @@ The same measurement also shows the allowance is accounted **per model**, not pe
 | `flint-40b-free` | `503` (their endpoint, not a quota) |
 | `jev-1.13-free` | `400 ModelProtocolUnsupported` on both chat and responses |
 
-So on a quota answer the router moves to the next free model that still has allowance, keeps the identity, and does **not** cool the account down. The client sees a normal `200`; `x-router-model` (and the response's `model`) names the model that actually answered, and the dashboard's Activity tab logs the hop:
+So on a quota answer the router moves, and the order is fixed: **IP first, identity second**. A spent exit is burned (left out of the pool) and the next one takes the request, retrying the model the client actually asked for; only when the fresh IP limits as well is the client reinstalled there; then the model pool on that IP; then more IPs; then a rebuilt session. The client sees a normal `200` from somewhere in that ladder, `x-router-model` (and the response's `model`) names the model that actually answered, and the Activity tab logs every hop:
 
 ```
-[proxy] opencode-free/identity-27: deepseek-v4.1-flash-free is out of allowance; answering with nemotron-3.5-lightning-free instead (1/5)
+[proxy] opencode-free/identity-27: 429 on exit 6f1a...; retrying deepseek-v4.1-flash-free on exit b60a... (1/3)
+[proxy] opencode-free/identity-27: 429 on the new exit too; reinstalled the client and retrying
 ```
 
-Order and behaviour are configurable per provider (`freeFallback: false` disables it, `freeFallbackModels: [...]` overrides the order) or globally (`freeFallbackModels` in `config.json`). Default: the validated list above, in that order. Combined with the daily reset, the provider keeps answering as long as any free model has allowance left.
+The whole ladder is capped at **60 s** (`FREE_LIMIT_BUDGET_MS`); past it the request goes to the configured fallback provider instead of leaving the caller waiting. Each exit gets a **25 s first-byte deadline** of its own, so a dead or throttled exit is dropped rather than eating the budget. A nuanced point that matters on this box: the shared subscription exits are themselves spent for the popular free models, so a *fresh identity on a fresh IP* is tried before walking models.
+
+Order and behaviour are configurable per provider (`freeFallback: false` disables the model walk, `freeFallbackModels: [...]` overrides the order) or globally (`freeFallbackModels` in `config.json`). Default: the validated list above, in that order.
 
 ### Cross-provider last resort
 
@@ -221,7 +224,7 @@ Only plain OpenAI-compatible targets are used, so the hop never changes the wire
 
 Three consequences in this router:
 
-* The free tier carries **no timer**. A quota answer does not cool the account — the upstream's ~16h `retry-after` is deliberately ignored for this provider type — so the very next request tries again at once: it reinstalls the client, walks the free-model pool, and answers. `freeTierCooldownMinutes` (default `0`, retry immediately) exists only to throttle upstream churn if that is ever needed, and `reinstallGapMinutes: 0` reinstalls on every limit instead of at most every 10 minutes. Every other provider type still honours `retry-after`.
+* The free tier carries **no timer**. A quota answer does not cool the account — the upstream's ~16h `retry-after` is deliberately ignored for this provider type — so the very next request tries again at once: it hops IP, reinstalls if the fresh IP is dry too, walks the free-model pool and answers. `freeTierCooldownMinutes` (default `0`, retry immediately) exists only to throttle upstream churn if that is ever needed, and `reinstallGapMinutes: 0` reinstalls on every limit instead of at most every 10 minutes. Every other provider type still honours `retry-after`.
 * `renewManagedIdentity` still rebuilds a whole identity (new account, new session, new project handle) for the limits that *are* per-session; a rebuilt identity presents different values in every header the router controls.
 * The only real escape from the free ceiling is a Console key: provider type `opencode`, base URL `https://opencode.ai/inference`. That unlocks the paid models too — `minimax-m3`, `qwen3.8-max` and `kimi-k2.6` answer `401 AuthError "Missing API key."` under `Bearer public`.
 
@@ -236,9 +239,9 @@ The router reinstalls the client by itself. Whenever a managed provider answers 
 | project (`x-opencode-project`) | `p-<16 hex>`, freshly minted |
 | client version (`user-agent`) | next entry of the validated list (`2.0.26` -> `2.0.31` -> `2.1.0`) |
 | cooldown | cleared |
-| exit IP | rotated when the provider opted into the pool (`proxy: rotate`) |
+| exit IP | the router rotates the exit *before* the reinstall on the free tier, and burns the spent one |
 
-It runs at most once per request and never more often than `reinstallGapMinutes` (default `10`), so upstream does not read the churn as abuse.
+It runs at most once per request and never more often than `reinstallGapMinutes` (default `10`), so upstream does not read the churn as abuse. On the free tier it runs only after an exit change failed to clear the limit — an identity is more expensive than an IP.
 
 On demand — the dashboard's **Reinstall client** button, or the bundled CLI:
 
@@ -504,8 +507,10 @@ subscription URLs ──▶ parse (vless / vmess / trojan / shadowsocks)
                       │
      provider.proxy = rotate ──▶ 429/402/403 arrives
                       ▼
-             rotate to the next exit and retry the SAME account first;
-             only if the whole pool fails does the account get cooled down
+             burn the spent exit, rotate to the next one and retry the SAME
+             account on the new address first; a fresh IP that limits too is
+             what triggers the identity reinstall. Only when the pool (and the
+             identity) are spent does the account get cooled down
 ```
 
 Default sources (editable in the dashboard, stored in `proxies.json`):
@@ -533,7 +538,8 @@ Then assign it per provider — **Providers → Edit → Outbound proxy**: `Dire
 Notes that save time:
 
 * Every routed response carries `x-router-exit` (exit id or `direct`) and `x-router-rotations`, so `curl -i` shows which address served it.
-* Testing walks the list in batches (`testBatchSize`, default 40) through a second xray instance, so 1000 configs never all live at once. The best `maxActive` (default 24) go into the live pool.
+* Testing walks the list in batches (`testBatchSize`, default 40) through a second xray instance, so 1000 configs never all live at once. The best `maxActive` (default 15) go into the live pool.
+* An exit that answers a rate limit is **burned** — it leaves the pool at once, whatever its failure count, and is never cycled back into during the same burst. When the pool drains (or an exit produces no first byte within 25 s) `replenish()` deletes the burn pile, re-fetches the subscriptions if the untested reserve is thin, tests a fresh batch and applies it. Fifteen burned exits therefore become fifteen new ones without a human.
 * Dead exits are dropped after `markDeadAfter` failures and retried on the next run; `rotateAttempts` (default 3) caps retries per request.
 * The `xray` binary: `install.sh --with-xray` installs it, the Docker image already contains it, or install it from your package manager. No binary = no pool, and the router reports that instead of failing requests.
 * `testUrl` defaults to `https://api.ipify.org?format=json` because it returns the exit IP; any JSON endpoint with an `ip` field works.

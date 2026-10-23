@@ -895,15 +895,25 @@ async function callUpstream(provider, account, ctx) {
   let upstream;
   try {
     if (picked) {
-      upstream = await proxiedRequest(url, {
-        method: ctx.method === 'GET' ? 'GET' : 'POST',
-        headers,
-        body: payload,
-        proxy: picked.proxy,
-        timeoutMs,
-        insecure: !!proxies.state.settings.insecure,
-        signal: controller.signal,
-      });
+      try {
+        upstream = await proxiedRequest(url, {
+          method: ctx.method === 'GET' ? 'GET' : 'POST',
+          headers,
+          body: payload,
+          proxy: picked.proxy,
+          // A dead exit accepts the local TCP connect and then stalls the
+          // CONNECT forever, so the pool path gets a first-byte deadline of its
+          // own instead of the provider's whole-response timeout. A healthy
+          // exit answers its headers in ~1-3s (measured).
+          timeoutMs: Math.min(timeoutMs, EXIT_FIRST_BYTE_MS),
+          insecure: !!proxies.state.settings.insecure,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        err.exit = picked.exit;
+        err.exitStall = /timeout/i.test(err.message || '');
+        throw err;
+      }
     } else {
       upstream = await fetch(url, {
         method: ctx.method === 'GET' ? 'GET' : 'POST',
@@ -1557,6 +1567,13 @@ const MANAGED_MAX_RENEWALS = 4;
 // Minimum spacing between identity replacements for a managed provider.
 const MANAGED_RENEW_GAP_MS = 10 * 60_000;
 const MANAGED_BACKOFF_MS = 60_000;
+// How long a pooled exit gets to produce response headers before it counts as
+// dead and the request moves on. Measured: healthy exits answer in 1-3s; a
+// burned node accepts the connect and then never answers.
+const EXIT_FIRST_BYTE_MS = 25_000;
+// The whole free-tier escalation (new IP -> new identity -> model walk) has to
+// finish inside a minute; past that the caller gets the fallback provider.
+const FREE_LIMIT_BUDGET_MS = 60_000;
 
 function isManagedProvider(provider) {
   return !!(PROVIDER_TYPES[provider && provider.type] || {}).manageAccounts;
@@ -1701,6 +1718,10 @@ async function relayViaFallback(hop, body, res) {
 
 async function handleProxy(req, res, url) {
   const t0 = now();
+  // Wall-clock ceiling for the free tier's limit ladder (rotate -> reinstall ->
+  // model walk -> rotate -> session). Past it the request falls through to the
+  // fallback provider instead of leaving the caller waiting.
+  let freeLimitDeadline = t0 + FREE_LIMIT_BUDGET_MS;
   state.totals.requests += 1;
 
   if (config.proxyKeys.length) {
@@ -1832,7 +1853,18 @@ async function handleProxy(req, res, url) {
         pushEvent({ kind: 'error', pid: provider.id, aid: account.id, st: 0 });
         persistState();
         console.warn(`[proxy] ${provider.id}/${account.name} network error: ${err.message}`);
-        if (call && call.exit && proxies) proxies.noteResult(call.exit.id, false);
+        if (err.exit && proxies) proxies.noteResult(err.exit.id, false, { burn: !!err.exitStall });
+        // A stalled exit is the exit's fault, not the identity's: change the
+        // exit immediately instead of spending the two socket retries on it.
+        if (err.exitStall && rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
+          const next = proxies.rotate(`stalled exit on ${provider.id}`, provider.id);
+          if (next) {
+            rotations += 1;
+            console.warn(`[proxy] exit ${err.exit.id} produced no headers in ${EXIT_FIRST_BYTE_MS / 1000}s; rotated to ${next.id} (${rotations}/${Math.max(1, rotateMax)})`);
+            continue;
+          }
+          void proxies.replenish('every active exit stalled');
+        }
         // Transient socket drops (TLS reset, upstream idle close) are worth one
         // retry on the same identity before the provider is called unhealthy.
         if (netRetries < 2) {
@@ -1860,10 +1892,11 @@ async function handleProxy(req, res, url) {
         // exit (policy gate, bad model handle): stop burning the pool.
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
-        if (isManagedProvider(provider) && renewals < 1) {
-          // One reinstall per request, and not more often than every 10 minutes:
-          // minting an identity on every 429 looked like abuse upstream and got
-          // our TLS handshakes dropped. Between reinstalls the provider backs off.
+        const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
+        if (isManagedProvider(provider) && renewals < 1 && !freeTier) {
+          // Non-free managed providers have no exit pool: reinstall is the only
+          // lever, so it runs first for them. The free tier rotates first (see
+          // the ladder below) and handles its own reinstall there.
           const rt = accountState(provider.id, account.id);
           // 0 means "reinstall at once"; unset keeps the conservative spacing
           // that stops an identity being minted on every single 429.
@@ -1873,29 +1906,84 @@ async function handleProxy(req, res, url) {
             : Math.max(0, Number(rawGap) || 0) * 60_000;
           const since = Date.now() - (rt.lastRenewAt || 0);
           if (since >= gapMs) {
-            // Reinstall the identity only; moving the exit IP is the quota
-            // branch's job below, so the two mechanisms do not fight.
             const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status}`);
             renewals += 1;
             account = fresh;
             continue;
           }
         }
-        const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
         if (freeTier && kind === 'quota') {
-          // The free allowance is accounted per IP *and* per model. Measured in
-          // the same minute, on the same models: an exhausted server IP answered
-          // 200 from a fresh IP while the old one had been 429 for hours. The
-          // other half of that measurement matters just as much - the shared
-          // subscription exits are themselves burned for the popular models, so
-          // leaving the host IP too early is slower than trying the model pool on
-          // the IP we already have. Escalation, bounded to about 2 models per IP:
-          //   1. another free model on this IP (usually the one that saves it),
-          //   2. the next exit IP, restarting the model walk with the model the
-          //      client actually asked for (only when the operator opted in),
-          //   3. a rebuilt session,
-          //   4. the caller then tries the configured fallback provider.
-          // Nothing here cools the account: the free tier carries no timer.
+          // The free allowance is accounted per IP *and* per model, and both
+          // reset by moving. Measured on this box: the same request answered 200
+          // from a fresh exit in the minute the old one answered 429. The
+          // operator's order is therefore IP first, identity second:
+          //   1. the next exit IP, retrying the model the client asked for,
+          //   2. a reinstalled client (new identity, session, project, UA) on
+          //      that fresh IP when it limits as well,
+          //   3. the rest of the free model pool on this IP,
+          //   4. further exit IPs,
+          //   5. a rebuilt session,
+          //   6. the caller's configured fallback provider.
+          // The whole ladder is capped by FREE_LIMIT_BUDGET_MS so a caller never
+          // waits a minute for an answer the fallback could give at once. Every
+          // exit that answers a limit is burned, so the pool rebuilds itself
+          // instead of cycling back onto spent IPs. Nothing cools the account:
+          // the free tier carries no timer.
+          if (now() > freeLimitDeadline) {
+            console.warn(`[proxy] ${provider.id}/${account.name}: free-tier limit ladder spent its ${Math.round(FREE_LIMIT_BUDGET_MS / 1000)}s budget after ${rotations} rotation(s); giving up on this provider`);
+            break;
+          }
+          const rotationPossible = rotateWanted && rotateMax > 0;
+          const canRotate = rotationPossible && rotations < rotateMax;
+          // The exit that answered the limit is spent either way - burn it even
+          // when the next step is a reinstall rather than another hop.
+          if (call.exit) proxies.noteResult(call.exit.id, false, { burn: true });
+          const rt = accountState(provider.id, account.id);
+          const rawGap = config.reinstallGapMinutes;
+          const gapMs = (rawGap === undefined || rawGap === null || rawGap === '')
+            ? MANAGED_RENEW_GAP_MS
+            : Math.max(0, Number(rawGap) || 0) * 60_000;
+          // One IP change first; the identity goes only when that did not help.
+          // A provider with no pool has no IP to move to, so it reinstalls on the
+          // first limit instead. One reinstall per request at most.
+          const reinstallDue = renewals < 1
+            && (rotations > 0 || !rotationPossible)
+            && Date.now() - (rt.lastRenewAt || 0) >= gapMs;
+          if (canRotate && !reinstallDue) {
+            ctx.forceDirect = false; // never go back to the host IP, it is spent
+            const pool = proxies.activeExits();
+            let next = pool.length ? proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`, provider.id) : null;
+            if (!next) {
+              // Pool drained (or never filled): rebuild it now, and give the
+              // rebuild's time back to the budget - waiting on the pool is not
+              // the caller's fault.
+              const rebuildStart = now();
+              console.warn(`[proxy] ${provider.id}: no usable exit left, rebuilding the pool with new subscriptions`);
+              const rebuilt = await proxies.replenish(`no usable exit for ${provider.id}`);
+              freeLimitDeadline += now() - rebuildStart;
+              next = rebuilt && rebuilt.ok ? proxies.rotate(`rebuilt pool for ${provider.id}`, provider.id) : null;
+            }
+            if (next) {
+              rotations += 1;
+              // A fresh IP gets the requested model again, not the tail of a walk.
+              triedModels.clear();
+              triedModels.add(requestedModel);
+              ctx.model = requestedModel;
+              modelsThisIp = 0;
+              console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; retrying ${requestedModel} on exit ${next.id} (${rotations}/${rotateMax})`);
+              // Running low: refill in the background while this request keeps
+              // hopping, so the next request never starts on an empty pool.
+              if (proxies.activeExits().length <= 3) void proxies.replenish('pool running low');
+              continue;
+            }
+          }
+          if (reinstallDue) {
+            const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status} on a fresh exit`);
+            renewals += 1;
+            account = fresh;
+            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}${rotations ? ' on the new exit too' : ''}; reinstalled the client and retrying`);
+            continue;
+          }
           const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
           // On the host's own IP walk the whole pool (it is the IP we know is
           // clean); once we are on a shared exit, two models is enough before
@@ -1912,26 +2000,15 @@ async function handleProxy(req, res, url) {
             console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
             continue;
           }
-          if (rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
-            if (call.exit) proxies.noteResult(call.exit.id, false);
-            ctx.forceDirect = false; // leave the host IP and start using the pool
-            const next = proxies.rotate(`quota on ${provider.id}`, provider.id);
-            rotations += 1;
-            // A fresh IP gets the requested model again, not the tail of the walk.
-            triedModels.clear();
-            triedModels.add(requestedModel);
-            ctx.model = requestedModel;
-            modelsThisIp = 0;
-            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; retrying ${requestedModel} on exit ${next ? next.id : '?'} (${rotations}/${Math.max(1, rotateMax)})`);
-            continue;
-          }
-          if (sessionRetries < 1) {
+          if (sessionRetries < 1 && now() < freeLimitDeadline) {
             // A new session is a new allowance for per-session accounting.
             sessionRetries += 1;
             ctx.freshSession = true;
             console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying`);
             continue;
           }
+          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} [quota] after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); failing over`);
+          break;
         }
         if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
           if (call.exit) proxies.noteResult(call.exit.id, false);
@@ -2536,6 +2613,13 @@ async function handleAdmin(req, res, url) {
     if (method === 'POST' && b === 'apply') {
       const res2 = await proxies.apply();
       return sendJson(res, 200, { ok: true, ...res2, snapshot: proxies.snapshot() });
+    }
+    // Throw the burn pile away, test new candidates and refill the pool. Runs by
+    // itself when the pool drains; this is the manual lever for it.
+    if (method === 'POST' && b === 'replenish') {
+      const body = await readJsonBody(req);
+      const out = await proxies.replenish(body.reason || 'manual (dashboard)');
+      return sendJson(res, 200, { ok: true, ...out, snapshot: proxies.snapshot() });
     }
     // Reinstall the client: new identity, session, project handle and client
     // version, with any cooldown cleared. `renew` stays as the historical path.

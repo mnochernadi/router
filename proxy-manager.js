@@ -42,7 +42,9 @@ const DEFAULT_SETTINGS = {
   xrayPath: process.env.ROUTER_XRAY || 'xray',
   inboundBasePort: 20801,
   testBasePort: 30801,
-  maxActive: 24,
+  // Deep enough to hop fifteen times before anything has to be re-tested, small
+  // enough that a full burn pile is cheap to rebuild.
+  maxActive: 15,
   testBatchSize: 40,
   testConcurrency: 8,
   testUrl: 'https://api.ipify.org?format=json',
@@ -904,25 +906,87 @@ class ProxyManager {
     return exit;
   }
 
-  noteResult(exitId, ok) {
+  /**
+   * Record the outcome of a real request through an exit.
+   *
+   * `burn` marks the exit spent rather than merely unlucky: the caller knows the
+   * exit answered a quota limit (or produced no headers at all), which is the
+   * exit's fault and not something a retry on the same exit can fix. A burned
+   * exit leaves the pool at once regardless of `markDeadAfter`, and shows up as
+   * burned in the UI so the pile is visible before it is rebuilt.
+   */
+  noteResult(exitId, ok, { burn = false } = {}) {
     const exit = this.byId.get(exitId);
     if (!exit) return;
     if (ok) { exit.failures = 0; return; }
     exit.failures = (exit.failures || 0) + 1;
-    if (exit.failures >= this.state.settings.markDeadAfter) {
-      exit.status = 'dead';
+    const spent = burn || exit.failures >= this.state.settings.markDeadAfter;
+    if (spent) {
+      exit.status = burn ? 'burned' : 'dead';
+      exit.burnedAt = burn ? Date.now() : 0;
+      exit.error = burn ? 'spent on a rate limit - leaves the pool until the next test' : exit.error;
       this.state.active = this.state.active.filter((id) => id !== exit.id);
-      this.pushEvent({ kind: 'exit-dead', exit: exit.id });
-      this.log(`[proxy] exit ${exit.id} marked dead after ${exit.failures} failures`);
+      this.pushEvent({ kind: burn ? 'exit-burned' : 'exit-dead', exit: exit.id });
+      this.log(`[proxy] exit ${exit.id} ${burn ? 'burned (spent on a rate limit)' : 'marked dead'} - ${this.state.active.length} left in the pool`);
     }
     this.save();
   }
 
+  /**
+   * Rebuild the pool once the burn pile has eaten it.
+   *
+   * The fifteen spent exits are deleted outright (the subscriptions re-publish
+   * the same URIs on the next fetch, so nothing is lost), a new batch is tested,
+   * and the working results are applied. Bounded to `maxActive * 3` candidates
+   * so a full rebuild stays inside a normal request budget.
+   */
+  async replenish(reason = 'pool empty') {
+    if (this._replenishing) return { skipped: 'a replenish is already running' };
+    this._replenishing = true;
+    try {
+      this.pushEvent({ kind: 'replenish', reason });
+      this.log(`[pool] replenishing the exit pool (${reason})`);
+      const spent = this.state.exits.filter((e) => e.status === 'burned');
+      if (spent.length) {
+        const gone = new Set(spent.map((e) => e.id));
+        this.state.exits = this.state.exits.filter((e) => !gone.has(e.id));
+        for (const id of gone) this.byId.delete(id);
+        this.state.active = this.state.active.filter((id) => !gone.has(id));
+        this.log(`[pool] dropped ${spent.length} burned exit(s) from the pool`);
+        this.save();
+      }
+      const maxActive = Math.max(1, Number(this.state.settings.maxActive) || 1);
+      let untested = this.state.exits.filter((e) => e.status === 'untested').length;
+      if (untested < maxActive) {
+        this.log(`[pool] only ${untested} untested exit(s) on hand - re-fetching the subscriptions first`);
+        await this.refresh({});
+        untested = this.state.exits.filter((e) => e.status === 'untested').length;
+      }
+      if (!untested) {
+        this.log('[pool] nothing left to test - the pool stays as it is');
+        return { ok: false, reason: 'no untested exits left' };
+      }
+      const started = await this.testAll({ limit: maxActive * 3 });
+      if (started && started.started) {
+        const deadline = Date.now() + 2 * 3600_000;
+        while (this.test.running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1000));
+      }
+      const applied = await this.apply();
+      this.pushEvent({ kind: 'replenished', active: this.state.active.length, ok: this.test.ok });
+      this.log(`[pool] replenished: ${this.test.ok} working found, ${this.state.active.length} active`);
+      return { ok: true, tested: started ? started.total : 0, ok_: this.test.ok, active: this.state.active.length, running: !!applied.running };
+    } finally {
+      this._replenishing = false;
+    }
+  }
+
+
   snapshot({ includeUri = false } = {}) {
-    const counts = { total: this.state.exits.length, ok: 0, dead: 0, untested: 0, byProtocol: {} };
+    const counts = { total: this.state.exits.length, ok: 0, dead: 0, untested: 0, burned: 0, byProtocol: {} };
     for (const e of this.state.exits) {
       if (e.status === 'ok') counts.ok += 1;
       else if (e.status === 'dead') counts.dead += 1;
+      else if (e.status === 'burned') counts.burned += 1;
       else if (e.status === 'leak') counts.leak = (counts.leak || 0) + 1;
       else counts.untested += 1;
       counts.byProtocol[e.protocol] = (counts.byProtocol[e.protocol] || 0) + 1;

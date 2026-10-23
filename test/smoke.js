@@ -241,6 +241,8 @@ function writeConfig() {
     defaultProvider: 'seq-provider',
     cors: true,
     proxyKeys: [],
+    // The free tier must reinstall on the spot, not wait out the 10 minute gap.
+    reinstallGapMinutes: 0,
     providers: [
       {
         id: 'seq-provider', name: 'Sequential Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
@@ -330,6 +332,13 @@ function writeConfig() {
         id: 'managed-test', name: 'Managed Identity Test', type: 'opencode-free',
         baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000, proxy: 'direct',
         accounts: [{ id: 'mid-1', name: 'auto-1', apiKey: '', enabled: true }],
+        fallbackProviders: [{ provider: 'fallback-provider', model: 'fallback-model' }],
+      },
+      {
+        id: 'free-rotate-test', name: 'Free Tier Over the Pool', type: 'opencode-free',
+        baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000,
+        proxy: 'rotate', rotateAttempts: 3,
+        accounts: [{ id: 'frt-1', name: 'keyless', apiKey: '', enabled: true }],
         fallbackProviders: [{ provider: 'fallback-provider', model: 'fallback-model' }],
       },
       {
@@ -564,6 +573,7 @@ async function memOf() {
     exits: [
       { id: 'x1', name: 'exit one', protocol: 'vless', host: '10.0.0.1', port: 443, uri: 'vless://x1', status: 'ok', latencyMs: 120, exitIp: '10.0.0.1', failures: 0, testedBy: TELEMETRY_SCHEMA, outbound: { protocol: 'freedom' } },
       { id: 'x2', name: 'exit two', protocol: 'vless', host: '10.0.0.2', port: 443, uri: 'vless://x2', status: 'ok', latencyMs: 240, exitIp: '10.0.0.2', failures: 0, testedBy: TELEMETRY_SCHEMA, outbound: { protocol: 'freedom' } },
+      { id: 'x3', name: 'exit three', protocol: 'vless', host: '10.0.0.3', port: 443, uri: 'vless://x3', status: 'untested', latencyMs: 0, exitIp: '', failures: 0, testedBy: TELEMETRY_SCHEMA, outbound: { protocol: 'freedom' } },
     ],
     active: ['x1', 'x2'],
   }));
@@ -1195,6 +1205,90 @@ async function memOf() {
     fs.writeFileSync(CONFIG, JSON.stringify(st, null, 2));
     await fetch(routerUrl('/admin/api/provider/managed-test/accounts'), { method: 'POST', headers: ADMIN, body: '{}' }).catch(() => {});
     check('managed: the managed provider still advertises itself as managed', mp.managed === true, String(mp.managed));
+  }
+
+  // 28. opencode-free again: a limit moves the exit IP first and the identity
+  //     second, the whole ladder stays inside a minute, and a spent exit is
+  //     burned so the pool rebuilds itself instead of cycling onto it.
+  {
+    const state1 = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const beforeIds = state1.providers.find((p) => p.id === 'free-rotate-test').accounts.map((a) => a.id);
+    const direct = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
+    check('free rotate: the first attempt is made from the host IP', direct.status === 200 && direct.headers.get('x-router-exit') === 'direct',
+      `${direct.status} exit=${direct.headers.get('x-router-exit')}`);
+
+    fb.burn429 = 1;
+    const hop = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
+    const hopExit = hop.headers.get('x-router-exit');
+    check('free rotate: one limit is answered from the next exit, not a new identity',
+      hop.status === 200 && !!hopExit && hopExit !== 'direct' && hop.headers.get('x-router-rotations') === '1',
+      `${hop.status} exit=${hopExit} rotations=${hop.headers.get('x-router-rotations')} body=${hop.text.slice(0, 120)}`);
+    const afterHop = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const hopIds = afterHop.providers.find((p) => p.id === 'free-rotate-test').accounts.map((a) => a.id);
+    check('free rotate: the identity survived the IP hop', JSON.stringify(hopIds) === JSON.stringify(beforeIds), `${JSON.stringify(beforeIds)} -> ${JSON.stringify(hopIds)}`);
+    const snap1 = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
+
+    // The fresh IP is limited as well: now the identity goes, and the request
+    // still answers - this is the "reinstall if the exit did not help" half.
+    fb.burn429 = 2;
+    const esc = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
+    const afterEsc = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const escIds = afterEsc.providers.find((p) => p.id === 'free-rotate-test').accounts.map((a) => a.id);
+    check('free rotate: a second limit on the fresh IP reinstalls the client and succeeds',
+      esc.status === 200 && escIds.length === 1 && !escIds.some((id) => hopIds.includes(id)),
+      `${esc.status} ${JSON.stringify(hopIds)} -> ${JSON.stringify(escIds)} rotations=${esc.headers.get('x-router-rotations')} account=${esc.headers.get('x-router-account')} burnsLeft=${fb.burn429}`);
+    check('free rotate: the reinstalled identity still answers through the pool', esc.headers.get('x-router-exit') !== 'direct',
+      String(esc.headers.get('x-router-exit')));
+    const snap2 = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
+    const burnedIds = (snap2.events || []).filter((e) => e.kind === 'exit-burned').map((e) => e.exit);
+    const activeIds = snap1.exits.filter((e) => e.active).map((e) => e.id);
+    check('free rotate: the exit that answered the limit is burned out of the pool',
+      burnedIds.some((id) => activeIds.includes(id)) && snap2.counts.ok <= activeIds.length,
+      `burnedEvents=${burnedIds.join(',')} activeBefore=${activeIds.join(',')} activeNow=${snap2.active}`);
+
+    // Worst case: everything 429s, so the ladder runs to its end. It must give up
+    // well inside the minute and let the configured fallback provider answer.
+    fb.burn429 = 99;
+    const t0 = Date.now();
+    const dead = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
+    const spent = Date.now() - t0;
+    fb.burn429 = 0;
+    check('free rotate: an exhausted ladder falls through to the fallback provider inside 60s',
+      dead.status === 200 && dead.headers.get('x-router-provider') === 'fallback-provider' && spent < 60000,
+      `${dead.status} provider=${dead.headers.get('x-router-provider')} ${spent}ms`);
+    check('free rotate: the ladder is bounded, not an unbounded retry storm',
+      Number(dead.headers.get('x-router-rotations') || 0) <= 3, String(dead.headers.get('x-router-rotations')));
+
+    // The burn pile is deleted and a fresh batch is taken on for the next hops.
+    const replenished = await (await fetch(routerUrl('/admin/api/proxies/replenish'), { method: 'POST', headers: ADMIN, body: '{}' })).json();
+    check('replenish: the burned exits are deleted from the pool',
+      !replenished.snapshot.exits.some((e) => e.id === hopExit || e.status === 'burned'),
+      replenished.snapshot.exits.map((e) => `${e.id}:${e.status}`).join(','));
+  }
+
+  // 29. burn bookkeeping without a network: one hit is enough to leave the pool,
+  //     rotation skips what was burned, and a refill never re-applies it.
+  {
+    const { ProxyManager } = require('../proxy-manager.js');
+    const pm = new ProxyManager({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-burn-')), log: () => {} });
+    pm.state.exits = ['b1', 'b2', 'b3'].map((id) => ({
+      id, status: 'ok', testedBy: TELEMETRY_SCHEMA, exitIp: `10.0.0.${id.slice(1)}`, latencyMs: 100, failures: 0, uri: `vless://${id}`,
+    }));
+    pm.state.active = ['b1', 'b2', 'b3'];
+    pm.reindex();
+    pm.noteResult('b1', false, { burn: true });
+    check('burn: one limit takes the exit out of the pool at once',
+      pm.byId.get('b1').status === 'burned' && !pm.state.active.includes('b1'),
+      `${pm.byId.get('b1').status} active=${pm.state.active.join(',')}`);
+    check('burn: no markDeadAfter failures are needed for it', pm.byId.get('b1').failures === 1, String(pm.byId.get('b1').failures));
+    const picked = pm.rotate('test', 'provider-x');
+    check('burn: rotation never lands on a burned exit', !!picked && picked.id !== 'b1', picked && picked.id);
+    pm.state.exits.push({ id: 'u1', status: 'untested', uri: 'vless://u1', failures: 0, latencyMs: 0, exitIp: '' });
+    pm.reindex();
+    await pm.replenish('test');
+    check('replenish: the burned exit is deleted and cannot be re-applied',
+      !pm.byId.has('b1') && !pm.state.exits.some((e) => e.status === 'burned') && !pm.state.active.includes('b1'),
+      pm.state.exits.map((e) => `${e.id}:${e.status}`).join(','));
   }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path
