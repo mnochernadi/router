@@ -79,6 +79,7 @@ const PROVIDER_TYPES = {
     // Accounts here are identities, not credentials: the router creates,
     // replaces and deletes them itself. Manual add is refused.
     manageAccounts: true,
+    defaultTimeoutMs: 600_000, // big contexts are slow before the first byte
   },
   // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
   // The driver owns the whole handshake, so this style always wants a proxy exit.
@@ -271,7 +272,7 @@ function normalizeProvider(p) {
     baseUrl: String(p.baseUrl || def.baseUrl || ''),
     strategy: p.strategy === 'sequential' ? 'sequential' : 'round-robin',
     cooldownHours: clampHours(p.cooldownHours),
-    timeoutMs: Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : 30_000,
+    timeoutMs: Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : (Number(def.defaultTimeoutMs) > 0 ? Number(def.defaultTimeoutMs) : 30_000),
     maxAttempts: Number(p.maxAttempts) > 0 ? Math.min(Number(p.maxAttempts), 32) : 0,
     headers: p.headers && typeof p.headers === 'object' ? { ...p.headers } : undefined,
     modelStyles: p.modelStyles && typeof p.modelStyles === 'object' ? { ...p.modelStyles } : undefined,
@@ -707,7 +708,8 @@ function buildUpstream(provider, account, ctx) {
   if (style === 'opencode-free') {
     const session = openCodeSession(provider, account, { fresh: !!ctx.freshSession });
     if (ctx.freshSession) ctx.freshSession = false;
-    const payload = ensureFingerprintTools({ ...(ctx.body || {}), model: ctx.model || (ctx.body || {}).model });
+    const baseModel = stripThinkingSuffix(ctx.model || (ctx.body || {}).model);
+  const payload = ensureFingerprintTools({ ...(ctx.body || {}), model: baseModel });
     return {
       style, responseStyle: 'openai',
       url: `${String(baseUrl || '').replace(/\/+$/, '')}${ctx.suffix || '/chat/completions'}`,
@@ -1286,7 +1288,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   }
 
   // ---- upstream streams, client asked for one JSON object ------------------
-  if (ctx.aggregate && upstream.body) {
+  if (ctx.aggregate && upstream.body && upstream.status < 300) {
     let payload = '';
     try {
       const agg = sseAggregator(ctx.model);
@@ -1840,6 +1842,11 @@ function openCodeSession(provider, account, { fresh = false } = {}) {
   return as.sessionId;
 }
 
+/** "model (high)" -> "model": the upstream knows only the base id. */
+function stripThinkingSuffix(model) {
+  return String(model || '').replace(/\([^()]+\)\s*$/, '').trim();
+}
+
 function ensureFingerprintTools(body) {
   const out = { ...(body || {}) };
   const tools = Array.isArray(out.tools) ? out.tools.slice() : [];
@@ -1853,6 +1860,9 @@ function ensureFingerprintTools(body) {
   }
   out.tools = tools;
   out.stream = true; // stream:false is refused on the free tier
+  // Measured against the live service: `metadata` is rejected with 400 while
+  // user, n, logprobs, response_format, penalties, seed and top_p are accepted.
+  delete out.metadata;
   return out;
 }
 
