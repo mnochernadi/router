@@ -1909,6 +1909,34 @@ const FREE_DRY_BASE_MS = 5 * 60_000;
 const FREE_DRY_MAX_MS = 2 * 60 * 60_000;
 const freeDry = { hits: 0, until: 0, backoffMs: FREE_DRY_BASE_MS, ...(state.freeDry || {}) };
 
+// The genuine CLI's allowance is its own bucket: it is the one client the gate
+// serves when everyone else is refused, so a spent *anonymous API* window says
+// nothing about it (and vice versa). Kept apart on purpose - sharing `freeDry` made
+// the CLI transport inherit a park earned by forged requests and answer 429 without
+// ever running the binary.
+const cliDry = { until: 0, hits: 0, ...(state.cliDry || {}) };
+
+function parkCliTier(retryMs, why) {
+  const until = now() + Math.max(60_000, Number(retryMs) || 0);
+  if (cliDry.until >= until) return false;
+  cliDry.hits += 1;
+  cliDry.until = until;
+  state.cliDry = { until: cliDry.until, hits: cliDry.hits };
+  persistState();
+  console.warn(`[cli] opencode CLI reports the free allowance is spent (${why ? `"${String(why).slice(0, 90)}"` : 'no detail'}) - parked until ${new Date(until).toISOString()}`);
+  pushEvent({ kind: 'cli-day-ceiling', until });
+  return true;
+}
+
+function clearCliDry(why) {
+  if (!cliDry.until && !cliDry.hits) return;
+  cliDry.until = 0;
+  cliDry.hits = 0;
+  delete state.cliDry;
+  persistState();
+  console.warn(`[cli] the opencode CLI answered again - dry window cleared${why ? ` (${why})` : ''}`);
+}
+
 /**
  * How long the pool rests after a ceiling the ladder could not clear.
  * `null` means resting is switched off (`freePoolRestMinutes: 0`): the operator's
@@ -2520,13 +2548,13 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   state.totals.requests += 1;
   const driver = cliDriverFor(provider);
 
-  const parked = freeDry.until > now() ? freeDry.until : 0;
+  const parked = cliDry.until > now() ? cliDry.until : 0;
   if (parked) {
     state.totals.failed += 1;
     const wait = Math.max(1, Math.round((parked - now()) / 1000));
     return sendJson(res, 429, {
       error: {
-        message: `the OpenCode free allowance is spent; it returns at ${new Date(parked).toISOString()}`,
+        message: `the opencode CLI reports its free allowance is spent; it returns at ${new Date(parked).toISOString()}`,
         type: 'router_free_day_ceiling',
         retryAfterSeconds: wait,
       },
@@ -2578,13 +2606,13 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
 
   if (result.limit || result.auth) {
     const wait = msToNextUtcMidnight();
-    parkFreeTier(provider.id, wait, result.error || 'the opencode CLI reports the free allowance is spent');
+    parkCliTier(wait, result.error);
     state.totals.failed += 1;
     if (!res.headersSent) {
       const secs = Math.max(1, Math.round(wait / 1000));
       return sendJson(res, 429, {
         error: {
-          message: `the OpenCode free allowance is spent (${result.error || 'free usage limit reached'}); it returns at ${new Date(now() + wait).toISOString()}`,
+          message: `the opencode CLI reports its free allowance is spent (${result.error || 'free usage limit reached'}); it returns at ${new Date(now() + wait).toISOString()}`,
           type: 'router_free_day_ceiling',
           retryAfterSeconds: secs,
         },
