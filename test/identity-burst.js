@@ -340,6 +340,13 @@ let childB = null;
     check('the free provider runs identityPool lanes, minted before the first request is served',
       !!p && p.identityPool === 2 && accountsOf(snap).length === 2,
       `identityPool=${p && p.identityPool} accounts=${accountsOf(snap).length}`);
+    // The lane index is what gives an identity its own slot and its own exit pin, so
+    // it has to reach disk: dropping it collapsed every lane onto lane 0 on the next
+    // restart, which is a pool that rotates nothing.
+    const onDisk = JSON.parse(fs.readFileSync(CONFIG_A, 'utf8')).providers[0].accounts || [];
+    check('the lane index is persisted, so a restart cannot collapse the pool',
+      onDisk.length === 2 && onDisk.every((a, i) => Number(a.lane) === i),
+      `lanes=${JSON.stringify(onDisk.map((a) => a.lane))}`);
   }
 
   // -------------------------------------------------------------------------

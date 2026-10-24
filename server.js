@@ -260,6 +260,14 @@ function normalizeAccount(a, fallbackName = 'account') {
   if (a.note) out.note = String(a.note);
   if (Number(a.rotateEveryMinutes) > 0) out.rotateEveryMinutes = Number(a.rotateEveryMinutes);
   if (a.keyless) out.keyless = true;
+  // Lane identity is positional state, not operator input, and it must survive a
+  // save/load cycle: it is what gives an identity its own slot and its own exit
+  // pin. Dropping it collapsed every lane onto lane 0 on the next restart (one
+  // exit, one slot, and a pool that rotates nothing), which is the opposite of
+  // what `identityPool` is for. `gen` rides along so the dashboard can show how
+  // many identities a lane has been through.
+  if (Number.isFinite(Number(a.lane)) && Number(a.lane) >= 0) out.lane = Number(a.lane);
+  if (Number(a.gen) > 0) out.gen = Number(a.gen);
   return out;
 }
 
@@ -459,7 +467,11 @@ async function saveConfig() {
   const serializable = { ...config };
   serializable.providers = config.providers.map((p) => ({
     ...p,
-    accounts: (p.accounts || []).map((a) => ({ id: a.id, name: a.name, apiKey: a.apiKey, enabled: a.enabled !== false })),
+    // Round-trip the accounts through the loader's own shape instead of a hand
+    // picked subset: the subset dropped `lane`, `gen` and `keyless`, so the identity
+    // pool write-back lost the lane indices on every save and a restart collapsed
+    // four lanes into lane 0 - one exit pin, one slot, a pool that rotates nothing.
+    accounts: (p.accounts || []).map((a) => normalizeAccount(a, a.name || 'account')),
   }));
   await atomicWrite(CONFIG_PATH, `${JSON.stringify(serializable, null, 2)}\n`);
   try { await fsp.chmod(CONFIG_PATH, 0o600); } catch { /* best effort (windows) */ }
@@ -2078,6 +2090,7 @@ function ensureManagedAccount(provider) {
     saveConfig().catch(() => {});
   }
   let created = false;
+  let lanesStamped = false;
   for (let lane = 0; lane < size; lane += 1) {
     let acc = provider.accounts[lane];
     if (!acc) {
@@ -2092,7 +2105,7 @@ function ensureManagedAccount(provider) {
       created = true;
       pushEvent({ kind: 'identity-created', pid: provider.id, aid: acc.id, lane });
     }
-    if (acc.lane === undefined) acc.lane = lane;
+    if (acc.lane === undefined) { acc.lane = lane; lanesStamped = true; }
   }
   // Pin an exit per lane straight away, so every identity has its own address
   // before its first request and the dashboard can show the one it will use.
@@ -2101,9 +2114,13 @@ function ensureManagedAccount(provider) {
       if (provider.accounts[lane]) proxies.pickLane(provider, String(lane));
     }
   }
-  if (created) {
+  if (created || lanesStamped) {
+    // `lanesStamped` matters on a config that already carried the rows (an older
+    // file, a hand-edited one): without this write the lane indices lived only in
+    // memory until some unrelated save, and a config read by an operator or a tool
+    // showed rows with no lane at all.
     saveConfig().catch(() => {});
-    console.warn(`[proxy] ${provider.id}: identity pool up with ${size} lane(s), each on its own exit IP`);
+    if (created) console.warn(`[proxy] ${provider.id}: identity pool up with ${size} lane(s), each on its own exit IP`);
   }
   const list = provider.accounts.filter((a) => a.enabled !== false);
   return list.find((a) => !isLimited(accountState(provider.id, a.id))) || list[0] || null;
