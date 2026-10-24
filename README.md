@@ -213,6 +213,8 @@ When a lane answers `429` the request does not sit there being rebuilt - it chan
 | exit IP | yes, and the spent one is burned out of the pool |
 | lane slot | no - the slot and its state survive, so limits cannot pile up on one lane |
 
+The pins are repaired after every refill, not on the next `429`. A lane that was rebuilt while the pool was empty kept no exit at all, and two lanes could end up sharing one because a burned lane's stale pin still counted as taken - which quietly puts two identities behind one allowance. `reconcileLanes()` runs at the end of `apply()`: a pin that is no longer live, or duplicated, is replaced from the pool. On this server that reads `lane 0..3 → 4 distinct egress IPs`.
+
 The whole ladder is capped at **60 s** (`FREE_LIMIT_BUDGET_MS`); past it the request goes to the configured fallback provider instead of leaving the caller waiting. The budget is checked *before* every attempt, and the remaining budget - never more than the 25 s first-byte deadline - is handed to that attempt, so one silent exit cannot spend the minute on its own. The first-byte deadline covers the CONNECT **and the TLS handshake**; a buffered (non-streaming) answer additionally gets a 20 s idle deadline on the body. Both burn the exit and move on. A nuanced point that matters on this box: the shared subscription exits are themselves spent for the popular free models, so a *fresh identity on a fresh IP* is tried before walking models.
 
 Order and behaviour are configurable per provider (`freeFallback: false` disables the model walk, `freeFallbackModels: [...]` overrides the order) or globally (`freeFallbackModels` in `config.json`). Default: the validated list above, in that order.

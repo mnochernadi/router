@@ -907,7 +907,43 @@ class ProxyManager {
     this.cursors.clear();
     this.save();
     this.pushEvent({ kind: 'apply', active: best.length });
+    const moved = this.reconcileLanes();
+    if (moved) this.log(`[pool] re-pinned ${moved} lane(s) onto their own exit after the refill`);
     return this.startMain();
+  }
+
+  /**
+   * Give every identity lane its own live exit again.
+   *
+   * A lane only picks a new exit when a request rotates, and a lane rebuilt while
+   * the pool was empty keeps whatever it had - nothing, or an address another lane
+   * already holds. Four identities sharing one egress IP share one allowance, so
+   * the pool's own health is not enough: the pins have to be repaired after every
+   * refill, not on the next 429.
+   */
+  reconcileLanes() {
+    const pool = this.activeExits();
+    if (!pool.length) return 0;
+    const aliveId = (id) => {
+      const e = this.byId.get(id);
+      return !!e && e.status === 'ok' && this.state.active.includes(id);
+    };
+    let moved = 0;
+    for (const pid of Object.keys(this.state.lanes || {})) {
+      const pins = this.state.lanes[pid] || {};
+      const claimed = new Set();
+      for (const laneKey of Object.keys(pins)) {
+        const id = pins[laneKey];
+        if (id && aliveId(id) && !claimed.has(id)) { claimed.add(id); continue; }
+        const fresh = this.laneExit(pid, laneKey, pool);
+        if (!fresh) continue;
+        pins[laneKey] = fresh.id;
+        claimed.add(fresh.id);
+        moved += 1;
+        this.pushEvent({ kind: 'lane-repin', pid, lane: laneKey, exit: fresh.id, ip: fresh.exitIp || '' });
+      }
+    }
+    return moved;
   }
 
   /**
@@ -1064,11 +1100,16 @@ class ProxyManager {
   laneExit(pid, laneKey, pool, { avoid = '' } = {}) {
     const pins = this.state.lanes[pid] || (this.state.lanes[pid] = {});
     const mine = pins[laneKey] || '';
-    const takenBy = (id) => Object.entries(pins).some(([k, v]) => k !== laneKey && v === id);
-    const alive = (id) => {
+    const aliveId = (id) => {
       const e = this.byId.get(id);
       return !!e && e.status === 'ok' && this.state.active.includes(id);
     };
+    // Only a live pin held by another lane blocks a candidate. A lane whose exit
+    // burned is not holding anything any more, and treating its stale pin as taken
+    // is what left two lanes sharing one address while a third had none.
+    const takenBy = (id) => Object.entries(pins)
+      .some(([k, v]) => k !== laneKey && v === id && aliveId(v));
+    const alive = aliveId;
     if (!avoid && mine && alive(mine) && !takenBy(mine)) return this.byId.get(mine);
     const candidates = pool.filter((e) => e.id !== mine && e.id !== avoid && !takenBy(e.id));
     const free = candidates.length ? candidates : pool.filter((e) => e.id !== mine);
