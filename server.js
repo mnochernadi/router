@@ -339,6 +339,16 @@ function normalizeConfig(cfg) {
     if (Number.isFinite(sweepMinutes) && sweepMinutes >= 0) out.allLanesRenewGapMinutes = Math.min(1440, sweepMinutes);
     else delete out.allLanesRenewGapMinutes;
   }
+  // How long the last resort keeps retrying before the caller is told the truth.
+  // Unset/nonsense keeps the built-in 30s; clamped to 1s..5min so a typo cannot hold
+  // a request for an hour (or give up before a single retry).
+  if (out.fallbackRetrySeconds === undefined || out.fallbackRetrySeconds === null || out.fallbackRetrySeconds === '') {
+    delete out.fallbackRetrySeconds;
+  } else {
+    const retrySeconds = Number(out.fallbackRetrySeconds);
+    if (Number.isFinite(retrySeconds) && retrySeconds > 0) out.fallbackRetrySeconds = Math.min(300, Math.max(1, retrySeconds));
+    else delete out.fallbackRetrySeconds;
+  }
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
   // Exclusive mode: one provider, and nothing else in the router.
   //
@@ -1746,6 +1756,43 @@ function restFreePool(providerId, why) {
   console.warn(`[proxy] ${providerId}: ${why} - resting the pool for ${rested}m; the fallback answers until then`);
 }
 
+// The horizon that separates "this exit, or this identity, is spent" from "the day
+// is spent". The free tier answers both with the same body; only the second carries
+// a retry-after measured in hours, and it is the *same absolute instant* for every
+// address and every model.
+//
+// Measured against the live service on 2026-10-24: eleven exits that had never
+// carried a request (nine countries), six freshly minted sessions, and all nine
+// keyless models - every one answered 429 with the same countdown to 00:00 UTC,
+// while the host IP was already dry. Nothing a client controls moves it, so a
+// day-scale answer is parked on the first sighting instead of being probed with
+// exits, builds, sessions, projects and model handles the way a short-lived limit
+// is (which is the ladder below, and it is right for a limit that moving clears).
+const FREE_DAY_HORIZON_MS = 30 * 60_000;
+const FREE_DAY_HORIZON_MAX_MS = 36 * 60 * 60_000;
+
+/**
+ * Park the free tier until the reset instant the upstream itself named.
+ *
+ * Returns false when it is already parked at least that long, so a burst of
+ * requests cannot keep re-announcing (and re-persisting) the same verdict.
+ */
+function parkFreeTier(providerId, retryMs, why) {
+  const horizon = Math.min(retryMs, FREE_DAY_HORIZON_MAX_MS);
+  const until = now() + horizon;
+  if (freeDry.until >= until) return false;
+  freeDry.hits += 1;
+  freeDry.until = until;
+  // The escalating window keeps its meaning across a restart: it is never shorter
+  // than the day the upstream just named.
+  freeDry.backoffMs = Math.max(freeDry.backoffMs, Math.min(FREE_DRY_MAX_MS, horizon));
+  state.freeDry = { hits: freeDry.hits, until: freeDry.until, backoffMs: freeDry.backoffMs };
+  persistState();
+  console.warn(`[proxy] ${providerId}: free tier is spent for the day (${Math.round(horizon / 60_000)}m to the reset${why ? `; "${String(why).slice(0, 90)}"` : ''}) - parking it${config.exclusiveProvider ? ' and retrying it on the next request' : ', the fallback answers until then'}`);
+  pushEvent({ kind: 'free-day-ceiling', pid: providerId, until: freeDry.until, retryAfterSeconds: Math.round(retryMs / 1000) });
+  return true;
+}
+
 /** The free tier answered again: forget the backoff so the pool is used normally. */
 function clearFreeDry(providerId) {
   if (!freeDry.until && freeDry.hits === 0 && freeDry.backoffMs === FREE_DRY_BASE_MS) return;
@@ -2100,10 +2147,12 @@ function providerFallbackHops(provider) {
 
 async function relayViaFallback(hop, body, res) {
   const fb = findProvider(hop.provider);
-  if (!fb) return false;
+  if (!fb) return { ok: false, reason: 'missing-provider', status: 0, message: `provider "${hop.provider}" is not configured` };
   const account = (fb.accounts || []).find((a) => a.enabled !== false);
-  if (!account) return false;
-  if ((PROVIDER_TYPES[fb.type] || PROVIDER_TYPES.custom).style !== 'openai') return false;
+  if (!account) return { ok: false, reason: 'no-account', status: 0, message: `provider "${hop.provider}" has no enabled account` };
+  if ((PROVIDER_TYPES[fb.type] || PROVIDER_TYPES.custom).style !== 'openai') {
+    return { ok: false, reason: 'style', status: 0, message: `provider "${hop.provider}" does not speak the OpenAI wire format` };
+  }
   const ctx2 = {
     model: hop.model,
     body: { ...(body || {}), model: hop.model },
@@ -2118,20 +2167,102 @@ async function relayViaFallback(hop, body, res) {
   try {
     const call = await callUpstream(fb, account, ctx2);
     if (!call.upstream.ok) {
-      try { if (call.upstream.body && call.upstream.body.cancel) await call.upstream.body.cancel(); } catch { /* noop */ }
+      // Read the reason before cancelling: a hop that says "one request at a time"
+      // is worth another round, one that says "policy" never is.
+      const status = call.upstream.status;
+      const retryMs = retryAfterMs(call.upstream.headers);
+      let message = '';
+      try { message = await peekError(call.upstream, 1024); } catch { /* noop */ }
       try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
-      return false;
+      return { ok: false, reason: classifyFailure(status, message), status, message, retryMs };
     }
     ctx2.exitId = call.exit ? call.exit.id : 'direct';
     state.totals.providerFallbacks = (state.totals.providerFallbacks || 0) + 1;
     pushEvent({ kind: 'provider-fallback', pid: fb.id, to: hop.model });
     console.warn(`[proxy] ${fb.id}: answering with ${hop.model} (configured fallback; the first-choice provider had nothing left)`);
     await relay(fb, account, call.upstream, call.controller, ctx2, res, 1);
-    return true;
+    return { ok: true };
   } catch (err) {
     console.warn(`[proxy] ${fb.id}: fallback hop failed: ${err.message}`);
-    return false;
+    return { ok: false, reason: 'network', status: 0, message: err.message };
   }
+}
+
+// How long the last resort keeps trying before the caller is told it could not be
+// served. A hop that answers "one request at a time" (pollinations Classic) clears
+// in seconds, and a shared free allowance comes back on its own, so the caller gets
+// an answer instead of that hop's limit. `fallbackRetrySeconds` overrides it.
+const FALLBACK_RETRY_MS = 30_000;
+const FALLBACK_BACKOFF_MIN_MS = 1_200;
+const FALLBACK_BACKOFF_MAX_MS = 6_000;
+const FALLBACK_MAX_ROUNDS = 6;
+
+function fallbackRetryDeadlineMs() {
+  const raw = Number(config.fallbackRetrySeconds);
+  if (!Number.isFinite(raw) || raw <= 0) return FALLBACK_RETRY_MS;
+  return Math.min(300_000, Math.max(1_000, Math.round(raw * 1000)));
+}
+
+/**
+ * The last resort, with retries: walk the configured hops, and when they all refuse,
+ * wait out the shortest window any of them quoted and walk them again - until
+ * `fallbackRetrySeconds` (default 30s) is spent, the round cap is reached, the
+ * client hangs up, or a hop finally answers.
+ *
+ * The point is that a limit on one hop must never become a limit for the caller:
+ * a `429` saying "your previous request is still running" is a queue, not a
+ * verdict, and the next round usually gets through. Hops that are *deterministically*
+ * dead (no such provider, no enabled account, wrong wire format, or a policy gate
+ * that no retry can pass) are dropped from the walk instead of being re-tried, so a
+ * misconfigured hop cannot hold the chain open for the whole deadline.
+ *
+ * Returns `{ ok, failures }`: `ok` also means "the client is gone, stop". `failures`
+ * is what every hop said, in order, so the final error can report the last resort's
+ * real reason instead of the first-choice provider's limit.
+ */
+async function relayFallbackChain(provider, body, res, hops) {
+  if (!hops.length) return { ok: false, failures: [] };
+  const clientGone = () => res.writableEnded || res.destroyed || !!(res.socket && res.socket.destroyed);
+  const failures = [];
+  const dead = new Set();
+  const deadline = now() + fallbackRetryDeadlineMs();
+  let round = 0;
+  while (round < FALLBACK_MAX_ROUNDS && now() < deadline) {
+    round += 1;
+    let waitMs = 0;
+    let live = 0;
+    for (let i = 0; i < hops.length; i += 1) {
+      if (res.headersSent || clientGone()) return { ok: true, failures };
+      if (dead.has(i)) continue;
+      const hop = hops[i];
+      const out = await relayViaFallback(hop, body, res);
+      if (out.ok) {
+        if (round > 1) pushEvent({ kind: 'fallback-retry', pid: provider.id, round, n: failures.length });
+        return { ok: true, failures };
+      }
+      if (out.reason === 'missing-provider' || out.reason === 'no-account' || out.reason === 'style') {
+        // Nothing a retry can change: this hop is not a candidate at all.
+        dead.add(i);
+        console.warn(`[proxy] ${hop.provider}/${hop.model}: dropped from the fallback walk (${out.message})`);
+        continue;
+      }
+      live += 1;
+      failures.push({ provider: hop.provider, model: hop.model, status: out.status || 0, kind: out.reason, message: String(out.message || '').slice(0, 180) });
+      // The shortest window any hop offered is the one worth waiting: a hop that
+      // quoted nothing gets the floor, so one silent hop cannot stretch the round.
+      const quoted = Number(out.retryMs) > 0 ? Number(out.retryMs) : 0;
+      const hopWait = Math.min(FALLBACK_BACKOFF_MAX_MS, Math.max(FALLBACK_BACKOFF_MIN_MS, quoted));
+      waitMs = waitMs ? Math.min(waitMs, hopWait) : hopWait;
+    }
+    if (!live) break;
+    const left = deadline - now();
+    if (left <= 0) break;
+    if (waitMs > left) waitMs = left;
+    const last = failures[failures.length - 1] || {};
+    console.warn(`[proxy] ${provider.id}: every fallback hop refused (${last.provider}/${last.model} ${last.status || 'n/a'}${last.message ? ` "${String(last.message).slice(0, 60)}"` : ''}); retrying in ${(waitMs / 1000).toFixed(1)}s (round ${round}/${FALLBACK_MAX_ROUNDS})`);
+    await new Promise((r) => { const t = setTimeout(r, waitMs); if (t.unref) t.unref(); });
+  }
+  return { ok: clientGone(), failures: failures.slice(-8) };
 }
 
 async function handleProxy(req, res, url) {
@@ -2264,6 +2395,11 @@ async function handleProxy(req, res, url) {
       : Math.max(1, (provider.accounts || []).length));
   let sawLimit = false;
   let laneWaitDone = false;
+  // Set the moment a day-scale quota answer parks the tier. It ends the whole
+  // provider attempt loop, not just this lane's: every remaining lane shares the
+  // same daily bucket, so attempt 2 would only spend another exit-free 429 and,
+  // worse, a local 2xx on one lane would clear the park that the answer earned.
+  let dayCeiling = false;
   // One all-lane sweep per request, whatever `allLanesRenewGapMinutes` says. A single
   // ladder can end in "spent" on several lanes in a row, and four new identities per
   // lane-ending is a mint storm, not a fresh start: the point of the rule is that the
@@ -2293,9 +2429,17 @@ async function handleProxy(req, res, url) {
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - skipping the ladder, answering from the fallback`);
   } else if (style === 'opencode-free' && freeDry.until > now()) {
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - trying it anyway, there is no fallback provider to hand the request to`);
+  } else if (style === 'opencode-free' && freeDry.until && freeDry.until <= now() && freeDry.reclaimed !== freeDry.until) {
+    // The parked day ended, so the upstream allowance is fresh again. Wake the pool
+    // once: the rebuilds and exit re-pins that were deliberately held back during
+    // the dry window would otherwise all land on the first request of the new day,
+    // and that request would spend the fresh allowance on them.
+    freeDry.reclaimed = freeDry.until;
+    kickPool(`free allowance reset for ${provider.id}`);
+    console.warn(`[proxy] ${provider.id}: free allowance window has reset - refreshing the exit pool for the new day`);
   }
 
-  for (let attempt = 1; !freeCeilingDry && attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = 1; !freeCeilingDry && !dayCeiling && attempt <= maxAttempts; attempt += 1) {
     let account = selectAccount(provider, tried);
     if (!account && style === 'opencode-free' && !laneWaitDone && now() < freeLimitDeadline) {
       // Every lane is spent or rebuilding. Rather than failing the caller, wait a
@@ -2472,6 +2616,21 @@ async function handleProxy(req, res, url) {
           // exit that answers a limit is burned, so the pool rebuilds itself
           // instead of cycling back onto spent IPs. Nothing cools an account:
           // the free tier carries no timer.
+          //
+          // One answer outranks all of it: a *day-scale* retry-after. The body is
+          // identical either way ("Free usage limit reached. Subscribe to OpenCode
+          // Go"), so it cannot tell a spent address from a spent day - the horizon
+          // can, and only the spent day is immune to every rung below. Parking on
+          // the first sighting turns the first request after the daily ceiling into
+          // one cheap 429 (no exit burned, no identity minted, no rebuild queued),
+          // which is what an exclusive deployment (no hop to hand over to) wants
+          // too: it is retried on the next request instead of being probed.
+          if (retryMs >= FREE_DAY_HORIZON_MS) {
+            parkFreeTier(provider.id, retryMs, snippet);
+            markLimited(provider, account, upstream.status, { ms: retryMs, message: snippet });
+            dayCeiling = true;
+            break;
+          }
           if (now() > freeLimitDeadline) {
             console.warn(`[proxy] ${provider.id}/${account.name}: free-tier limit ladder spent its ${Math.round((freeLimitDeadline - t0 - contextMs) / 1000)}s budget after ${rotations} rotation(s); giving up on this provider`);
             // A ladder that burned its whole budget without clearing the limit
@@ -2714,17 +2873,29 @@ async function handleProxy(req, res, url) {
   // Configured cross-provider fallback, tried only when nothing on this provider
   // could answer (every model out of allowance or every account cooling). Empty
   // in exclusive mode, so the caller gets this provider's own error instead.
+  let fallbackFailures = [];
   if (!res.headersSent) {
-    for (const hop of fallbackHops) {
-      if (res.headersSent) break;
-      if (await relayViaFallback(hop, body, res)) return;
-    }
+    const chain = await relayFallbackChain(provider, body, res, fallbackHops);
+    if (chain.ok) return;
+    fallbackFailures = chain.failures;
   }
 
   state.totals.failed += 1;
   if (!res.headersSent) {
     const { error, status } = allExhausted(provider, tried, sawLimit);
-    sendJson(res, status || (sawLimit ? 429 : 503), { error });
+    // Never report the first-choice provider's limit as if it were the whole story:
+    // when the last resort also refused, say what it said and when to come back.
+    if (fallbackFailures.length) {
+      error.fallback = fallbackFailures;
+      error.message = `${error.message} Every fallback hop refused as well (last: ${fallbackFailures[fallbackFailures.length - 1].provider}/${fallbackFailures[fallbackFailures.length - 1].model} ${fallbackFailures[fallbackFailures.length - 1].status || 'no status'}${fallbackFailures[fallbackFailures.length - 1].message ? ` - ${fallbackFailures[fallbackFailures.length - 1].message}` : ''}).`;
+    }
+    // The last resort's verdict is the honest status: a hop that answered 429 with a
+    // retry window is a rate limit, not a router outage, and answering 503 for it only
+    // invites a hot retry loop. Only when nothing quoted a limit does the ladder's own
+    // story decide (429 after a limit, 503 otherwise).
+    const lastHopStatus = fallbackFailures.length ? Number(fallbackFailures[fallbackFailures.length - 1].status) : 0;
+    const lastHopLimited = lastHopStatus === 429 || lastHopStatus === 402 || lastHopStatus === 403;
+    sendJson(res, lastHopLimited ? 429 : (status || (sawLimit ? 429 : 503)), { error });
   }
 }
 
@@ -2769,6 +2940,9 @@ function snapshot() {
     // Floor between all-lane identity sweeps (minutes); 0 means every limit. Each
     // provider reports its own last sweep as `allLanesSweptAt`.
     allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000,
+    // How long the last resort retries before the caller is told it could not be
+    // served. 30s unless `fallbackRetrySeconds` says otherwise.
+    fallbackRetryMs: fallbackRetryDeadlineMs(),
     cors: !!config.cors,
     hasProxyKeys: config.proxyKeys.length > 0,
     memory: {
