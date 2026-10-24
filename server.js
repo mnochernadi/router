@@ -268,6 +268,15 @@ function normalizeAccount(a, fallbackName = 'account') {
   // many identities a lane has been through.
   if (Number.isFinite(Number(a.lane)) && Number(a.lane) >= 0) out.lane = Number(a.lane);
   if (Number(a.gen) > 0) out.gen = Number(a.gen);
+  // A signed-in lane's credential and its refresh material are the whole reason it
+  // exists (its own principal, its own daily allowance), so they must round-trip.
+  if (a.signedIn) {
+    out.signedIn = true;
+    if (a.refreshToken) out.refreshToken = String(a.refreshToken);
+    if (Number(a.tokenExpiresAt) > 0) out.tokenExpiresAt = Number(a.tokenExpiresAt);
+    if (a.email) out.email = String(a.email);
+    if (a.orgId) out.orgId = String(a.orgId);
+  }
   return out;
 }
 
@@ -895,13 +904,19 @@ function buildUpstream(provider, account, ctx) {
   // Answer with the id the model actually has, not the UI's "(high)" variant.
   ctx.model = baseModel;
   const payload = ensureFingerprintTools({ ...(ctx.body || {}), model: baseModel });
+    // A lane that signed in is a different *principal* with its own daily allowance,
+    // so it carries its own credential. The anonymous path keeps the literal "public"
+    // - one shared bucket - and the credential goes where the CLI puts it: the body's
+    // `apiKey` (measured in opencode-linux-x64@1.19.4's bundle) as well as the header.
+    const token = usableKey(account.apiKey);
+    if (token) payload.apiKey = token;
     return {
       style, responseStyle: 'openai',
       url: `${String(baseUrl || '').replace(/\/+$/, '')}${ctx.suffix || '/chat/completions'}`,
       headers: {
         'content-type': 'application/json',
         accept: 'text/event-stream',
-        authorization: 'Bearer public',
+        authorization: `Bearer ${token || 'public'}`,
         'user-agent': openCodeUA(provider, account),
         'x-opencode-client': 'cli',
         'x-opencode-session': session,
@@ -1001,6 +1016,12 @@ function buildUpstream(provider, account, ctx) {
 }
 
 async function callUpstream(provider, account, ctx, limits = {}) {
+  // A signed-in lane's access token is short lived; renew it before it is used
+  // rather than discovering the 401 halfway through a ladder.
+  if (account && account.refreshToken && Number(account.tokenExpiresAt) > 0
+    && Number(account.tokenExpiresAt) - Date.now() < SIGNIN_REFRESH_MARGIN_MS) {
+    await refreshSignedInLane(provider, account).catch(() => {});
+  }
   const spec = buildUpstream(provider, account, ctx);
   const controller = new AbortController();
   const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 30_000;
@@ -2376,6 +2397,143 @@ function lendIdentity(provider, tried) {
 // The historical name: the request path, the admin API and the tests use it.
 const renewManagedIdentity = reinstallManagedClient;
 
+// ---------------------------------------------------------------------------
+// Sign-in: add a principal, not another fake identity
+// ---------------------------------------------------------------------------
+
+async function opencodeHttp(pathname, { method = 'GET', token = '', body = null, timeoutMs = 20_000 } = {}) {
+  const headers = { accept: 'application/json', 'user-agent': openCodeUA({ id: 'signin' }, { id: 'signin' }) };
+  if (body) headers['content-type'] = 'application/json';
+  if (token) headers.authorization = `Bearer ${token}`;
+  const res = await fetch(`${OPENCODE_CONSOLE}${pathname}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* html error page */ }
+  return { ok: res.ok, status: res.status, json, text };
+}
+
+/** Store a signed-in principal as a new lane, with its own daily allowance. */
+function addSignedInLane(provider, tokens, user) {
+  const accounts = provider.accounts || (provider.accounts = []);
+  const lane = accounts.length;
+  const acc = newManagedAccount(provider, lane);
+  acc.name = `signed-in-${lane + 1}${user && user.email ? ` (${user.email})` : ''}`;
+  acc.apiKey = tokens.access_token;
+  acc.signedIn = true;
+  acc.refreshToken = tokens.refresh_token || '';
+  acc.tokenExpiresAt = Date.now() + (Number(tokens.expires_in) || 3600) * 1000;
+  if (user && user.email) acc.email = String(user.email);
+  if (user && user.id) acc.orgId = String(user.id);
+  accounts.push(acc);
+  // The lane pool slices to `identityPool`, so the pool has to grow to hold a
+  // signed-in principal - it is a different allowance, not spare capacity.
+  provider.identityPool = Math.min(MANAGED_POOL_MAX, Math.max(managedPoolSize(provider), accounts.length));
+  const as = accountState(provider.id, acc.id);
+  as.uaIndex = OPENCODE_FREE_UA_INDEX;
+  as.sessionId = '';
+  openCodeSession(provider, acc);
+  saveConfig().catch(() => {});
+  persistState();
+  pushEvent({ kind: 'signed-in', pid: provider.id, aid: acc.id, lane, email: acc.email || '' });
+  console.warn(`[proxy] ${provider.id}: signed in as ${acc.email || 'a console account'} - lane ${lane} now serves as its own principal (its own daily allowance)`);
+  return acc;
+}
+
+/** Refresh a signed-in lane's access token before it expires. */
+async function refreshSignedInLane(provider, account) {
+  if (!account || !account.refreshToken) return false;
+  const r = await opencodeHttp('/auth/device/token', {
+    method: 'POST',
+    body: { grant_type: 'refresh_token', refresh_token: account.refreshToken, client_id: OPENCODE_CLIENT_ID },
+  });
+  if (!r.json || !r.json.access_token) {
+    console.warn(`[proxy] ${provider.id}/${account.name}: token refresh failed (HTTP ${r.status}); it will be re-tried on the next request`);
+    return false;
+  }
+  account.apiKey = r.json.access_token;
+  if (r.json.refresh_token) account.refreshToken = r.json.refresh_token;
+  account.tokenExpiresAt = Date.now() + (Number(r.json.expires_in) || 3600) * 1000;
+  saveConfig().catch(() => {});
+  console.warn(`[proxy] ${provider.id}/${account.name}: access token refreshed`);
+  return true;
+}
+
+/**
+ * Run the device flow: ask for a code, then poll until the operator approves it in
+ * the browser. Each approval adds a principal, so N sign-ins are N daily buckets.
+ */
+async function startOpenCodeSignin(provider) {
+  const existing = opencodeSignins.get(provider.id);
+  if (existing && existing.status === 'pending' && existing.expiresAt > now()) return existing;
+  const r = await opencodeHttp('/auth/device/code', { method: 'POST', body: { client_id: OPENCODE_CLIENT_ID } });
+  if (!r.json || !r.json.device_code) {
+    const detail = (r.json && (r.json.error || r.json.message)) || r.text.slice(0, 160) || `HTTP ${r.status}`;
+    throw new Error(`device code request failed: ${detail}`);
+  }
+  const st = {
+    status: 'pending',
+    userCode: String(r.json.user_code || ''),
+    verificationUri: String(r.json.verification_uri_complete || r.json.verification_uri || ''),
+    deviceCode: r.json.device_code,
+    interval: Math.max(2, Number(r.json.interval) || 5),
+    expiresAt: now() + (Number(r.json.expires_in) || 900) * 1000,
+    startedAt: now(),
+    error: '',
+    email: '',
+  };
+  opencodeSignins.set(provider.id, st);
+  pushEvent({ kind: 'signin-started', pid: provider.id });
+  console.warn(`[proxy] ${provider.id}: sign-in code ${st.userCode} - approve it at ${st.verificationUri}`);
+  void pollOpenCodeSignin(provider, st);
+  return st;
+}
+
+async function pollOpenCodeSignin(provider, st) {
+  while (st.status === 'pending' && now() < st.expiresAt) {
+    await new Promise((r) => setTimeout(r, st.interval * 1000));
+    if (st.status !== 'pending') return;
+    let r;
+    try {
+      r = await opencodeHttp('/auth/device/token', {
+        method: 'POST',
+        body: { grant_type: OPENCODE_DEVICE_GRANT, device_code: st.deviceCode, client_id: OPENCODE_CLIENT_ID },
+      });
+    } catch (err) {
+      st.error = err.message;
+      continue;
+    }
+    const j = r.json || {};
+    if (j.access_token) {
+      let user = null;
+      try {
+        const u = await opencodeHttp('/api/user', { token: j.access_token });
+        if (u.json) user = u.json;
+      } catch { /* the token is what matters; the label is a nicety */ }
+      const acc = addSignedInLane(provider, j, user);
+      st.status = 'done';
+      st.email = acc.email || '';
+      st.error = '';
+      return;
+    }
+    if (j.error === 'authorization_pending') continue;
+    if (j.error === 'slow_down') { st.interval += 5; continue; }
+    st.status = 'failed';
+    st.error = String(j.error || j.message || `HTTP ${r.status}`);
+    console.warn(`[proxy] ${provider.id}: sign-in failed: ${st.error}`);
+    return;
+  }
+  if (st.status === 'pending') {
+    st.status = 'expired';
+    st.error = 'the code expired before it was approved';
+    console.warn(`[proxy] ${provider.id}: sign-in code expired`);
+  }
+}
+
 /**
  * Last resort: answer from another provider when the chosen one has nothing left.
  *
@@ -3406,6 +3564,32 @@ const OPENCODE_FREE_UA_INDEX = OPENCODE_FREE_UAS.length - 1;
 const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
+// ---------------------------------------------------------------------------
+// OpenCode Console sign-in (the one lever that changes the principal)
+// ---------------------------------------------------------------------------
+// The anonymous free tier is a single shared daily bucket: address, identity,
+// build, session, project, model and path were all measured against it and none of
+// them moves it (see the free-day ceiling above). What does move it is *who is
+// asking*, and the real CLI changes that with a device-flow sign-in. Taken from the
+// shipped bundle (opencode-linux-x64@1.19.4):
+//
+//   POST {console}/auth/device/code   {client_id:"opencode-cli"}
+//        -> {device_code, user_code, verification_uri_complete, expires_in, interval}
+//   POST {console}/auth/device/token  {grant_type:"urn:ietf:params:oauth:grant-type:device_code",
+//                                      device_code, client_id:"opencode-cli"}
+//        -> {access_token, refresh_token, expires_in} | {error:"authorization_pending"|"slow_down"|...}
+//   POST {console}/auth/device/token  {grant_type:"refresh_token", refresh_token, client_id}
+//   GET  {console}/api/user           Authorization: Bearer <access_token> -> {id, email}
+//
+// and it attaches the credential as `apiKey` in the *body* ("public" only when it
+// has none), which is where a signed-in lane puts it too.
+const OPENCODE_CONSOLE = process.env.OPENCODE_CONSOLE || 'https://opencode.ai/console';
+const OPENCODE_CLIENT_ID = 'opencode-cli';
+const OPENCODE_DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+const SIGNIN_REFRESH_MARGIN_MS = 5 * 60_000;
+/** providerId -> { status, userCode, verificationUri, expiresAt, error, email } */
+const opencodeSignins = new Map();
+
 function openCodeSessionId(timestamp = Date.now(), counter = 1) {
   const mask = (1n << 48n) - 1n;
   const hex = (~(BigInt(timestamp) * 0x1000n + BigInt(counter)) & mask).toString(16).padStart(12, '0');
@@ -3725,6 +3909,42 @@ async function handleAdmin(req, res, url) {
     pushEvent({ kind: 'strategy', pid: provider.id, s: provider.strategy === 'sequential' ? 1 : 0 });
     persistState();
     return sendJson(res, 200, { ok: true, provider: providerSummary(provider) });
+  }
+
+  // ---- sign-in: add a principal (its own daily allowance) ------------------
+  // The anonymous free tier is one shared bucket that no address, identity, build,
+  // session, project, model or path moves. A signed-in principal is a different
+  // bucket, which is why this is the only thing that lifts the ceiling; N sign-ins
+  // are N allowances, and the ladder rotates across them like any other lane.
+  if (method === 'POST' && a === 'provider' && b && c === 'signin' && !d) {
+    const provider = findProvider(b);
+    if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+    try {
+      const st = await startOpenCodeSignin(provider);
+      return sendJson(res, 200, {
+        ok: true, status: st.status, userCode: st.userCode, verificationUri: st.verificationUri,
+        expiresAt: st.expiresAt, intervalSeconds: st.interval,
+      });
+    } catch (err) {
+      return sendJson(res, 502, { error: { message: err.message, type: 'signin_failed' } });
+    }
+  }
+  if (method === 'POST' && a === 'provider' && b && c === 'signin' && d === 'cancel') {
+    opencodeSignins.delete(b);
+    return sendJson(res, 200, { ok: true, cancelled: true });
+  }
+  if (method === 'GET' && a === 'provider' && b && c === 'signin') {
+    const provider = findProvider(b);
+    if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+    const st = opencodeSignins.get(provider.id) || null;
+    const signedIn = (provider.accounts || []).filter((x) => x.signedIn)
+      .map((x) => ({ id: x.id, name: x.name, email: x.email || '', lane: x.lane, expiresInSeconds: Math.max(0, Math.round((Number(x.tokenExpiresAt) - now()) / 1000)) }));
+    return sendJson(res, 200, {
+      ok: true,
+      pending: st ? { status: st.status, userCode: st.userCode, verificationUri: st.verificationUri, expiresAt: st.expiresAt, error: st.error } : null,
+      signedIn,
+      console: OPENCODE_CONSOLE,
+    });
   }
 
   if (method === 'POST' && a === 'provider' && b && c === 'accounts') {
