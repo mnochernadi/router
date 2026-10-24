@@ -102,6 +102,10 @@ class OpenCodeCliDriver {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.running += 1;
+      const dbg = (...parts) => { try { this.log(`[cli-driver] ${parts.join(' ')}`); } catch { /* logging must not break the run */ } };
+      dbg(`spawn pid=${child.pid || '?'} args="${args.join(' ')}" cwd=${this.homeDir}`);
+      child.on('spawn', () => dbg(`spawned pid=${child.pid}`));
+      child.on('exit', (code, signal) => dbg(`exit code=${code} signal=${signal || '-'}`));
       let stdout = '';
       let stderr = '';
       let finished = false;
@@ -141,12 +145,16 @@ class OpenCodeCliDriver {
       child.stdout.on('data', (chunk) => {
         const text = chunk.toString('utf8');
         stdout += text;
+        dbg(`stdout ${Buffer.byteLength(text)}B`);
         if (onDelta) {
           const clean = stripAnsi(text);
           if (clean.trim()) { try { onDelta(clean); } catch { /* caller gone */ } }
         }
       });
-      child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString('utf8');
+        dbg(`stderr ${stripAnsi(chunk.toString('utf8')).slice(0, 120)}`);
+      });
       child.on('error', (err) => { stderr += `spawn error: ${err.message}`; done({ code: -1, signal: 'spawn-error' }); });
       child.on('close', (code, signal) => done({ code, signal }));
       if (signal) {
