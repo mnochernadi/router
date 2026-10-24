@@ -231,6 +231,9 @@ function defaultConfig() {
     cooldownStatuses: DEFAULT_COOLDOWN_STATUSES.slice(),
     retryStatuses: DEFAULT_RETRY_STATUSES.slice(),
     defaultProvider: '',
+    // Exclusive mode: the id (or type) of the only provider this router serves.
+    // See `exclusiveProvider()` -- empty means the normal multi-provider router.
+    exclusiveProvider: '',
     cors: true,
     proxyKeys: [],
     logging: { requests: false },
@@ -337,6 +340,31 @@ function normalizeConfig(cfg) {
     else delete out.allLanesRenewGapMinutes;
   }
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
+  // Exclusive mode: one provider, and nothing else in the router.
+  //
+  // `exclusiveProvider` is a hard lock, not a preference. A deployment whose
+  // client asks for one free tier (`opencode-free/deepseek-v4.1-flash-free`)
+  // must never be answered by a different vendor, so at load time every other
+  // provider is dropped and the cross-provider fallback list is thrown away.
+  // The request path enforces the same rule again (resolveProvider refuses an
+  // unknown provider prefix instead of picking a healthy one), so a config that
+  // is edited behind the router's back still cannot switch the answer.
+  const locked = String(out.exclusiveProvider || '').trim();
+  if (locked) {
+    const target = out.providers.find((p) => p.id === locked) || out.providers.find((p) => p.type === locked);
+    if (!target) {
+      console.warn(`[config] exclusiveProvider "${locked}" is not a configured provider; ignoring the lock`);
+      delete out.exclusiveProvider;
+    } else {
+      const dropped = out.providers.filter((p) => p !== target).map((p) => p.id);
+      if (dropped.length) console.warn(`[config] exclusive mode on "${target.id}": ignoring provider(s) ${dropped.join(', ')}`);
+      if (target.fallbackProviders) console.warn(`[config] exclusive mode on "${target.id}": cross-provider fallbacks are not used`);
+      out.exclusiveProvider = target.id;
+      out.providers = [target];
+      delete target.fallbackProviders;
+      out.defaultProvider = target.id;
+    }
+  }
   if (process.env.ADMIN_KEY) out.adminKey = process.env.ADMIN_KEY;
   return out;
 }
@@ -401,6 +429,19 @@ async function saveConfig() {
 
 function findProvider(id) {
   return config.providers.find((p) => p.id === id) || null;
+}
+
+/**
+ * The one provider this router is locked to, or null.
+ *
+ * Set by `exclusiveProvider` in config.json. When it is set the router serves
+ * that provider and only that provider: the loader drops the others, a request
+ * naming another provider is refused, the cross-provider fallback is off, and
+ * the admin API will not add one back. The point is a client that pins
+ * `opencode-free/<model>` and must never be answered by another vendor.
+ */
+function exclusiveProvider() {
+  return config.exclusiveProvider ? findProvider(config.exclusiveProvider) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -742,19 +783,28 @@ function providerSummary(provider) {
 // ---------------------------------------------------------------------------
 
 function resolveProvider(body, req) {
+  const locked = exclusiveProvider();
   const hinted = req.headers['x-router-provider'];
   if (hinted) {
     const byId = findProvider(String(hinted));
     if (byId) return { provider: byId, model: body?.model };
     const byType = config.providers.find((p) => p.type === hinted);
     if (byType) return { provider: byType, model: body?.model };
+    // Exclusive mode: a header naming a provider that is not configured is an
+    // error, never a hint to pick somebody else.
+    if (locked) return { provider: null, model: body?.model, unknown: String(hinted) };
   }
   const model = typeof body?.model === 'string' ? body.model : '';
   if (model.includes('/')) {
     const [prefix, ...rest] = model.split('/');
     const byId = findProvider(prefix);
     if (byId) return { provider: byId, model: rest.join('/') };
+    // `vendor/model` with no such vendor: in exclusive mode this is the exact
+    // shape that used to fall through to "first healthy provider" and get the
+    // answer from a different vendor. Refuse it instead.
+    if (locked) return { provider: null, model, unknown: prefix };
   }
+  if (locked) return { provider: locked, model };
   if (config.defaultProvider) {
     const byId = findProvider(config.defaultProvider);
     if (byId) return { provider: byId, model };
@@ -1967,7 +2017,7 @@ function allLanesRenewGapMs() {
  * rebuilding are left to finish, they are getting a new identity anyway.
  */
 function queueAllLaneRefreshes(provider, reason) {
-  if (!isManagedProvider(provider)) return 0;
+  if (!isManagedProvider(provider)) return { swept: false, queued: 0 };
   // Per provider, not global: one provider sitting on a dry ceiling must not
   // suppress another provider's sweep. Kept in the provider's runtime state so it
   // survives a restart instead of granting a free sweep on every boot.
@@ -1976,7 +2026,7 @@ function queueAllLaneRefreshes(provider, reason) {
   const gapMs = allLanesRenewGapMs();
   if (gapMs > 0 && now() - lastSweep < gapMs) {
     console.warn(`[proxy] ${provider.id}: all-lane identity sweep skipped (${Math.round((gapMs - (now() - lastSweep)) / 1000)}s of the ${Math.round(gapMs / 1000)}s floor left); rebuilding the reporting lane only`);
-    return 0;
+    return { swept: false, queued: 0 };
   }
   ensureManagedAccount(provider);
   // Stamped before the loop: one request must not sweep twice when a second lane
@@ -1996,7 +2046,7 @@ function queueAllLaneRefreshes(provider, reason) {
     console.warn(`[proxy] ${provider.id}: limit hit - minting a new identity on ${queued}/${lanes.length} lane(s), each on a fresh exit (${reason})`);
   }
   persistState();
-  return queued;
+  return { swept: true, queued };
 }
 
 /**
@@ -2034,6 +2084,10 @@ const renewManagedIdentity = reinstallManagedClient;
  * answer is never silently mislabelled.
  */
 function providerFallbackHops(provider) {
+  // Exclusive mode: never answer from another vendor, whatever the config says.
+  // The loader already strips the list; this is the second door, for a config
+  // that is edited while the router runs.
+  if (config.exclusiveProvider) return [];
   const list = (provider && Array.isArray(provider.fallbackProviders) && provider.fallbackProviders.length)
     ? provider.fallbackProviders
     : (Array.isArray(config.fallbackProviders) ? config.fallbackProviders : []);
@@ -2112,9 +2166,17 @@ async function handleProxy(req, res, url) {
   // made a 3MB agent turn sit for 95s before the fallback was even tried.
   freeLimitDeadline += Math.min(contextMs, PROMPT_BUDGET_LADDER_MAX_MS);
 
-  const { provider, model } = resolveProvider(body, req);
+  const { provider, model, unknown } = resolveProvider(body, req);
   if (!provider) {
     state.totals.failed += 1;
+    if (unknown) {
+      return sendJson(res, 404, {
+        error: {
+          message: `this router serves only "${config.exclusiveProvider}"; "${unknown}" is not configured, and the request will not be answered by another provider`,
+          type: 'router_unknown_provider',
+        },
+      });
+    }
     return sendJson(res, 503, {
       error: {
         message: config.providers.length
@@ -2202,13 +2264,35 @@ async function handleProxy(req, res, url) {
       : Math.max(1, (provider.accounts || []).length));
   let sawLimit = false;
   let laneWaitDone = false;
+  // One all-lane sweep per request, whatever `allLanesRenewGapMinutes` says. A single
+  // ladder can end in "spent" on several lanes in a row, and four new identities per
+  // lane-ending is a mint storm, not a fresh start: the point of the rule is that the
+  // *next* request finds four fresh identities, which one sweep already achieves.
+  // The configured floor then governs how often a new request may sweep again.
+  let allLanesSweptHere = false;
+  const sweepAllLanes = (why) => {
+    if (allLanesSweptHere) return 0;
+    const { swept, queued } = queueAllLaneRefreshes(provider, why);
+    if (swept) allLanesSweptHere = true;
+    return queued;
+  };
+  // Cross-provider last resort, resolved once: in exclusive mode this is always
+  // empty, and that changes how a known-dry ceiling is treated just below.
+  const fallbackHops = providerFallbackHops(provider);
   // The ceiling is upstream and account-wide, so while the pool is resting a fresh
   // ladder only re-learns the same 429 and costs the caller its first byte - which
   // is exactly what made a big prompt look like "the router is broken". Go straight
   // to the configured fallback hops and leave the free tier alone until it recovers.
-  const freeCeilingDry = style === 'opencode-free' && freeDry.until > now();
+  //
+  // With nowhere to hand the request to (exclusive mode, or no fallback configured)
+  // skipping the ladder is not an optimisation, it is a guaranteed failure: the
+  // caller asked for this provider, so prove the ceiling again instead - that is
+  // what makes the request start working the moment the allowance returns.
+  const freeCeilingDry = style === 'opencode-free' && freeDry.until > now() && fallbackHops.length > 0;
   if (freeCeilingDry) {
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - skipping the ladder, answering from the fallback`);
+  } else if (style === 'opencode-free' && freeDry.until > now()) {
+    console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - trying it anyway, there is no fallback provider to hand the request to`);
   }
 
   for (let attempt = 1; !freeCeilingDry && attempt <= maxAttempts; attempt += 1) {
@@ -2407,7 +2491,7 @@ async function handleProxy(req, res, url) {
             // by lane. This is the path a dry deployment takes most often, because a
             // 6-8s `freeLadderBudgetSeconds` ends the ladder here rather than at the
             // per-lane handover below.
-            queueAllLaneRefreshes(provider, `HTTP ${upstream.status} - ladder budget spent`);
+            sweepAllLanes(`HTTP ${upstream.status} - ladder budget spent`);
             break;
           }
           if (freeDry.until > now()) {
@@ -2416,7 +2500,7 @@ async function handleProxy(req, res, url) {
             // pool still has to refill itself for the moment the ceiling lifts, so
             // the background rebuild is kicked here too - resting is not sleeping.
             kickPool(`dry free ceiling for ${provider.id}`);
-            console.warn(`[proxy] ${provider.id}/${account.name}: free ceiling is dry upstream - not burning exit ${call.exit ? call.exit.id : 'direct'}; answering from the fallback`);
+            console.warn(`[proxy] ${provider.id}/${account.name}: free ceiling is dry upstream - not burning exit ${call.exit ? call.exit.id : 'direct'}; ${fallbackHops.length ? 'answering from the fallback' : 'reporting it to the client'}`);
             break;
           }
           const laneKey = laneKeyOf(account);
@@ -2545,7 +2629,7 @@ async function handleProxy(req, res, url) {
           // on four fresh identities instead of spending itself proving the other
           // three are spent as well. Throttled: a cold burst must not turn one dry
           // ceiling into a stream of new identities.
-          const swept = queueAllLaneRefreshes(provider, `HTTP ${upstream.status} - lane spent`);
+          const swept = sweepAllLanes(`HTTP ${upstream.status} - lane spent`);
           const queued = swept > 0
             ? true
             : queueLaneRefresh(provider, account, `HTTP ${upstream.status} - lane spent`);
@@ -2628,9 +2712,10 @@ async function handleProxy(req, res, url) {
   }
 
   // Configured cross-provider fallback, tried only when nothing on this provider
-  // could answer (every model out of allowance or every account cooling).
+  // could answer (every model out of allowance or every account cooling). Empty
+  // in exclusive mode, so the caller gets this provider's own error instead.
   if (!res.headersSent) {
-    for (const hop of providerFallbackHops(provider)) {
+    for (const hop of fallbackHops) {
       if (res.headersSent) break;
       if (await relayViaFallback(hop, body, res)) return;
     }
@@ -2671,6 +2756,9 @@ function snapshot() {
     port: config.port,
     publicBaseUrl: process.env.ROUTER_PUBLIC_URL || '',
     defaultProvider: config.defaultProvider,
+    // Exclusive mode: the dashboard shows the lock so a "why can't I add a
+    // provider" question answers itself.
+    exclusiveProvider: config.exclusiveProvider || '',
     cooldownHours: clampHours(config.cooldownHours),
     cooldownStatuses: config.cooldownStatuses,
     // Free-tier ladder dial (seconds); 25 is what an unset config behaves as, and
@@ -3018,6 +3106,20 @@ async function handleAdmin(req, res, url) {
     const body = await readJsonBody(req, 12 * 1024 * 1024);
     const converted = convertBackup(body);
     if (converted.errors.length) return sendJson(res, 400, { error: { message: converted.errors.join('; '), type: 'import_failed' } });
+    // Exclusive mode: an import may restore accounts, never a second vendor.
+    if (config.exclusiveProvider) {
+      const all = Array.isArray(converted.config.providers) ? converted.config.providers : [];
+      const kept = all.filter((p) => p.id === config.exclusiveProvider);
+      const dropped = all.filter((p) => p.id !== config.exclusiveProvider).map((p) => p.id);
+      if (dropped.length) converted.warnings.push(`exclusive mode: ignored provider(s) ${dropped.join(', ')}`);
+      if (converted.replace && !kept.length) {
+        return sendJson(res, 400, {
+          error: { message: `this router is locked to "${config.exclusiveProvider}"; the backup has no such provider and cannot replace the config`, type: 'provider_locked' },
+        });
+      }
+      converted.config.providers = kept;
+      converted.summary.providers = kept.length;
+    }
     if (converted.replace) config = normalizeConfig({ ...config, ...converted.config });
     else mergeImported(converted.config);
     await saveConfig();
@@ -3037,6 +3139,17 @@ async function handleAdmin(req, res, url) {
       }
     }
     const provider = normalizeProvider({ ...seeded, ...body });
+    // Exclusive mode: the router is locked to one provider. Adding a second one
+    // would put another vendor back in the answer path, which is the bug this
+    // mode exists to prevent.
+    if (config.exclusiveProvider && provider.id !== config.exclusiveProvider) {
+      return sendJson(res, 409, {
+        error: {
+          message: `this router is locked to "${config.exclusiveProvider}" (exclusiveProvider in config.json); no other provider can be added`,
+          type: 'provider_locked',
+        },
+      });
+    }
     if (existing && !body.force) {
       return sendJson(res, 409, { error: { message: `provider "${provider.id}" already exists`, type: 'conflict' } });
     }
@@ -3395,6 +3508,14 @@ async function handleAdmin(req, res, url) {
       return sendJson(res, 200, { ok: true, provider: providerSummary(provider) });
     }
     if (method === 'DELETE') {
+      if (config.exclusiveProvider === provider.id) {
+        return sendJson(res, 409, {
+          error: {
+            message: `"${provider.id}" is the locked provider (exclusiveProvider); it cannot be deleted. Clear exclusiveProvider in config.json first.`,
+            type: 'provider_locked',
+          },
+        });
+      }
       config.providers = config.providers.filter((p) => p.id !== provider.id);
       dropProviderState(provider.id);
       if (config.defaultProvider === provider.id) config.defaultProvider = '';
@@ -3421,7 +3542,7 @@ async function handleAdmin(req, res, url) {
     const body = await readJsonBody(req);
     if (body.adminKey) config.adminKey = String(body.adminKey);
     if (body.cooldownHours != null) config.cooldownHours = clampHours(body.cooldownHours);
-    if (body.defaultProvider != null) config.defaultProvider = String(body.defaultProvider);
+    if (body.defaultProvider != null && !config.exclusiveProvider) config.defaultProvider = String(body.defaultProvider);
     if (body.cors != null) config.cors = !!body.cors;
     // Clearing inbound auth must be explicit: the dashboard never receives the
     // stored keys, so an empty list means "nothing typed", not "remove them".

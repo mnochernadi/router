@@ -1614,6 +1614,130 @@ async function memOf() {
     }
   }
 
+  // 32. exclusive mode: one provider, and nothing else in the router. A client
+  //     that pins `opencode-free/<model>` must never be answered by another
+  //     vendor - not through a leftover `fallbackProviders` entry, not through a
+  //     model prefix that names a provider which is not configured, and not
+  //     through the "first healthy provider" fallthrough.
+  {
+    const exTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-exclusive-'));
+    let exChild = null;
+    const portProbe = net.createServer();
+    try {
+      await new Promise((r) => portProbe.listen(0, '127.0.0.1', r));
+      const EX_PORT = portProbe.address().port;
+      await new Promise((r) => portProbe.close(() => r()));
+      const exCfg = {
+        adminKey: 'test-admin-key', host: '127.0.0.1', port: EX_PORT, cooldownHours: 12,
+        cooldownStatuses: [429, 402, 403], retryStatuses: [500, 502, 503, 504],
+        defaultProvider: '', cors: true, proxyKeys: [],
+        // 3s of ladder: enough to prove the tier is white-listed again, short
+        // enough that a regression cannot hold the suite for the 25s default.
+        freeLadderBudgetSeconds: 3,
+        exclusiveProvider: 'opencode-free',
+        providers: [
+          {
+            id: 'opencode-free', name: 'Locked Free Tier', type: 'opencode-free',
+            baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin',
+            timeoutMs: 10000, proxy: 'direct', identityPool: 1, freeFallback: false,
+            accounts: [{ id: 'ex-1', name: 'keyless', apiKey: '', enabled: true }],
+            // Deliberate leftover: it must be dropped at load, not used.
+            fallbackProviders: [{ provider: 'pollinations', model: 'openai-fast' }],
+          },
+          {
+            id: 'pollinations', name: 'Other Vendor', type: 'custom',
+            baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`, strategy: 'sequential', timeoutMs: 10000,
+            accounts: [{ id: 'pl-1', name: 'other-vendor', apiKey: 'key-ok', enabled: true }],
+          },
+        ],
+      };
+      const exConfig = path.join(exTmp, 'config.json');
+      fs.writeFileSync(exConfig, JSON.stringify(exCfg, null, 2));
+      exChild = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+        cwd: REPO,
+        env: { ...process.env, ROUTER_CONFIG: exConfig, ROUTER_STATE: path.join(exTmp, 'state.json'), PORT: String(EX_PORT), HOST: '127.0.0.1', FB_API_HOST: `http://127.0.0.1:${MOCK_PORT}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let exLog = '';
+      exChild.stdout.on('data', (d) => { exLog += d.toString(); });
+      exChild.stderr.on('data', (d) => { exLog += d.toString(); });
+      const exUrl = (p) => `http://127.0.0.1:${EX_PORT}${p}`;
+      const exChat = async (body, headers = {}) => {
+        const r = await fetch(exUrl('/v1/chat/completions'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+        });
+        return { status: r.status, headers: r.headers, text: await r.text() };
+      };
+
+      let exUp = false;
+      for (let i = 0; i < 60; i++) {
+        try { const r = await fetch(exUrl('/health')); if (r.ok) { exUp = true; break; } } catch {}
+        await sleep(200);
+      }
+      check('exclusive: a router locked to one provider boots', exUp, exLog.slice(-400));
+
+      if (exUp) {
+        const snap = await (await fetch(exUrl('/admin/api/state'), { headers: ADMIN })).json();
+        check('exclusive: the lock is exposed and every other provider is dropped at load',
+          snap.exclusiveProvider === 'opencode-free'
+          && snap.providers.length === 1
+          && snap.providers[0].id === 'opencode-free',
+          `locked=${snap.exclusiveProvider} providers=${snap.providers.map((p) => p.id).join(',')}`);
+
+        const ok = await exChat({ model: 'opencode-free/big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] });
+        let okBody = {};
+        try { okBody = JSON.parse(ok.text); } catch { /* reported below */ }
+        check('exclusive: the pinned model is served by the locked provider',
+          ok.status === 200 && ok.headers.get('x-router-provider') === 'opencode-free'
+          && okBody.choices?.[0]?.message?.content === 'OC0 OC1 OC2 OC3 ',
+          `${ok.status} provider=${ok.headers.get('x-router-provider')} body=${ok.text.slice(0, 140)}`);
+
+        // The exact live failure: a model naming a provider that is not in the
+        // router, and a header naming one. Both used to be answered by whoever
+        // was healthy; both must be refused now.
+        const byModel = await exChat({ model: 'pollinations/openai-fast', stream: false, messages: [{ role: 'user', content: 'ping' }] });
+        let byModelBody = {};
+        try { byModelBody = JSON.parse(byModel.text); } catch { /* reported below */ }
+        check('exclusive: a model prefix naming an unconfigured provider is refused, not routed',
+          byModel.status === 404 && byModelBody.error?.type === 'router_unknown_provider',
+          `${byModel.status} ${byModel.text.slice(0, 160)}`);
+
+        const byHeader = await exChat({ model: 'big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] }, { 'x-router-provider': 'pollinations' });
+        check('exclusive: a header naming another provider is refused too',
+          byHeader.status === 404, `${byHeader.status} ${byHeader.text.slice(0, 160)}`);
+
+        const add = await fetch(exUrl('/admin/api/providers'), {
+          method: 'POST', headers: ADMIN,
+          body: JSON.stringify({ id: 'pollinations', name: 'Other Vendor', type: 'custom', baseUrl: 'https://example.invalid/v1' }),
+        });
+        const addBody = await add.json();
+        check('exclusive: the admin API refuses to put a second provider back',
+          add.status === 409 && addBody.error?.type === 'provider_locked', `${add.status} ${JSON.stringify(addBody).slice(0, 160)}`);
+
+        // The free tier is dry: with `freeFallback: false` there is no model walk
+        // and no cross-provider hop, so the client gets this provider's own 429 -
+        // and the tier is tried again on the next request instead of being skipped
+        // because a previous ladder marked the ceiling dry.
+        const before = fb.modelQuota429;
+        fb.modelQuotaExhausted = ['big-pickle'];
+        const dry1 = await exChat({ model: 'opencode-free/big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] });
+        const dry2 = await exChat({ model: 'opencode-free/big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] });
+        fb.modelQuotaExhausted = [];
+        check('exclusive: a dry free model fails with this provider\'s own 429, never a substitution',
+          dry1.status === 429 && dry1.headers.get('x-router-provider') !== 'pollinations'
+          && !dry1.text.includes('openai-fast') && !dry2.text.includes('openai-fast'),
+          `status=${dry1.status} provider=${dry1.headers.get('x-router-provider')} body=${dry1.text.slice(0, 200)}`);
+        check('exclusive: a known-dry ceiling is tried again instead of being skipped (no fallback to hand over to)',
+          fb.modelQuota429 - before >= 2, `tier attempts=${fb.modelQuota429 - before}`);
+      }
+    } finally {
+      if (exChild) exChild.kill('SIGTERM');
+      fs.rmSync(exTmp, { recursive: true, force: true });
+    }
+  }
+
   console.log('\n==================== RESULTS ====================');
   console.log(results.join('\n'));
   console.log(`\n  ${pass} passed, ${fail} failed`);
