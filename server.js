@@ -2624,10 +2624,11 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
 
   if (!result.ok) {
     state.totals.failed += 1;
+    console.warn(`[cli] ${provider.id}/${baseModel} failed: code=${result.code} signal=${result.signal || '-'} ms=${result.ms} ${result.stderr || ''}`);
     if (!res.headersSent) {
       return sendJson(res, 502, {
         error: {
-          message: `the opencode CLI could not answer: ${result.error || `exit ${result.code}`}`,
+          message: `the opencode CLI could not answer: ${result.error || `exit ${result.code}`}${result.stderr ? ` - ${result.stderr}` : ''}`,
           type: 'router_cli_failed',
           transport: 'opencode-cli',
         },

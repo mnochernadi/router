@@ -120,13 +120,20 @@ class OpenCodeCliDriver {
         const limit = LIMIT_RE.test(combined);
         const auth = !limit && AUTH_RE.test(combined);
         const text = cleanAnswer(stdout);
+        // Keep the tail of whatever the CLI said: an unexplained failure is the one
+        // thing this transport must never report, since the binary is the whole point.
+        const detail = stripAnsi(combined).split('\n').map((l) => l.trim()).filter(Boolean).slice(-3).join(' | ');
         resolve({
           ok: !limit && !auth && (text.length > 0 || (extra.code === 0 && !stderr.trim())),
           text,
           limit,
           auth,
           code: typeof extra.code === 'number' ? extra.code : -1,
-          error: limit ? stripAnsi(combined).split('\n').filter(Boolean).pop() || 'free allowance spent' : (auth ? 'the CLI reports no usable credential' : ''),
+          signal: extra.signal || '',
+          stderr: detail.slice(0, 300),
+          error: limit
+            ? (detail || 'free allowance spent')
+            : (auth ? 'the CLI reports no usable credential' : (extra.signal ? `the CLI was killed (${extra.signal})` : (extra.code ? `the CLI exited ${extra.code}` : ''))),
           ms: Date.now() - started,
         });
       };
@@ -140,8 +147,8 @@ class OpenCodeCliDriver {
         }
       });
       child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-      child.on('error', (err) => { stderr += `spawn error: ${err.message}`; done({ code: -1 }); });
-      child.on('close', (code) => done({ code }));
+      child.on('error', (err) => { stderr += `spawn error: ${err.message}`; done({ code: -1, signal: 'spawn-error' }); });
+      child.on('close', (code, signal) => done({ code, signal }));
       if (signal) {
         const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
         if (signal.aborted) onAbort();
