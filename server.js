@@ -40,6 +40,7 @@ const { Readable, Transform } = require('node:stream');
 const { ProxyManager } = require('./proxy-manager');
 const { proxiedRequest } = require('./proxy-client');
 const { FreebuffDriver } = require('./freebuff-driver');
+const { OpenCodeCliDriver } = require('./opencode-cli-driver');
 
 // ---------------------------------------------------------------------------
 // Paths and static defaults
@@ -84,6 +85,17 @@ const PROVIDER_TYPES = {
   // freebuff / Codebuff: OpenAI-shaped but signed, session-bound and geo-gated.
   // The driver owns the whole handshake, so this style always wants a proxy exit.
   freebuff: { label: 'freebuff (Codebuff)', baseUrl: 'https://www.codebuff.com', style: 'freebuff', keyOptional: true },
+  // The genuine CLI as the transport. The free tier's gate is on the *client*: the
+  // exact request the real binary sends answers 429 from node/bun/curl/browser
+  // fingerprints and 200 from the binary itself (measured on this box), so the only
+  // keyless way through is to let the binary make the call. No key, no account.
+  'opencode-cli': {
+    label: 'OpenCode CLI (keyless, uses the real client)',
+    baseUrl: '',
+    style: 'opencode-cli',
+    keyless: true,
+    defaultTimeoutMs: 300_000,
+  },
   custom: { label: 'OpenAI-compatible', baseUrl: '', style: 'openai' },
 };
 
@@ -311,6 +323,10 @@ function normalizeProvider(p) {
       : undefined,
     // Cross-provider last resort: [{ provider: 'pollinations', model: 'openai' }]
     fallbackProviders: Array.isArray(p.fallbackProviders) && p.fallbackProviders.length ? p.fallbackProviders : undefined,
+    // opencode-cli transport: where the genuine binary lives and how to run it.
+    cliPath: p.cliPath ? String(p.cliPath) : undefined,
+    cliHome: p.cliHome ? String(p.cliHome) : undefined,
+    cliArgs: Array.isArray(p.cliArgs) && p.cliArgs.length ? p.cliArgs.map(String) : undefined,
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     // Free-tier identity lanes: how many identities run in parallel, each with
@@ -430,6 +446,8 @@ let config = defaultConfig();
 // no xray binary and no freebuff accounts the router behaves exactly as before.
 let proxies = null;
 let freebuff = null;
+// The genuine CLI, when a provider uses the `opencode-cli` transport.
+let opencodeCli = null;
 const DATA_DIR = path.dirname(STATE_PATH);
 
 // Fingerprint of what is actually running: a "Frankenstein" checkout (files
@@ -2429,12 +2447,198 @@ function recycleLane(provider, account, reason) {
   return { account: fresh, lane: Number(lane), burnedExit: burned, exit: next ? (next.exitIp || next.id || '') : '' };
 }
 
+// ---------------------------------------------------------------------------
+// The genuine CLI as the transport (see opencode-cli-driver.js for the why)
+// ---------------------------------------------------------------------------
+
+/** The conversation as one prompt: the CLI is an agent and takes a message. */
+function promptFromMessages(body) {
+  const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+  const out = [];
+  for (const m of msgs) {
+    const role = String((m && m.role) || 'user');
+    let content = '';
+    if (typeof m.content === 'string') content = m.content;
+    else if (Array.isArray(m.content)) {
+      content = m.content.map((p) => (p && (p.text || p.content)) || '').filter(Boolean).join('\n');
+    }
+    if (!content.trim()) continue;
+    if (role === 'system') out.push(content.trim());
+    else out.push(`${role === 'assistant' ? 'Assistant' : 'User'}: ${content.trim()}`);
+  }
+  // The last user turn is the message to answer; earlier turns become context.
+  if (out.length > 1 && /^User: /.test(out[out.length - 1])) {
+    const last = out.pop();
+    return `${out.join('\n\n')}\n\n${last.replace(/^User: /, '')}`;
+  }
+  return out.join('\n\n');
+}
+
+/** Milliseconds to the next 00:00 UTC - the instant the free allowance returns. */
+function msToNextUtcMidnight() {
+  const d = new Date();
+  const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+  return Math.max(60_000, next - Date.now());
+}
+
+/** The default location of the router's own copy of the CLI. */
+function defaultCliPath() {
+  return String(process.env.ROUTER_OPENCODE_CLI || config.cliPath || '/opt/llm-router/bin/opencode');
+}
+
+/** One driver, reused unless the provider points somewhere else. */
+function cliDriverFor(provider) {
+  const binPath = String(provider.cliPath || defaultCliPath());
+  const homeDir = String(provider.cliHome || path.join(DATA_DIR, 'oc-cli-home'));
+  const args = Array.isArray(provider.cliArgs) ? provider.cliArgs.map(String) : [];
+  if (opencodeCli && opencodeCli.binPath === binPath && opencodeCli.homeDir === homeDir
+    && JSON.stringify(opencodeCli.args) === JSON.stringify(args)) return opencodeCli;
+  return new OpenCodeCliDriver({ binPath, homeDir, args, log: (m) => console.warn(m) });
+}
+
+function cliStreamChunk(model, text, finish = null) {
+  return `data: ${JSON.stringify({
+    id: 'chatcmpl-cli',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta: finish ? {} : { content: text }, finish_reason: finish }],
+  })}\n\n`;
+}
+
+/**
+ * Serve a request by running the genuine CLI.
+ *
+ * The CLI carries its own free allowance: when it says the limit is reached, that
+ * is a *day-scale* answer with the same 00:00 UTC reset the API reports, so the
+ * tier is parked (no exit burned, no identity minted) and the client is told the
+ * instant, instead of being handed a generic 503.
+ */
+async function handleOpenCodeCli(provider, body, model, req, res) {
+  const t0 = now();
+  const baseModel = stripThinkingSuffix(model || '');
+  state.totals.requests += 1;
+  const driver = cliDriverFor(provider);
+
+  const parked = freeDry.until > now() ? freeDry.until : 0;
+  if (parked) {
+    state.totals.failed += 1;
+    const wait = Math.max(1, Math.round((parked - now()) / 1000));
+    return sendJson(res, 429, {
+      error: {
+        message: `the OpenCode free allowance is spent; it returns at ${new Date(parked).toISOString()}`,
+        type: 'router_free_day_ceiling',
+        retryAfterSeconds: wait,
+      },
+    }, { 'retry-after': String(wait) });
+  }
+  if (!driver.available()) {
+    state.totals.failed += 1;
+    return sendJson(res, 503, {
+      error: {
+        message: `the OpenCode CLI is not installed at ${driver.binPath} - install it (install.sh --with-opencode-cli) or set cliPath on this provider`,
+        type: 'router_cli_missing',
+      },
+    });
+  }
+
+  const prompt = promptFromMessages(body) || 'hello';
+  const wantsStream = !!(body && body.stream);
+  const headers = baseResponseHeaders(200, wantsStream ? 'text/event-stream' : 'application/json; charset=utf-8', provider);
+  headers['x-router-account'] = 'cli';
+  headers['x-router-model'] = baseModel;
+  headers['x-router-transport'] = 'opencode-cli';
+  const streamHeaders = { ...headers, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' };
+
+  // The CLI honours HTTPS_PROXY (measured), so the exit pool still applies to it.
+  const env = {};
+  if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
+    const picked = proxies.pick(provider);
+    if (picked && picked.proxy) env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = `http://${picked.proxy.host}:${picked.proxy.port}`;
+  }
+
+  const controller = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+  const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 300_000;
+
+  const result = await driver.run({
+    model: baseModel,
+    prompt,
+    timeoutMs,
+    env,
+    signal: controller.signal,
+    onDelta: wantsStream
+      ? (delta) => {
+        if (res.writableEnded) return;
+        if (!res.headersSent) res.writeHead(200, streamHeaders);
+        res.write(cliStreamChunk(baseModel, delta));
+      }
+      : null,
+  });
+
+  if (result.limit || result.auth) {
+    const wait = msToNextUtcMidnight();
+    parkFreeTier(provider.id, wait, result.error || 'the opencode CLI reports the free allowance is spent');
+    state.totals.failed += 1;
+    if (!res.headersSent) {
+      const secs = Math.max(1, Math.round(wait / 1000));
+      return sendJson(res, 429, {
+        error: {
+          message: `the OpenCode free allowance is spent (${result.error || 'free usage limit reached'}); it returns at ${new Date(now() + wait).toISOString()}`,
+          type: 'router_free_day_ceiling',
+          retryAfterSeconds: secs,
+        },
+      }, { 'retry-after': String(secs) });
+    }
+    if (!res.writableEnded) res.destroy();
+    return;
+  }
+
+  if (!result.ok) {
+    state.totals.failed += 1;
+    if (!res.headersSent) {
+      return sendJson(res, 502, {
+        error: {
+          message: `the opencode CLI could not answer: ${result.error || `exit ${result.code}`}`,
+          type: 'router_cli_failed',
+          transport: 'opencode-cli',
+        },
+      });
+    }
+    if (!res.writableEnded) res.destroy();
+    return;
+  }
+
+  state.totals.success += 1;
+  if (wantsStream) {
+    state.totals.streamed += 1;
+    if (!res.headersSent) res.writeHead(200, streamHeaders);
+    res.write(cliStreamChunk(baseModel, result.text || ''));
+    res.write(cliStreamChunk(baseModel, '', 'stop'));
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } else {
+    const payload = JSON.stringify({
+      id: 'chatcmpl-cli',
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: baseModel,
+      choices: [{ index: 0, message: { role: 'assistant', content: result.text || '' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    headers['content-length'] = Buffer.byteLength(payload);
+    res.writeHead(200, headers);
+    res.end(payload);
+  }
+  state.totals.bytesOut += Buffer.byteLength(result.text || '');
+  if (typeof reqLog === 'function') reqLog(`[cli] ${provider.id}/${baseModel} ok ${now() - t0}ms`);
+}
+
 /**
  * Recycle every lane the operator asked for, then ask the edge once.
  * Shared by `/admin/api/provider/<id>/recycle` and the pool-prefixed alias
  * `/admin/api/proxies/provider/<id>/recycle`, so either guess works.
- */
-async function handleRecycle(req, res, provider) {
+ */async function handleRecycle(req, res, provider) {
   if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
   const payload = await readJsonBody(req).catch(() => ({}));
   const enabled = (provider.accounts || []).filter((a) => a.enabled !== false);
@@ -2825,6 +3029,13 @@ async function handleProxy(req, res, url) {
       },
     });
   }
+  // The CLI transport is a client, not an account: it needs no identity lane, and
+  // its own free allowance is the only quota in play. Handled before the account
+  // machinery below, which would otherwise ask it for an account it never has.
+  if ((PROVIDER_TYPES[provider.type] || {}).style === 'opencode-cli') {
+    return handleOpenCodeCli(provider, body, model, req, res);
+  }
+
   if (!(provider.accounts || []).length) {
     // A managed provider created a second ago has no identity yet; mint it here
     // so "add provider, send a request" works instead of answering 503.
@@ -4740,6 +4951,14 @@ function boot() {
   }
   freebuff = new FreebuffDriver({ stateFile: path.join(DATA_DIR, 'freebuff-state.json'), log: (m) => console.warn(m) });
   freebuff.init();
+  // The CLI transport keeps a HOME of its own next to the state files, so it never
+  // shares credentials or sessions with anything else on the box.
+  opencodeCli = new OpenCodeCliDriver({
+    binPath: defaultCliPath(),
+    homeDir: path.join(DATA_DIR, 'oc-cli-home'),
+    args: Array.isArray(config.cliArgs) ? config.cliArgs.map(String) : [],
+    log: (m) => console.warn(m),
+  });
   server.listen(config.port, config.host, () => {
     const mem = process.memoryUsage();
     const where = `${config.host}:${config.port}`;

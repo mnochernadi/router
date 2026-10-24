@@ -1776,6 +1776,98 @@ async function memOf() {
     }
   }
 
+  // 28. The genuine-CLI transport (`opencode-cli`): the router runs the real
+  //     binary because the free tier's gate is on the client, not the request.
+  //     Offline here - a fixture stands in for the binary.
+  {
+    const cliTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-cli-'));
+    let cliChild = null;
+    const probe = net.createServer();
+    try {
+      await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+      const CLI_PORT = probe.address().port;
+      await new Promise((r) => probe.close(() => r()));
+      const fake = path.join(REPO, 'test', 'fixtures', 'fake-opencode-cli.js');
+      const cliCfg = {
+        adminKey: 'test-admin-key', host: '127.0.0.1', port: CLI_PORT, cooldownHours: 12,
+        cooldownStatuses: [429, 402, 403], retryStatuses: [500, 502, 503, 504],
+        defaultProvider: '', cors: true, proxyKeys: [],
+        exclusiveProvider: 'opencode-cli',
+        providers: [{
+          id: 'opencode-cli', name: 'CLI transport', type: 'opencode-cli',
+          strategy: 'round-robin', timeoutMs: 30_000, proxy: 'direct',
+          // The fixture is a node script: run it with the same node that runs the suite.
+          cliPath: process.execPath, cliArgs: [fake],
+          accounts: [],
+        }],
+      };
+      const cliConfig = path.join(cliTmp, 'config.json');
+      fs.writeFileSync(cliConfig, JSON.stringify(cliCfg, null, 2));
+      cliChild = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+        cwd: REPO,
+        env: { ...process.env, ROUTER_CONFIG: cliConfig, ROUTER_STATE: path.join(cliTmp, 'state.json'), PORT: String(CLI_PORT), HOST: '127.0.0.1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let cliLog = '';
+      cliChild.stdout.on('data', (d) => { cliLog += d.toString(); });
+      cliChild.stderr.on('data', (d) => { cliLog += d.toString(); });
+      const cliUrl = (p) => `http://127.0.0.1:${CLI_PORT}${p}`;
+      const cliChat = async (body, headers = {}) => {
+        const r = await fetch(cliUrl('/v1/chat/completions'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+        });
+        return { status: r.status, headers: r.headers, text: await r.text() };
+      };
+
+      let up = false;
+      for (let i = 0; i < 40 && !up; i += 1) {
+        try { up = (await fetch(cliUrl('/health'))).ok; } catch { await sleep(150); }
+      }
+      check('cli transport: the router boots with an account-less provider', up === true, cliLog.slice(-300) || cliChild.exitCode);
+
+      const ok = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'hello there' }] });
+      let okBody = {};
+      try { okBody = JSON.parse(ok.text); } catch { /* reported below */ }
+      check('cli transport: a chat request is answered from the binary\'s stdout',
+        ok.status === 200
+        && String(okBody.choices?.[0]?.message?.content || '').includes('FAKE OK')
+        && ok.headers.get('x-router-transport') === 'opencode-cli',
+        `${ok.status} transport=${ok.headers.get('x-router-transport')} body=${ok.text.slice(0, 160)}`);
+      check('cli transport: the answer is a chat.completion with the requested model',
+        okBody.object === 'chat.completion' && okBody.model === 'big-pickle',
+        JSON.stringify({ object: okBody.object, model: okBody.model }));
+
+      const streamed = await cliChat({ model: 'opencode-cli/big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+      check('cli transport: streaming answers with SSE chunks and [DONE]',
+        streamed.status === 200 && streamed.text.includes('chat.completion.chunk') && streamed.text.trim().endsWith('data: [DONE]'),
+        `${streamed.status} ${streamed.text.slice(-80)}`);
+
+      const limited = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: '__LIMIT__ please' }] });
+      const limitBody = JSON.parse(limited.text);
+      const limitRa = Number(limited.headers.get('retry-after'));
+      check('cli transport: the CLI\'s own limit becomes a 429 with the reset clock',
+        limited.status === 429 && limitBody.error?.type === 'router_free_day_ceiling'
+        && Number.isFinite(limitRa) && limitRa > 60,
+        `${limited.status} ra=${limited.headers.get('retry-after')} body=${limited.text.slice(0, 160)}`);
+
+      const afterLimit = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: 'hello again' }] });
+      check('cli transport: a spent allowance parks the tier instead of spawning the binary again',
+        afterLimit.status === 429 && Number(afterLimit.headers.get('retry-after')) > 60,
+        `${afterLimit.status} ra=${afterLimit.headers.get('retry-after')}`);
+
+      const snap = await (await fetch(cliUrl('/admin/api/state'), { headers: ADMIN })).json();
+      check('cli transport: the provider is advertised and needs no identity pool',
+        snap.providers.some((p) => p.id === 'opencode-cli' && p.accountCount === 0)
+        && snap.exclusiveProvider === 'opencode-cli',
+        JSON.stringify(snap.providers.map((p) => `${p.id}:${p.accountCount}`)));
+    } finally {
+      if (cliChild) cliChild.kill('SIGTERM');
+      fs.rmSync(cliTmp, { recursive: true, force: true });
+    }
+  }
+
   console.log('\n==================== RESULTS ====================');
   console.log(results.join('\n'));
   console.log(`\n  ${pass} passed, ${fail} failed`);
