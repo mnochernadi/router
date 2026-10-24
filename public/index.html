@@ -894,6 +894,7 @@
         <i data-lucide="log-in" class="h-3.5 w-3.5"></i><span x-text="pd && pd.type === 'freebuff' ? 'Authorize freebuff' : 'Get a Console key'"></span></button>
       <button class="btn" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
       <button class="btn" x-show="pd && pd.managed" @click="renewIdentity(pd)" title="Reinstall the client now: new identity, session, project handle and client version, cooldown cleared"><i data-lucide="dna" class="h-3.5 w-3.5"></i>Reinstall client</button>
+      <button class="btn btn-primary" x-show="pd && (pd.type === 'opencode-free' || pd.type === 'opencode')" @click="openSignin(pd)" title="Sign in to OpenCode Console: a signed-in account is its own daily allowance, not another anonymous identity"><i data-lucide="log-in" class="h-3.5 w-3.5"></i>Sign in</button>
       <button class="btn" x-show="pd && !pd.managed" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
       <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
       <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -944,8 +945,22 @@
     </div>
     <div class="space-y-3 text-[12px] text-slate-300" x-show="lf.providerType === 'opencode-free'">
         <p>OpenCode's free tier refuses every non-OpenCode client (<code class="mono">403 FreeTierError</code>) — verified from this server across 7 header sets and both endpoints. It cannot be fixed with a proxy or an account.</p>
-        <p>The working path is a Console key: create one at <a class="text-accent underline" href="https://opencode.ai/console" target="_blank">opencode.ai/console</a>, then paste it as the account key. The <code class="mono">*-free</code> models there still cost nothing.</p>
-        <p class="text-slate-500">Until then this provider is a model catalogue only.</p>
+        <div class="space-y-2 rounded-lg border border-accent/30 bg-accent/5 p-3">
+          <p class="text-[11px] uppercase tracking-wide text-accent/80">Sign in — a principal, not another identity</p>
+          <p class="text-[11px] text-slate-400">The anonymous allowance is one shared daily bucket: addresses, identities, builds, sessions, models and paths were all measured against it and none of them move it. <strong class="text-slate-200">A signed-in account is a different bucket</strong>, so each sign-in adds an allowance and the ladder rotates across them.</p>
+          <div class="flex items-center gap-2" x-show="sg.userCode">
+            <code class="mono text-lg tracking-[0.2em] text-accent" x-text="sg.userCode"></code>
+            <button class="btn !px-2 !py-1" @click="copy(sg.userCode)" title="Copy the code"><i data-lucide="copy" class="h-3 w-3"></i></button>
+          </div>
+          <button class="btn w-full justify-center" @click="startSignin()" x-show="!sg.userCode">
+            <i data-lucide="log-in" class="h-3.5 w-3.5"></i>Get a sign-in code</button>
+          <a class="btn btn-primary w-full justify-center" :href="sg.url || '#'" target="_blank" rel="noopener" x-show="sg.url">
+            <i data-lucide="external-link" class="h-3.5 w-3.5"></i>Open the approval page</a>
+          <p class="text-[11px] leading-relaxed" :class="sg.error ? 'text-rose-400' : 'text-slate-500'" x-text="sg.error || sg.status"></p>
+          <p class="text-[11px] text-emerald-300" x-show="sg.signedIn.length"
+            x-text="sg.signedIn.length + ' principal(s) signed in: ' + sg.signedIn.map(a => a.email || a.name).join(', ')"></p>
+        </div>
+        <p>The other path is a Console key: create one at <a class="text-accent underline" href="https://opencode.ai/console" target="_blank">opencode.ai/console</a>, then paste it as the account key. The <code class="mono">*-free</code> models there still cost nothing.</p>
     </div>
     <div class="space-y-3" x-show="lf.providerType === 'freebuff'">
         <p class="text-[12px] text-slate-300">freebuff has no API key: you sign in on freebuff.com, approve the device, and this page finishes by itself.</p>
@@ -1505,6 +1520,54 @@ function app() {
     switchTab(id) { this.tab = id; this.refreshIcons(); if (id === 'network') this.loadProxies(); },
 
     lf: { providerType: '', provider: '', account: '', session: '', url: '', status: '', error: '', done: false, blocked: false },
+    // OpenCode Console sign-in: a device code the operator approves in a browser.
+    // Each approval adds a principal, i.e. its own daily allowance.
+    sg: { provider: '', userCode: '', url: '', status: '', error: '', signedIn: [] },
+    async openSignin(p) {
+      this.lf = { providerType: p.type, provider: p.id, account: '', session: '', url: '', status: '', error: '', done: false };
+      this.sg = { provider: p.id, userCode: '', url: '', status: '', error: '', signedIn: [] };
+      this.modal = 'authorize';
+      await this.pollSignin(true);
+      this.refreshIcons();
+    },
+    async startSignin() {
+      this.sg.error = '';
+      this.sg.status = 'asking OpenCode for a code...';
+      try {
+        const r = await this.api('/provider/' + encodeURIComponent(this.sg.provider) + '/signin', { method: 'POST', body: {} });
+        this.sg.userCode = r.userCode || '';
+        this.sg.url = r.verificationUri || '';
+        this.sg.status = `Approve ${r.userCode} in the page that just opened (expires in ${Math.round((r.expiresAt - Date.now()) / 60000)} min). This window finishes by itself.`;
+        try { const w = window.open(this.sg.url, 'opencode_signin', 'noopener,width=560,height=760'); if (!w) this.sg.status += ' The popup was blocked - use the button below.'; } catch (e) { /* the link works */ }
+        if (this.signinTimer) clearInterval(this.signinTimer);
+        this.signinTimer = setInterval(() => this.pollSignin(true), 3000);
+      } catch (err) { this.sg.error = err.message; this.sg.status = ''; }
+      this.refreshIcons();
+    },
+    async pollSignin(silent) {
+      if (!this.sg.provider) return;
+      try {
+        const r = await this.api('/provider/' + encodeURIComponent(this.sg.provider) + '/signin');
+        this.sg.signedIn = r.signedIn || [];
+        const before = this.sg.signedIn.length;
+        if (r.pending && r.pending.status === 'pending') {
+          if (!silent) this.sg.status = `Still waiting for approval of ${r.pending.userCode}...`;
+        } else if (r.pending && r.pending.status !== 'pending') {
+          this.sg.status = r.pending.error || r.pending.status;
+          if (r.pending.status === 'done') {
+            this.sg.userCode = '';
+            this.sg.url = '';
+            this.toast(`${this.sg.provider}: signed in as ${(this.sg.signedIn[this.sg.signedIn.length - 1] || {}).email || 'a new principal'}`, 'ok');
+            if (this.signinTimer) { clearInterval(this.signinTimer); this.signinTimer = null; }
+            await this.load(true);
+          }
+        }
+        if (before && this.sg.userCode) {
+          this.sg.userCode = '';
+          this.sg.status = `${before} principal(s) signed in.`;
+        }
+      } catch (err) { if (!silent) this.sg.error = err.message; }
+    },
     async startFreebuffLogin(p) {
       this.lf = { providerType: p.type, provider: p.id, account: (p.accounts[0] || {}).id || '', session: '', url: '', status: '', error: '', done: false };
       this.modal = 'authorize';

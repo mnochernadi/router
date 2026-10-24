@@ -2478,7 +2478,13 @@ async function startOpenCodeSignin(provider) {
   const st = {
     status: 'pending',
     userCode: String(r.json.user_code || ''),
-    verificationUri: String(r.json.verification_uri_complete || r.json.verification_uri || ''),
+    // The edge answers with a path (`/console/device?...`); resolve it the way the
+    // CLI does (`new URL(v, vt + '/')`) so the dashboard and curl show a URL that
+    // can actually be opened.
+    verificationUri: (() => {
+      const raw = String(r.json.verification_uri_complete || r.json.verification_uri || '');
+      try { return new URL(raw, `${OPENCODE_CONSOLE}/`).href; } catch { return raw; }
+    })(),
     deviceCode: r.json.device_code,
     interval: Math.max(2, Number(r.json.interval) || 5),
     expiresAt: now() + (Number(r.json.expires_in) || 900) * 1000,
