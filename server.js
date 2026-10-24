@@ -1657,8 +1657,36 @@ function freeProviderDryBudgetMs() {
 // How long the pool is left alone once two lanes have produced the same free-tier
 // quota answer: the ceiling is on the upstream account, so rotating exits and
 // minting identities only burns addresses that the next real request needs.
-const FREE_DRY_MS = 5 * 60_000;
-const freeDry = { hits: 0, until: 0 };
+//
+// The window grows on every consecutive dry probe (5m -> 15m -> 45m -> 2h): a spent
+// allowance does not come back in five minutes, and each 5-minute expiry used to
+// cost a real request a full ladder walk plus several exits. Any 2xx from the
+// provider resets it. It is persisted, so a restart does not send the first request
+// straight back into the ladder.
+const FREE_DRY_BASE_MS = 5 * 60_000;
+const FREE_DRY_MAX_MS = 2 * 60 * 60_000;
+const freeDry = { hits: 0, until: 0, backoffMs: FREE_DRY_BASE_MS, ...(state.freeDry || {}) };
+
+/** Rest the pool for the current backoff window, then double the next one. */
+function restFreePool(providerId, why) {
+  freeDry.until = now() + freeDry.backoffMs;
+  const rested = Math.round(freeDry.backoffMs / 60_000);
+  freeDry.backoffMs = Math.min(FREE_DRY_MAX_MS, Math.round(freeDry.backoffMs * 3));
+  state.freeDry = { hits: freeDry.hits, until: freeDry.until, backoffMs: freeDry.backoffMs };
+  persistState();
+  console.warn(`[proxy] ${providerId}: ${why} - resting the pool for ${rested}m; the fallback answers until then`);
+}
+
+/** The free tier answered again: forget the backoff so the pool is used normally. */
+function clearFreeDry(providerId) {
+  if (!freeDry.until && freeDry.hits === 0 && freeDry.backoffMs === FREE_DRY_BASE_MS) return;
+  freeDry.hits = 0;
+  freeDry.until = 0;
+  freeDry.backoffMs = FREE_DRY_BASE_MS;
+  delete state.freeDry;
+  persistState();
+  console.warn(`[proxy] ${providerId}: free allowance answered again - dry backoff reset`);
+}
 // A retry that follows a 429 is usually answered quickly (or not at all): a
 // stalled exit is abandoned in eight seconds instead of twenty-five, because the
 // next lane is cheap and the caller's budget is not. The first attempt keeps the
@@ -2292,10 +2320,7 @@ async function handleProxy(req, res, url) {
               // Two ladders in a row could not clear it - that is the account, not
               // the exit. One is kept as a fluke so a single slow burst does not
               // switch the pool off.
-              if (freeDry.hits >= 2) {
-                freeDry.until = now() + FREE_DRY_MS;
-                console.warn(`[proxy] ${provider.id}: ceiling is upstream, not the exit - resting the pool for ${Math.round(FREE_DRY_MS / 60000)}m`);
-              }
+              if (freeDry.hits >= 2) restFreePool(provider.id, 'ceiling is upstream, not the exit');
             }
             break;
           }
@@ -2319,7 +2344,15 @@ async function handleProxy(req, res, url) {
           // One IP hop per lane and request: with several lanes alive, burning
           // three exits on one identity before trying a healthy lane next door is
           // waste - the hops are cheap, the pool is not.
-          const canRotate = rotationPossible && rotations < (freeLadder ? Math.min(rotateMax, 1) : rotateMax);
+          //
+          // `accountWide` disables the hop entirely. When the body says the
+          // allowance itself is spent ("Free usage limit reached. Subscribe to
+          // OpenCode Go"), no address and no identity can clear it: the hop would
+          // burn an exit, and the refill under it would hold the caller for the
+          // length of a subscription fetch. Hand over instead.
+          const canRotate = !accountWide
+            && rotationPossible
+            && rotations < (freeLadder ? Math.min(rotateMax, 1) : rotateMax);
           // The exit that answered the limit is spent - unless the body says the
           // ceiling is the account ("Free usage limit reached. Subscribe to OpenCode
           // Go"), in which case no address can clear it and burning one only spends
@@ -2349,7 +2382,13 @@ async function handleProxy(req, res, url) {
               // the caller's fault.
               const rebuildStart = now();
               console.warn(`[proxy] ${provider.id}: no usable exit left, rebuilding the pool with new subscriptions`);
-              const rebuilt = await proxies.replenish(`no usable exit for ${provider.id}`, { maxCandidates: 15 });
+              // Bounded: a subscription fetch is the pool's job, not the caller's.
+              // The rebuild keeps running in the background either way; past five
+              // seconds the request moves on with whatever the pool has.
+              const rebuilt = await Promise.race([
+                proxies.replenish(`no usable exit for ${provider.id}`, { maxCandidates: 15 }),
+                new Promise((resolve) => { const t = setTimeout(() => resolve(null), 5_000); if (t.unref) t.unref(); }),
+              ]);
               freeLimitDeadline += now() - rebuildStart;
               next = rebuilt && rebuilt.ok ? proxies.rotateLane(provider, laneKey, `rebuilt pool for ${provider.id}`) : null;
             }
@@ -2411,10 +2450,9 @@ async function handleProxy(req, res, url) {
           // spent dry on an account-wide ceiling: with no exit left there is
           // nothing for the next lane (or the next request) to move to, and every
           // further attempt only logs "no working exit to switch to". Rest the pool
-          // for a short window and let the rebuild catch up in the background.
+          // for a backoff window and let the rebuild catch up in the background.
           if (accountWide && proxies.activeExits().length === 0 && freeDry.until < now()) {
-            freeDry.until = now() + FREE_DRY_MS;
-            console.warn(`[proxy] ${provider.id}: pool spent dry on an upstream ceiling - resting it for ${Math.round(FREE_DRY_MS / 60000)}m while it rebuilds`);
+            restFreePool(provider.id, 'pool spent dry on an upstream ceiling');
           }
           const queued = queueLaneRefresh(provider, account, `HTTP ${upstream.status} - lane spent`);
           console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status} [quota] lane spent${snippet ? ` (${snippet.slice(0, 80)})` : ''} after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); ${queued ? 'rebuilding it in the background' : 'already rebuilding'}, ${others} lane(s) ready; handing over`);
@@ -2450,6 +2488,9 @@ async function handleProxy(req, res, url) {
         state.totals.success += 1;
         if (ctx.stream) state.totals.streamed += 1;
         if (call.exit && proxies) proxies.noteResult(call.exit.id, true);
+        // The free allowance is answering again: drop the dry backoff so the next
+        // request uses the tier instead of the fallback.
+        if (style === 'opencode-free') clearFreeDry(provider.id);
       } else {
         state.totals.failed += 1;
         if (call.exit && proxies) proxies.noteResult(call.exit.id, false);
@@ -3548,6 +3589,9 @@ function sampleMemory() {
 
 function boot() {
   loadStateSync();
+  // `state` is replaced by the file on disk, so the dry backoff has to be picked up
+  // here rather than in the module-level literal (which runs before the load).
+  if (state.freeDry && typeof state.freeDry === 'object') Object.assign(freeDry, state.freeDry);
   const { file, created } = loadConfigSync();
   if (created) {
     saveConfig().catch((err) => console.error(`[config] could not write config.json: ${err.message}`));
