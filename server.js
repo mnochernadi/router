@@ -1937,44 +1937,6 @@ function providerFallbackHops(provider) {
     .filter((h) => h.provider && h.model && h.provider !== (provider && provider.id));
 }
 
-/**
- * Look at the first SSE frame of a 200 response and report it when it is really an
- * error, leaving the stream intact for the caller.
- *
- * Some OpenAI-compatible hops answer `200 text/event-stream` and then push
- * `data: {"error":...}` - a big prompt is the usual trigger. Relaying that verbatim
- * hands the client a stream that never produces a token, so the hop is skipped
- * instead.
- *
- * The peek reads a *clone* of the body: a native Response exposes `body` as a
- * getter-only accessor, so a consumed stream cannot be put back. Reading a tee'd
- * clone leaves the response the caller will relay untouched, whatever Response
- * implementation produced it.
- */
-async function peekSseError(upstream) {
-  const type = String(upstream.headers.get('content-type') || '').toLowerCase();
-  if (!type.includes('event-stream') || !upstream.body || !upstream.body.getReader) return null;
-  let probe;
-  try { probe = upstream.clone(); } catch { return null; }
-  if (!probe.body || !probe.body.getReader) return null;
-  const reader = probe.body.getReader();
-  const buffered = [];
-  let seen = '';
-  try {
-    while (seen.length < 512) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffered.push(value);
-      seen += Buffer.from(value).toString('utf8');
-      if (seen.includes('\n\n')) break;
-    }
-  } catch { /* fall through with whatever arrived */ }
-  try { await reader.cancel().catch(() => {}); } catch { /* noop */ }
-  const m = seen.match(/"error"\s*:\s*\{[^}]*"message"\s*:\s*"([^"]*)"/);
-  const message = m ? m[1] : (/"error"\s*:/.test(seen) && !/"choices"\s*:/.test(seen) ? 'error frame' : null);
-  return { message };
-}
-
 async function relayViaFallback(hop, body, res) {
   const fb = findProvider(hop.provider);
   if (!fb) return false;
@@ -1995,16 +1957,6 @@ async function relayViaFallback(hop, body, res) {
   try {
     const call = await callUpstream(fb, account, ctx2);
     if (!call.upstream.ok) {
-      try { if (call.upstream.body && call.upstream.body.cancel) await call.upstream.body.cancel(); } catch { /* noop */ }
-      try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
-      return false;
-    }
-    // A big body is where a hop is most likely to answer 200 with an SSE error frame
-    // instead of a completion (measured on pollinations: `usage_missing`). Peek the
-    // first frame before committing the client to this hop.
-    const peek = await peekSseError(call.upstream);
-    if (peek && peek.message) {
-      console.warn(`[proxy] ${fb.id}: fallback hop ${hop.model} answered an error frame (${peek.message.slice(0, 80)}); trying the next hop`);
       try { if (call.upstream.body && call.upstream.body.cancel) await call.upstream.body.cancel(); } catch { /* noop */ }
       try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
       return false;
@@ -2368,9 +2320,12 @@ async function handleProxy(req, res, url) {
           // three exits on one identity before trying a healthy lane next door is
           // waste - the hops are cheap, the pool is not.
           const canRotate = rotationPossible && rotations < (freeLadder ? Math.min(rotateMax, 1) : rotateMax);
-          // The exit that answered the limit is spent either way - burn it even
-          // when the next step is a reinstall rather than another hop.
-          if (call.exit) proxies.noteResult(call.exit.id, false, { burn: true });
+          // The exit that answered the limit is spent - unless the body says the
+          // ceiling is the account ("Free usage limit reached. Subscribe to OpenCode
+          // Go"), in which case no address can clear it and burning one only spends
+          // the pool the next real request needs. That case is handled by resting
+          // the pool below, not by a rotation.
+          if (call.exit) proxies.noteResult(call.exit.id, false, { burn: !accountWide });
           const rt = accountState(provider.id, account.id);
           const rawGap = config.reinstallGapMinutes;
           const gapMs = (rawGap === undefined || rawGap === null || rawGap === '')
