@@ -326,6 +326,16 @@ function normalizeConfig(cfg) {
   const ladderSeconds = clampLadderSeconds(out.freeLadderBudgetSeconds);
   if (ladderSeconds) out.freeLadderBudgetSeconds = ladderSeconds;
   else delete out.freeLadderBudgetSeconds;
+  // Floor between "renew every lane" sweeps, in minutes. Absent keeps the built-in
+  // minute; 0 is meaningful ("sweep on every limit") and so is kept, unlike a zero
+  // ladder dial. Clamped to a day so a typo cannot park the sweep for a week.
+  if (out.allLanesRenewGapMinutes === undefined || out.allLanesRenewGapMinutes === null || out.allLanesRenewGapMinutes === '') {
+    delete out.allLanesRenewGapMinutes;
+  } else {
+    const sweepMinutes = Number(out.allLanesRenewGapMinutes);
+    if (Number.isFinite(sweepMinutes) && sweepMinutes >= 0) out.allLanesRenewGapMinutes = Math.min(1440, sweepMinutes);
+    else delete out.allLanesRenewGapMinutes;
+  }
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
   if (process.env.ADMIN_KEY) out.adminKey = process.env.ADMIN_KEY;
   return out;
@@ -711,6 +721,9 @@ function providerSummary(provider) {
     // Identities run in parallel lanes, each on its own exit IP: a spent lane is
     // rebuilt while the others keep answering.
     identityPool: managedPoolSize(provider),
+    // When every lane was last given a new identity at once (0 = never). The floor
+    // between those sweeps is `allLanesRenewGapMinutes` in the snapshot.
+    allLanesSweptAt: Number(providerState(provider.id).allLanesSweptAt) || 0,
     // Advertised context window; clients read it and stop trimming at 8k.
     contextWindow: contextWindowOf(provider),
     // The dashboard reads this to render the "rotating exits" pill and to seed
@@ -1606,6 +1619,12 @@ function inboundKey(req, url) {
 const MANAGED_MAX_RENEWALS = 4;
 // Minimum spacing between identity replacements for a managed provider.
 const MANAGED_RENEW_GAP_MS = 10 * 60_000;
+// A limit is answered by minting a new identity on *every* lane at once (see
+// queueAllLaneRefreshes), not only on the lane that reported it. Without a floor a
+// burst of cold requests would mint a fresh set for every 429 the ladder collects,
+// so one sweep per episode is allowed by default.
+// `allLanesRenewGapMinutes: 0` in config.json means "sweep on every limit".
+const ALL_LANES_RENEW_GAP_MS = 60_000;
 const MANAGED_BACKOFF_MS = 60_000;
 // Free-tier identity lanes.
 //
@@ -1918,6 +1937,66 @@ function queueLaneRefresh(provider, account, reason) {
 function laneReady(provider, account) {
   const as = accountState(provider.id, account.id);
   return account.enabled !== false && !as.refreshing && !isLimited(as);
+}
+
+/**
+ * Spacing between "renew every lane" sweeps, in milliseconds.
+ * `allLanesRenewGapMinutes` (config) overrides it; 0 means every limit.
+ */
+function allLanesRenewGapMs() {
+  const raw = config.allLanesRenewGapMinutes;
+  if (raw === undefined || raw === null || raw === '') return ALL_LANES_RENEW_GAP_MS;
+  return Math.max(0, Number(raw) || 0) * 60_000;
+}
+
+/**
+ * Hit the limit on one lane -> mint a new identity on *all* of them.
+ *
+ * The operator's rule: a limit is the whole provider's problem, not one lane's. If
+ * only the lane that reported it is rebuilt, the next request spends itself
+ * rediscovering that the other three are spent too; sweeping all four means the next
+ * request starts on a complete set of fresh identities (new session, new project
+ * handle, new client build and a new exit pin each - everything
+ * reinstallManagedClient changes).
+ *
+ * Runs through queueLaneRefresh per lane, so each lane keeps its slot and gets the
+ * usual background treatment: the reporting request does not wait for the exits to
+ * be re-pinned. Throttled to one sweep per `allLanesRenewGapMinutes` (default one
+ * minute) because a cold burst would otherwise mint a fresh set for every 429 the
+ * ladder collects. Returns how many lanes were actually queued - lanes already
+ * rebuilding are left to finish, they are getting a new identity anyway.
+ */
+function queueAllLaneRefreshes(provider, reason) {
+  if (!isManagedProvider(provider)) return 0;
+  // Per provider, not global: one provider sitting on a dry ceiling must not
+  // suppress another provider's sweep. Kept in the provider's runtime state so it
+  // survives a restart instead of granting a free sweep on every boot.
+  const ps = providerState(provider.id);
+  const lastSweep = Number(ps.allLanesSweptAt) || 0;
+  const gapMs = allLanesRenewGapMs();
+  if (gapMs > 0 && now() - lastSweep < gapMs) {
+    console.warn(`[proxy] ${provider.id}: all-lane identity sweep skipped (${Math.round((gapMs - (now() - lastSweep)) / 1000)}s of the ${Math.round(gapMs / 1000)}s floor left); rebuilding the reporting lane only`);
+    return 0;
+  }
+  ensureManagedAccount(provider);
+  // Stamped before the loop: one request must not sweep twice when a second lane
+  // reports the same limit a moment later.
+  ps.allLanesSweptAt = now();
+  const lanes = (provider.accounts || []).filter((a) => a.enabled !== false);
+  let queued = 0;
+  for (const lane of lanes) {
+    try {
+      if (queueLaneRefresh(provider, lane, reason)) queued += 1;
+    } catch (err) {
+      console.warn(`[proxy] ${provider.id}#${laneKeyOf(lane)}: sweep could not queue the rebuild: ${err.message}`);
+    }
+  }
+  if (queued) {
+    pushEvent({ kind: 'reinstall-all', pid: provider.id, n: queued, reason });
+    console.warn(`[proxy] ${provider.id}: limit hit - minting a new identity on ${queued}/${lanes.length} lane(s), each on a fresh exit (${reason})`);
+  }
+  persistState();
+  return queued;
 }
 
 /**
@@ -2322,6 +2401,13 @@ async function handleProxy(req, res, url) {
               // switch the pool off.
               if (freeDry.hits >= 2) restFreePool(provider.id, 'ceiling is upstream, not the exit');
             }
+            // The budget running out on a quota is still "I hit the limit": every lane
+            // gets a new identity, on the same floor as the other sweep, so the next
+            // request starts on a complete set rather than re-proving the ceiling lane
+            // by lane. This is the path a dry deployment takes most often, because a
+            // 6-8s `freeLadderBudgetSeconds` ends the ladder here rather than at the
+            // per-lane handover below.
+            queueAllLaneRefreshes(provider, `HTTP ${upstream.status} - ladder budget spent`);
             break;
           }
           if (freeDry.until > now()) {
@@ -2454,8 +2540,16 @@ async function handleProxy(req, res, url) {
           if (accountWide && proxies.activeExits().length === 0 && freeDry.until < now()) {
             restFreePool(provider.id, 'pool spent dry on an upstream ceiling');
           }
-          const queued = queueLaneRefresh(provider, account, `HTTP ${upstream.status} - lane spent`);
-          console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status} [quota] lane spent${snippet ? ` (${snippet.slice(0, 80)})` : ''} after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); ${queued ? 'rebuilding it in the background' : 'already rebuilding'}, ${others} lane(s) ready; handing over`);
+          // The operator's rule: a limit is answered with a new identity on *every*
+          // lane, not only on the one that reported it - so the next request starts
+          // on four fresh identities instead of spending itself proving the other
+          // three are spent as well. Throttled: a cold burst must not turn one dry
+          // ceiling into a stream of new identities.
+          const swept = queueAllLaneRefreshes(provider, `HTTP ${upstream.status} - lane spent`);
+          const queued = swept > 0
+            ? true
+            : queueLaneRefresh(provider, account, `HTTP ${upstream.status} - lane spent`);
+          console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status} [quota] lane spent${snippet ? ` (${snippet.slice(0, 80)})` : ''} after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); ${swept > 0 ? `minting a new identity on all ${swept} lane(s)` : queued ? 'rebuilding it in the background' : 'already rebuilding'}, ${others} lane(s) ready; handing over`);
           // The next attempt starts on the requested model regardless.
           ctx.model = requestedModel;
           triedModels.clear();
@@ -2584,6 +2678,9 @@ function snapshot() {
     // input with the numbers the router is actually using.
     freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25,
     freeLadderDryBudgetMs: freeProviderDryBudgetMs(),
+    // Floor between all-lane identity sweeps (minutes); 0 means every limit. Each
+    // provider reports its own last sweep as `allLanesSweptAt`.
+    allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000,
     cors: !!config.cors,
     hasProxyKeys: config.proxyKeys.length > 0,
     memory: {
@@ -3342,8 +3439,14 @@ async function handleAdmin(req, res, url) {
       if (ladderSeconds) config.freeLadderBudgetSeconds = ladderSeconds;
       else delete config.freeLadderBudgetSeconds;
     }
+    // All-lane identity sweep floor, in minutes. 0 is a real setting here ("renew
+    // every lane on every limit"), so it is stored rather than treated as "unset".
+    if (body.allLanesRenewGapMinutes != null && body.allLanesRenewGapMinutes !== '') {
+      const sweepMinutes = Number(body.allLanesRenewGapMinutes);
+      if (Number.isFinite(sweepMinutes) && sweepMinutes >= 0) config.allLanesRenewGapMinutes = Math.min(1440, sweepMinutes);
+    }
     await saveConfig();
-    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
+    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25, allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
   }
 
   return sendJson(res, 404, { error: { message: `unknown admin route ${method} ${url.pathname}`, type: 'not_found' } });

@@ -205,6 +205,8 @@ One identity on one IP is one allowance, and an allowance that runs out used to 
 
 When a lane answers `429` the request does not sit there being rebuilt - it changes the lane's IP, reinstalls the lane's identity, walks the model pool on that lane, and the moment the lane is spent the request is **handed to the next lane**, whose IP and identity are untouched and which has its own allowance. The spent lane is parked and rebuilt **in the background** (burn its exit, pin a fresh one, new session, new project, new build), then returns to rotation. Only when *every* lane is spent does a request wait for the first rebuild to finish, and only for `LANE_WAIT_MS` (12 s) at most.
 
+A limit that survives that whole ladder is the *provider's* problem, not that lane's. So the moment a lane is spent, the router mints a **new identity on every lane at once** (`queueAllLaneRefreshes`) rather than only on the one that reported it: the next request then starts on a complete set of fresh identities instead of spending itself rediscovering that the other three are spent too. The sweep drives the same per-lane rebuild - new session, new project handle, next client build, and a newly pinned exit - through the background queue, so the reporting request does not pay for four exit re-pins. It is throttled to **one sweep per minute**, `allLanesRenewGapMinutes` in `config.json` (top-level, next to `freeLadderBudgetSeconds`; `0` means every limit, clamped to a day), because a burst of cold requests would otherwise mint a fresh set of identities for every `429` the ladder collects. The dashboard's activity list shows it as a single `reinstall-all` event covering all lanes, and the snapshot exposes the floor as `allLanesRenewGapMinutes` / `allLanesSweptAt`.
+
 | Lane fingerprint | Rotated per rebuild |
 |---|---|
 | session id (`x-opencode-session`) | yes |
@@ -342,6 +344,7 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `retryStatuses` | `[500,502,503,504]` | Statuses that fail over without cooldown. |
 | `defaultProvider` | `""` | Fallback provider id. |
 | `freeLadderBudgetSeconds` | `25` | `3`-`120`: time-boxes the free-tier ladder on a cold request (the already-dry leash is 80 % of it - 20 s at the default; the 60 s ceiling is fixed). Set `6`-`8` when the free allowance is spent and the fallback should answer. Unset = 25 s / 20 s, i.e. unchanged. |
+| `allLanesRenewGapMinutes` | `1` | `0`-`1440`: floor between "mint a new identity on every lane at once" sweeps. `0` = sweep on every limit (the most aggressive setting: every lane gets a new session, project and client build the moment one of them is spent). Per provider, stamped in `state.json`, so a restart does not grant a free sweep. |
 | `cors` | `true` | Send permissive CORS headers to proxy clients. |
 | `logging.requests` | `false` | Routing lines in the process log. Off by default — counters live in the dashboard. |
 | `rotateEveryMinutes` | `0` | Time-boxed rotation: keep one account for N minutes, then move to the next. Use it when a provider's free quota resets on a clock — OpenCode: `120` for two-hour tokens. Per-account override allowed. `0` = off. |

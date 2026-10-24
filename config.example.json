@@ -16,6 +16,7 @@
   ],
   "defaultProvider": "",
   "freeLadderBudgetSeconds": 25,
+  "allLanesRenewGapMinutes": 1,
   "cors": true,
   "proxyKeys": [],
   "providers": [

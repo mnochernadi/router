@@ -1267,6 +1267,8 @@ async function memOf() {
       `${esc.status} gens=${escLanes.accounts.map((a) => a.gen).join(',')} rotations=${esc.headers.get('x-router-rotations')} burnsLeft=${fb.burn429}`);
     check('free rotate: the rebuilt lane still answers through the pool', esc.headers.get('x-router-exit') !== 'direct',
       String(esc.headers.get('x-router-exit')));
+    check('lanes: the sweep floor is exposed and defaults to a minute',
+      afterEsc.allLanesRenewGapMinutes === 1, String(afterEsc.allLanesRenewGapMinutes));
     const snap2 = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
     const burnedIds = (snap2.events || []).filter((e) => e.kind === 'exit-burned').map((e) => e.exit);
     const activeIds = snap1.exits.filter((e) => e.active).map((e) => e.id);
@@ -1277,6 +1279,10 @@ async function memOf() {
     // Worst case: everything 429s, so the ladder runs to its end. Every lane is
     // handed over, nothing waits for a rebuild that cannot help, and the caller
     // is given the configured fallback provider well inside the minute.
+    // Snapshot what each lane presents *before* the ladder so the sweep can be
+    // compared per lane: the rebuilds are background and land fast, so a baseline
+    // taken after the request would already contain their new identities.
+    const beforeSweep = new Map(escLanes.accounts.map((a) => [a.id, `${a.gen}:${a.build}`]));
     fb.burn429 = 99;
     const t0 = Date.now();
     const dead = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
@@ -1295,6 +1301,28 @@ async function memOf() {
     check('lanes: both spent lanes are rebuilt after an exhausted ladder',
       deadLanes.length === 2 && deadLanes.every((a) => Number(a.gen) > 1 || a.refreshing),
       deadLanes.map((a) => `${a.name}gen${a.gen}${a.refreshing ? ' refreshing' : ''}`).join(','));
+
+    // The limit belongs to the provider, not to the lane that reported it: one
+    // ladder ending in "spent" sweeps *every* lane, so the next request starts on a
+    // complete set of fresh identities instead of re-learning that the others are
+    // dry as well. One sweep, covering all lanes, and not one per lane.
+    const sweeps = (afterDead.events || []).filter((e) => e.kind === 'reinstall-all' && e.pid === 'free-rotate-test');
+    check('lanes: one limit mints a new identity on every lane, not only on the one that reported it',
+      sweeps.length === 1 && sweeps[0].n === 2, JSON.stringify(sweeps));
+
+    // ...and every one of them really is a new identity: the rebuild runs off the
+    // request path, so wait for it and compare each lane against itself - new
+    // generation, new client build, nothing left presenting the spent one.
+    let swept = deadLanes;
+    for (let i = 0; i < 50 && swept.some((a) => a.refreshing); i += 1) {
+      await sleep(100);
+      const st = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+      swept = st.providers.find((p) => p.id === 'free-rotate-test').accounts;
+    }
+    check('lanes: the sweep finishes - every lane steps to a new generation and build',
+      swept.length === 2 && swept.every((a) => !a.refreshing && beforeSweep.get(a.id) !== `${a.gen}:${a.build}`)
+      && new Set(swept.map((a) => a.build)).size === 2,
+      swept.map((a) => `${a.name}gen${a.gen}/${a.build}${a.refreshing ? ' refreshing' : ''}`).join(','));
 
     // The burn pile is deleted and a fresh batch is taken on for the next hops.
     const replenished = await (await fetch(routerUrl('/admin/api/proxies/replenish'), { method: 'POST', headers: ADMIN, body: '{}' })).json();
@@ -1592,6 +1620,7 @@ async function memOf() {
   console.log('=================================================');
   console.log('\n--- router log tail ---');
   console.log(routerLog.split('\n').slice(-12).join('\n'));
+  if (process.env.SMOKE_LOG_FILE) fs.writeFileSync(process.env.SMOKE_LOG_FILE, routerLog);
 
   child.kill('SIGTERM');
   await sleep(300);
