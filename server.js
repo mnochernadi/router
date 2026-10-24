@@ -1654,7 +1654,7 @@ function allExhausted(provider, tried, dueToLimit) {
   // reset the upstream named - and it applies even to a lane that never answered a
   // 429 itself. Reporting it is what lets a client back off to the right moment
   // instead of retrying on a 12h default (or being told "try again" with no figure).
-  const parkedUntil = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style === 'opencode-free' && freeDry.until > now()
+  const parkedUntil = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style === 'opencode-free' && freeTierParked()
     ? freeDry.until
     : 0;
   const nextUnlock = parkedUntil || accounts
@@ -1918,6 +1918,21 @@ function freeDayHorizonMs() {
 }
 
 /**
+ * Is the free tier parked at this instant?
+ *
+ * One question, asked everywhere the ladder decides whether to move, so
+ * `freeDayHorizonMinutes: 0` means *never* park rather than "stop creating new
+ * parks": a window recorded by an earlier policy (it lives in `state.json`) must
+ * not keep the ladder switched off after the operator has asked for it back. With
+ * parking off, the answer's own clock still reaches the client - the upstream's
+ * `retry-after` is passed through - so "keep rotating" costs exits and identities
+ * but never leaves the caller without a time to come back at.
+ */
+function freeTierParked() {
+  return freeDayHorizonMs() > 0 && freeDry.until > now();
+}
+
+/**
  * Park the free tier until the reset instant the upstream itself named.
  *
  * Returns false when it is already parked at least that long, so a burst of
@@ -2131,6 +2146,14 @@ function reinstallManagedClient(provider, oldAccount, reason, { rotateExit = fal
     proxies.rotateLane(provider, laneKeyOf(oldAccount), `reinstall after ${reason}`);
   }
   pushEvent({ kind: 'reinstall', pid: provider.id, aid: oldAccount.id, lane: oldAccount.lane, reason });
+  // A lane rebuild is also "this lane is back in service", and every rebuild goes
+  // through here: the in-place one a burst lends, the background queue and the
+  // ladder's own identity step. Reporting it once, centrally, is what makes the
+  // burst path observable (and with `identityBurst: false` the burst events stay
+  // inert by definition, because this switch is off).
+  if (identityBurstEnabled()) {
+    pushEvent({ kind: 'lane-rebuilt', pid: provider.id, aid: oldAccount.id, lane: oldAccount.lane, reason });
+  }
   console.warn(`[proxy] ${provider.id}#${laneKeyOf(oldAccount)}: client reinstalled (${reason}); new session, new project, client ${OPENCODE_FREE_UAS[as.uaIndex]}`);
   saveConfig().catch(() => {});
   persistState();
@@ -2293,7 +2316,6 @@ function rebuildLaneNow(provider, account, reason) {
     if (provider.proxy === 'rotate' && proxies) proxies.pickLane(provider, laneKey);
     as.refreshing = false;
     as.limitedUntil = 0;
-    pushEvent({ kind: 'lane-rebuilt', pid: provider.id, aid: account.id, lane: account.lane, reason });
     console.warn(`[proxy] ${provider.id}#${laneKey}: lane rebuilt in place (${reason}); it stays in service for the other requests`);
     return true;
   } catch (err) {
@@ -2666,7 +2688,7 @@ async function handleProxy(req, res, url) {
   // skipping the ladder is not an optimisation, it is a guaranteed failure: the
   // caller asked for this provider, so prove the ceiling again instead - that is
   // what makes the request start working the moment the allowance returns.
-  const freeCeilingDry = style === 'opencode-free' && freeDry.until > now() && fallbackHops.length > 0;
+  const freeCeilingDry = style === 'opencode-free' && freeTierParked() && fallbackHops.length > 0;
   if (freeCeilingDry) {
     // A known-dry day is a limit, not a missing account: if the fallback hops cannot
     // answer either, the client is told when the tier is back (429 +
@@ -2674,7 +2696,7 @@ async function handleProxy(req, res, url) {
     // configuration. In exclusive mode that 429 is the answer.
     sawLimit = true;
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - skipping the ladder, answering from the fallback`);
-  } else if (style === 'opencode-free' && freeDry.until > now()) {
+  } else if (style === 'opencode-free' && freeTierParked()) {
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - trying it anyway, there is no fallback provider to hand the request to`);
   } else if (style === 'opencode-free' && freeDry.until && freeDry.until <= now() && freeDry.reclaimed !== freeDry.until) {
     // The parked day ended, so the upstream allowance is fresh again. Wake the pool
@@ -2923,7 +2945,7 @@ async function handleProxy(req, res, url) {
             sweepAllLanes(`HTTP ${upstream.status} - ladder budget spent`);
             break;
           }
-          if (freeDry.until > now()) {
+          if (freeTierParked()) {
             // Known-dry ceiling: leave the exit in the pool instead of burning it
             // for an answer this box cannot change, and hand the request on. The
             // pool still has to refill itself for the moment the ceiling lifts, so
@@ -4356,6 +4378,14 @@ function boot() {
   sampleMemory();
   proxies = new ProxyManager({ dataDir: DATA_DIR, log: (m) => console.warn(m) });
   proxies.init();
+  // Mint the identity lanes now rather than on the first request: a cold burst has
+  // to find its lanes (and their pinned exits) already there, which is the whole
+  // point of `identityPool`. Idempotent - an existing pool is only re-pinned - and
+  // it is what makes the dashboard show the lanes before any traffic arrives.
+  for (const p of config.providers) {
+    if (!isManagedProvider(p)) continue;
+    try { ensureManagedAccount(p); } catch (err) { console.warn(`[proxy] ${p.id}: could not mint the identity pool: ${err.message}`); }
+  }
   freebuff = new FreebuffDriver({ stateFile: path.join(DATA_DIR, 'freebuff-state.json'), log: (m) => console.warn(m) });
   freebuff.init();
   server.listen(config.port, config.host, () => {
