@@ -157,6 +157,13 @@ const mock = http.createServer(async (req, res) => {
       res.writeHead(429, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached. Subscribe to OpenCode Go to keep going.' } }));
     }
+    if (fb.stallNext > 0) {
+      // Accept the request and never answer: the exit (or the host IP) went
+      // quiet after the tunnel was up. The router must give up on it by itself.
+      fb.stallNext -= 1;
+      fb.stalled += 1;
+      return;
+    }
     if (fb.burn429 > 0) {
       fb.burn429 -= 1;
       res.writeHead(429, { 'content-type': 'application/json' });
@@ -316,7 +323,7 @@ function writeConfig() {
       },
       {
         id: 'empty-managed', name: 'Empty Managed', type: 'opencode-free', baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`,
-        strategy: 'sequential', timeoutMs: 10000, accounts: [],
+        strategy: 'sequential', timeoutMs: 10000, accounts: [], identityPool: 1,
       },
       {
         id: 'proxy-test', name: 'Proxy Rotation Test', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
@@ -331,15 +338,20 @@ function writeConfig() {
       {
         id: 'managed-test', name: 'Managed Identity Test', type: 'opencode-free',
         baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000, proxy: 'direct',
-        accounts: [{ id: 'mid-1', name: 'auto-1', apiKey: '', enabled: true }],
+        accounts: [{ id: 'mid-1', name: 'auto-1', apiKey: '', enabled: true }], identityPool: 1,
         fallbackProviders: [{ provider: 'fallback-provider', model: 'fallback-model' }],
       },
       {
         id: 'free-rotate-test', name: 'Free Tier Over the Pool', type: 'opencode-free',
         baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000,
-        proxy: 'rotate', rotateAttempts: 3,
+        proxy: 'rotate', rotateAttempts: 3, identityPool: 2,
         accounts: [{ id: 'frt-1', name: 'keyless', apiKey: '', enabled: true }],
         fallbackProviders: [{ provider: 'fallback-provider', model: 'fallback-model' }],
+      },
+      {
+        id: 'lane-default-test', name: 'Default Lane Pool', type: 'opencode-free',
+        baseUrl: `http://127.0.0.1:${MOCK_PORT}/inference/v1`, strategy: 'round-robin', timeoutMs: 10000,
+        proxy: 'direct', accounts: [],
       },
       {
         id: 'fallback-provider', name: 'Fallback Target', type: 'custom', baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`,
@@ -377,6 +389,8 @@ const fb = {
   modelQuotaExhausted: [],
   modelQuota429: 0,
   burn429: 0,
+  stallNext: 0,
+  stalled: 0,
 };
 
 function fbCanonical({ method, path: p, ts, bodyHash, fetchId }) {
@@ -527,7 +541,7 @@ async function chat(opts = {}) {
   const res = await fetch(routerUrl('/v1/chat/completions'), {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
-    body: JSON.stringify({ model: opts.model || 'gpt-test', stream: !!opts.stream, messages: [{ role: 'user', content: 'ping' }], ...(opts.n ? { n: opts.n } : {}) }),
+    body: JSON.stringify({ model: opts.model || 'gpt-test', stream: !!opts.stream, messages: opts.messages || [{ role: 'user', content: 'ping' }], ...(opts.n ? { n: opts.n } : {}) }),
   });
   let text = '';
   if (opts.stream && res.ok) {
@@ -1127,7 +1141,8 @@ async function memOf() {
     check('managed: exactly one identity was minted', !!seeded && seeded.accountCount === 1, JSON.stringify(seeded && seeded.accountCount));
 
     const before = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json());
-    const beforeIds = before.providers.find((p) => p.id === 'managed-test').accounts.map((a) => a.id);
+    const beforeAccount = before.providers.find((p) => p.id === 'managed-test').accounts[0];
+    const beforeGen = beforeAccount.gen;
     fb.burn429 = 1;
     const r = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'managed-test' } });
     check('managed: an exhausted identity is replaced and the request still succeeds',
@@ -1135,9 +1150,11 @@ async function memOf() {
     await sleep(700);
     const after = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
     const mp = after.providers.find((p) => p.id === 'managed-test');
-    const afterIds = mp.accounts.map((a) => a.id);
-    check('managed: the old identity is gone and exactly one replacement exists',
-      mp.accountCount === 1 && afterIds.every((id) => !beforeIds.includes(id)), `${JSON.stringify(beforeIds)} -> ${JSON.stringify(afterIds)}`);
+    const afterAccount = mp.accounts[0];
+    check('managed: exactly one identity is kept and it is a rebuild of the same slot',
+      mp.accountCount === 1 && afterAccount.id === beforeAccount.id, `${beforeAccount.id} -> ${afterAccount.id} count=${mp.accountCount}`);
+    check('managed: the identity generation moved on',
+      Number(afterAccount.gen) > Number(beforeGen), `gen ${beforeGen} -> ${afterAccount.gen}`);
     check('managed: the renewal is counted and nothing was cooled down',
       (after.totals.renewals || 0) >= 1 && mp.limitedCount === 0, `renewals=${after.totals.renewals} limited=${mp.limitedCount}`);
 
@@ -1211,11 +1228,21 @@ async function memOf() {
   //     second, the whole ladder stays inside a minute, and a spent exit is
   //     burned so the pool rebuilds itself instead of cycling onto it.
   {
-    const state1 = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
-    const beforeIds = state1.providers.find((p) => p.id === 'free-rotate-test').accounts.map((a) => a.id);
     const direct = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
     check('free rotate: the first attempt is made from the host IP', direct.status === 200 && direct.headers.get('x-router-exit') === 'direct',
       `${direct.status} exit=${direct.headers.get('x-router-exit')}`);
+
+    // Lanes are minted on the first request, then stay: the slot survives a
+    // rebuild and no lane is ever replaced by another row.
+    const state1 = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const laneProvider = state1.providers.find((p) => p.id === 'free-rotate-test');
+    const beforeIds = laneProvider.accounts.map((a) => a.id);
+    check('lanes: the pool size is honoured and every lane is a separate identity',
+      laneProvider.accountCount === 2 && new Set(beforeIds).size === 2,
+      `accounts=${laneProvider.accountCount} ids=${beforeIds.join(',')}`);
+    const pins = laneProvider.accounts.map((a) => a.exit);
+    check('lanes: every lane holds its own exit',
+      pins.every(Boolean) && new Set(pins).size === pins.length, JSON.stringify(pins));
 
     fb.burn429 = 1;
     const hop = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
@@ -1233,11 +1260,12 @@ async function memOf() {
     fb.burn429 = 2;
     const esc = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
     const afterEsc = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
-    const escIds = afterEsc.providers.find((p) => p.id === 'free-rotate-test').accounts.map((a) => a.id);
-    check('free rotate: a second limit on the fresh IP reinstalls the client and succeeds',
-      esc.status === 200 && escIds.length === 1 && !escIds.some((id) => hopIds.includes(id)),
-      `${esc.status} ${JSON.stringify(hopIds)} -> ${JSON.stringify(escIds)} rotations=${esc.headers.get('x-router-rotations')} account=${esc.headers.get('x-router-account')} burnsLeft=${fb.burn429}`);
-    check('free rotate: the reinstalled identity still answers through the pool', esc.headers.get('x-router-exit') !== 'direct',
+    const escLanes = afterEsc.providers.find((p) => p.id === 'free-rotate-test');
+    check('free rotate: a second limit on the fresh IP reinstalls that lane and succeeds',
+      esc.status === 200 && escLanes.accountCount === 2
+      && escLanes.accounts.some((a) => Number(a.gen) > 1),
+      `${esc.status} gens=${escLanes.accounts.map((a) => a.gen).join(',')} rotations=${esc.headers.get('x-router-rotations')} burnsLeft=${fb.burn429}`);
+    check('free rotate: the rebuilt lane still answers through the pool', esc.headers.get('x-router-exit') !== 'direct',
       String(esc.headers.get('x-router-exit')));
     const snap2 = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
     const burnedIds = (snap2.events || []).filter((e) => e.kind === 'exit-burned').map((e) => e.exit);
@@ -1246,8 +1274,9 @@ async function memOf() {
       burnedIds.some((id) => activeIds.includes(id)) && snap2.counts.ok <= activeIds.length,
       `burnedEvents=${burnedIds.join(',')} activeBefore=${activeIds.join(',')} activeNow=${snap2.active}`);
 
-    // Worst case: everything 429s, so the ladder runs to its end. It must give up
-    // well inside the minute and let the configured fallback provider answer.
+    // Worst case: everything 429s, so the ladder runs to its end. Every lane is
+    // handed over, nothing waits for a rebuild that cannot help, and the caller
+    // is given the configured fallback provider well inside the minute.
     fb.burn429 = 99;
     const t0 = Date.now();
     const dead = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'free-rotate-test' } });
@@ -1259,6 +1288,14 @@ async function memOf() {
     check('free rotate: the ladder is bounded, not an unbounded retry storm',
       Number(dead.headers.get('x-router-rotations') || 0) <= 3, String(dead.headers.get('x-router-rotations')));
 
+    // Both lanes were handed over and parked, with a rebuild queued for each
+    // rather than run on the caller's clock.
+    const afterDead = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const deadLanes = afterDead.providers.find((p) => p.id === 'free-rotate-test').accounts;
+    check('lanes: both spent lanes are rebuilt after an exhausted ladder',
+      deadLanes.length === 2 && deadLanes.every((a) => Number(a.gen) > 1 || a.refreshing),
+      deadLanes.map((a) => `${a.name}gen${a.gen}${a.refreshing ? ' refreshing' : ''}`).join(','));
+
     // The burn pile is deleted and a fresh batch is taken on for the next hops.
     const replenished = await (await fetch(routerUrl('/admin/api/proxies/replenish'), { method: 'POST', headers: ADMIN, body: '{}' })).json();
     check('replenish: the burned exits are deleted from the pool',
@@ -1266,11 +1303,49 @@ async function memOf() {
       replenished.snapshot.exits.map((e) => `${e.id}:${e.status}`).join(','));
   }
 
+  // 28b. the default lane pool, and lanes as isolated as the design promises.
+  {
+    const st = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    const def = st.providers.find((p) => p.id === 'lane-default-test');
+    check('lanes: an untouched free provider defaults to four identities', def.identityPool === 4, String(def.identityPool));
+    const req = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'lane-default-test' } });
+    check('lanes: the default pool is minted on the first request', req.status === 200, `${req.status} ${req.text.slice(0, 120)}`);
+    const seeded = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json()).providers.find((p) => p.id === 'lane-default-test');
+    check('lanes: four separate identities exist, each with its own session and build',
+      seeded.accountCount === 4
+      && new Set(seeded.accounts.map((a) => a.lane)).size === 4
+      && new Set(seeded.accounts.map((a) => a.build)).size === 3,
+      `count=${seeded.accountCount} lanes=${seeded.accounts.map((a) => a.lane).join(',')} builds=${seeded.accounts.map((a) => a.build).join(',')}`);
+  }
+
+  // 28c. the context window the router advertises: clients trim on this number,
+  //      and an unset one made them cut the conversation off at a few thousand
+  //      tokens while the free tier still holds ~900KB.
+  {
+    const listed = await (await fetch(routerUrl('/v1/models'), { headers: ADMIN })).json();
+    const rows = listed.data || [];
+    check('context: every advertised model carries the million-token window',
+      rows.length > 0 && rows.every((m) => m.limit && m.limit.context === 1000000 && m.max_input_tokens === 1000000),
+      `rows=${rows.length} contexts=${rows.map((m) => m.limit && m.limit.context).slice(0, 6).join(',')}`);
+    const st = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    check('context: the provider summary exposes the window for the dashboard',
+      (st.providers || []).every((p) => p.contextWindow === 1000000),
+      `windows=${(st.providers || []).map((p) => p.contextWindow).join(',')}`);
+    // A large body earns a longer first-byte deadline than a chat one-liner, and
+    // the ladder's budget grows with it instead of being cut off mid-prefill.
+    const big = 'x'.repeat(400 * 1024);
+    const bigRes = await chat({ model: 'big-pickle', messages: [{ role: 'user', content: big }], headers: { 'x-router-provider': 'lane-default-test' } });
+    check('context: a 400KB prompt still answers', bigRes.status === 200, `${bigRes.status} ${bigRes.text.slice(0, 120)}`);
+  }
+
   // 29. burn bookkeeping without a network: one hit is enough to leave the pool,
   //     rotation skips what was burned, and a refill never re-applies it.
   {
     const { ProxyManager } = require('../proxy-manager.js');
     const pm = new ProxyManager({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-burn-')), log: () => {} });
+    // Its own port range: the default is production's, and an xray left behind on
+    // those ports keeps receiving traffic (reuseport) long after the test ends.
+    Object.assign(pm.state.settings, { inboundBasePort: 23800, testBasePort: 23840 });
     pm.state.exits = ['b1', 'b2', 'b3'].map((id) => ({
       id, status: 'ok', testedBy: TELEMETRY_SCHEMA, exitIp: `10.0.0.${id.slice(1)}`, latencyMs: 100, failures: 0, uri: `vless://${id}`,
     }));
@@ -1289,6 +1364,59 @@ async function memOf() {
     check('replenish: the burned exit is deleted and cannot be re-applied',
       !pm.byId.has('b1') && !pm.state.exits.some((e) => e.status === 'burned') && !pm.state.active.includes('b1'),
       pm.state.exits.map((e) => `${e.id}:${e.status}`).join(','));
+    // Never leave a listener (or its child) behind: the run is over.
+    await pm.stopMain().catch(() => {});
+  }
+
+  // 30. transport deadlines: both a silent CONNECT (stalled TLS handshake) and a
+  //     head-then-silence body must fail at the deadline. Measured on the live
+  //     pool before this fix: a stalled handshake hung for 82s because the
+  //     tunnel cleared its socket timeout and nothing re-armed it.
+  {
+    const net = require('node:net');
+    const { proxiedRequest } = require('../proxy-client.js');
+
+    const silentTunnel = net.createServer((sock) => {
+      sock.once('data', () => sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'));
+      sock.on('error', () => {});
+    });
+    await new Promise((r) => silentTunnel.listen(0, '127.0.0.1', r));
+    let handshakeErr = null;
+    const t0 = Date.now();
+    try {
+      await proxiedRequest('https://example.test/v1/chat/completions', {
+        method: 'POST', body: '{}', proxy: { host: '127.0.0.1', port: silentTunnel.address().port }, timeoutMs: 1200,
+      });
+    } catch (err) { handshakeErr = err; }
+    const handshakeMs = Date.now() - t0;
+    check('transport: a tunnel that goes silent before the TLS handshake fails at the deadline',
+      handshakeMs < 2500 && !!handshakeErr && /no response head/.test(handshakeErr.message) && handshakeErr.stall === true,
+      `${handshakeMs}ms "${handshakeErr && handshakeErr.message}"`);
+
+    const stallingBody = net.createServer((sock) => {
+      sock.once('data', () => {
+        sock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        sock.once('data', () => sock.write('HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+      });
+      sock.on('error', () => {});
+    });
+    await new Promise((r) => stallingBody.listen(0, '127.0.0.1', r));
+    let bodyMsg = '';
+    let bodyErr = null;
+    const t1 = Date.now();
+    try {
+      const res = await proxiedRequest('http://example.test/v1/chat/completions', {
+        method: 'POST', body: '{}', proxy: { host: '127.0.0.1', port: stallingBody.address().port }, timeoutMs: 1500, idleMs: 900,
+      });
+      const reader = res.body.getReader();
+      for (;;) { const { done } = await reader.read(); if (done) break; }
+    } catch (err) { bodyErr = err; bodyMsg = err.message; }
+    const bodyMs = Date.now() - t1;
+    check('transport: a body that stops after its head fails on the idle deadline',
+      bodyMs < 3500 && /stalled/.test(bodyMsg) && bodyErr.stall === true, `${bodyMs}ms "${bodyMsg}"`);
+
+    silentTunnel.close();
+    stallingBody.close();
   }
 
   // 15. cooldown expiry: a past deadline must be treated as healthy by the sweeper path

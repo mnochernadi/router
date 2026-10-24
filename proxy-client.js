@@ -27,6 +27,11 @@ const { Readable, PassThrough, Transform } = require('node:stream');
 const CONNECT_HEAD_LIMIT = 32 * 1024;
 const RESPONSE_HEAD_LIMIT = 128 * 1024;
 
+/** A deadline error. `stall` tells the caller the exit is at fault, not the peer. */
+function stallError(message) {
+  return Object.assign(new Error(message), { stall: true });
+}
+
 function headersShim(map) {
   return {
     get: (name) => (map.has(String(name).toLowerCase()) ? map.get(String(name).toLowerCase()) : null),
@@ -120,19 +125,33 @@ function openTunnel(proxy, target, timeoutMs) {
 /**
  * Write one HTTP/1.1 request onto `conn` and resolve the parsed response.
  * `Connection: close` keeps framing simple (one response per socket).
+ *
+ * Three deadlines, because they fail differently and only the first two are the
+ * exit's fault:
+ *   deadline  - the whole CONNECT + TLS + response-head path, armed by the caller
+ *               before the handshake (a stalled handshake used to hang forever:
+ *               the socket timeout was cleared when the tunnel opened).
+ *   idleMs    - no byte of the body for this long after the head opened. A
+ *               stream that keeps sending is never cut; a stalled one is.
  */
-function requestOverTunnel(conn, { method, url, headers, body, timeoutMs }) {
+function requestOverTunnel(conn, { method, url, headers, body, headDeadline, idleMs = 0 }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let head = Buffer.alloc(0);
+    let idle = null;
+    let opened = null;
+    const stopIdle = () => { if (idle) { clearInterval(idle); idle = null; } };
     const fail = (err) => {
       if (settled) return;
       settled = true;
+      if (headDeadline) headDeadline.clear();
+      stopIdle();
       try { conn.destroy(); } catch { /* noop */ }
       reject(err);
     };
 
     const onData = (chunk) => {
+      if (opened) { opened.touch(); return; }
       head = head.length ? Buffer.concat([head, chunk]) : chunk;
       const end = head.indexOf('\r\n\r\n');
       if (end === -1) {
@@ -141,6 +160,9 @@ function requestOverTunnel(conn, { method, url, headers, body, timeoutMs }) {
       }
       conn.removeListener('data', onData);
       settled = true;
+      // The exit delivered its head: the exit deadline is met. What remains is
+      // the body, which gets an idle deadline of its own instead.
+      if (headDeadline) headDeadline.clear();
       conn.setTimeout(0);
 
       const headText = head.subarray(0, end).toString('latin1');
@@ -164,8 +186,28 @@ function requestOverTunnel(conn, { method, url, headers, body, timeoutMs }) {
       conn.pipe(out);
       conn.once('error', (err) => out.destroy(err));
 
+      if (idleMs > 0) {
+        // Reset on every byte: a long answer is fine, a dead one is not. The
+        // underlying TLS socket's own setTimeout does not fire reliably once a
+        // wrapper socket replaced it, so the timer is driven from `data`.
+        let last = Date.now();
+        const touch = () => { last = Date.now(); };
+        opened = { touch };
+        conn.on('data', touch);
+        idle = setInterval(() => {
+          if (Date.now() - last < idleMs) return;
+          stopIdle();
+          out.destroy(stallError(`upstream body stalled for ${Math.round(idleMs / 1000)}s (timeout)`));
+        }, 1000);
+        out.once('close', stopIdle);
+      }
+
       const chunked = /\bchunked\b/i.test(map.get('transfer-encoding') || '');
       const bodyStream = chunked ? out.pipe(chunkedDecode()) : out;
+      // pipe() does not forward errors, and an unhandled 'error' on the raw
+      // PassThrough kills the process. Route it to whatever the caller reads.
+      if (bodyStream !== out) out.on('error', (err) => bodyStream.destroy(err));
+      else out.on('error', () => { /* the web reader carries it */ });
 
       resolve({
         status,
@@ -174,11 +216,10 @@ function requestOverTunnel(conn, { method, url, headers, body, timeoutMs }) {
         body: Readable.toWeb(bodyStream),
         node: bodyStream,
         tunnelled: true,
-        cancel: () => { try { out.destroy(); } catch { /* noop */ } try { conn.destroy(); } catch { /* noop */ } },
+        cancel: () => { stopIdle(); try { out.destroy(); } catch { /* noop */ } try { conn.destroy(); } catch { /* noop */ } },
       });
     };
 
-    conn.setTimeout(timeoutMs, () => fail(new Error(`proxy upstream timeout (${timeoutMs}ms)`)));
     conn.once('error', fail);
     conn.on('data', onData);
 
@@ -202,6 +243,7 @@ async function proxiedRequest(targetUrl, options = {}) {
     body = null,
     proxy,
     timeoutMs = 30_000,
+    idleMs = 0,
     insecure = false,
     signal,
   } = options;
@@ -213,6 +255,29 @@ async function proxiedRequest(targetUrl, options = {}) {
   const port = Number(url.port || (isTls ? 443 : 80));
 
   let conn = await openTunnel(proxy, { host: url.hostname, port }, timeoutMs);
+
+  // Armed before the handshake and cleared when the head arrives. The tunnel's
+  // own socket timeout is cleared on CONNECT 200, so without this a stalled TLS
+  // handshake waits for the peer to give up (measured: 82s).
+  const headDeadline = { timer: null, clear() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } } };
+  headDeadline.timer = setTimeout(
+    () => { try { conn.destroy(stallError(`exit produced no response head in ${Math.round(timeoutMs / 1000)}s (timeout)`)); } catch { /* noop */ } },
+    timeoutMs,
+  );
+
+  const onAbort = () => {
+    headDeadline.clear();
+    try { conn.destroy(Object.assign(new Error('aborted'), { stall: false })); } catch { /* noop */ }
+  };
+  if (signal) {
+    if (signal.aborted) {
+      headDeadline.clear();
+      try { conn.destroy(); } catch { /* noop */ }
+      throw new Error('aborted');
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
   if (isTls) {
     conn = await new Promise((resolve, reject) => {
       const t = tls.connect(
@@ -223,28 +288,32 @@ async function proxiedRequest(targetUrl, options = {}) {
     });
   }
 
-  if (signal) {
-    if (signal.aborted) { try { conn.destroy(); } catch { /* noop */ } throw new Error('aborted'); }
-    signal.addEventListener('abort', () => { try { conn.destroy(); } catch { /* noop */ } }, { once: true });
-  }
-
-  return requestOverTunnel(conn, { method, url, headers, body, timeoutMs });
+  // The listener stays attached after the head so the caller's deadline can
+  // still cut a stalled body (a non-streaming client is buffering it).
+  return requestOverTunnel(conn, { method, url, headers, body, headDeadline, idleMs });
 }
 
 /** GET a URL through a proxy and read a bounded body (used by the proxy tester). */
-async function proxiedGet(targetUrl, proxy, { timeoutMs = 8000, insecure = false, maxBytes = 64 * 1024 } = {}) {
+function proxiedGet(targetUrl, proxy, { timeoutMs = 8000, insecure = false, maxBytes = 64 * 1024 } = {}) {
   const started = Date.now();
-  const res = await proxiedRequest(targetUrl, { method: 'GET', headers: { accept: '*/*' }, proxy, timeoutMs, insecure });
-  let text = '';
-  if (res.body) {
-    const reader = Readable.fromWeb(res.body);
-    for await (const chunk of reader) {
-      text += chunk.toString('utf8');
-      if (text.length > maxBytes) break;
+  // The tester reads the whole body, so the idle guard is what stops it hanging
+  // on an exit that hands over a head and then goes quiet.
+  const res = proxiedRequest(targetUrl, { method: 'GET', headers: { accept: '*/*' }, proxy, timeoutMs, idleMs: timeoutMs, insecure });
+  return res.then(async (r) => {
+    let text = '';
+    if (r.body) {
+      const reader = Readable.fromWeb(r.body);
+      try {
+        for await (const chunk of reader) {
+          text += chunk.toString('utf8');
+          if (text.length > maxBytes) break;
+        }
+      } finally {
+        try { reader.destroy(); } catch { /* noop */ }
+      }
     }
-    try { reader.destroy(); } catch { /* noop */ }
-  }
-  return { status: res.status, ok: res.ok, text, ms: Date.now() - started, headers: res.headers, tunnelled: res.tunnelled === true };
+    return { status: r.status, ok: r.ok, text, ms: Date.now() - started, headers: r.headers, tunnelled: r.tunnelled === true };
+  });
 }
 
 module.exports = { proxiedRequest, proxiedGet, openTunnel, headersShim, chunkedDecode };

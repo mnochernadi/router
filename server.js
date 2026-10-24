@@ -292,6 +292,12 @@ function normalizeProvider(p) {
     fallbackProviders: Array.isArray(p.fallbackProviders) && p.fallbackProviders.length ? p.fallbackProviders : undefined,
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
+    // Free-tier identity lanes: how many identities run in parallel, each with
+    // its own exit IP. Clamped to 1..6; 0/unset means the default (4).
+    identityPool: Number(p.identityPool) > 0 ? Math.min(6, Number(p.identityPool)) : undefined,
+    // Context window advertised to clients for this provider (tokens). The free
+    // tier holds ~900KB, so the default is a full million.
+    contextWindow: Number(p.contextWindow) > 0 ? Math.round(Number(p.contextWindow)) : undefined,
     accounts,
   };
 }
@@ -602,7 +608,10 @@ function selectAccount(provider, exclude) {
     const a = list[i];
     if (!a || a.enabled === false) return false;
     if (exclude.has(a.id)) return false;
-    return !isLimited(accountState(provider.id, a.id));
+    const as = accountState(provider.id, a.id);
+    // A lane under rebuild has no valid identity yet.
+    if (as.refreshing) return false;
+    return !isLimited(as);
   };
 
   const healthy = [];
@@ -655,6 +664,11 @@ function accountSummary(provider, account) {
   return {
     id: account.id,
     name: account.name,
+    lane: account.lane === undefined ? 0 : Number(account.lane),
+    gen: Number(as.gen) || 1,
+    build: openCodeUA(provider, account),
+    refreshing: !!as.refreshing,
+    exit: (proxies && proxies.state.lanes[provider.id] ? proxies.state.lanes[provider.id][laneKeyOf(account)] : '') || '',
     maskedKey: maskKey(account.apiKey),
     keyless: !usableKey(account.apiKey),
     enabled: account.enabled !== false,
@@ -687,6 +701,11 @@ function providerSummary(provider) {
     hasModelStyles: !!provider.modelStyles,
     rotateEveryMinutes: Number(provider.rotateEveryMinutes) || 0,
     managed: isManagedProvider(provider),
+    // Identities run in parallel lanes, each on its own exit IP: a spent lane is
+    // rebuilt while the others keep answering.
+    identityPool: managedPoolSize(provider),
+    // Advertised context window; clients read it and stop trimming at 8k.
+    contextWindow: contextWindowOf(provider),
     // The dashboard reads this to render the "rotating exits" pill and to seed
     // the edit form; without it an edit silently saved `proxy: 'direct'`.
     proxy: provider.proxy || 'direct',
@@ -857,11 +876,15 @@ function buildUpstream(provider, account, ctx) {
   };
 }
 
-async function callUpstream(provider, account, ctx) {
+async function callUpstream(provider, account, ctx, limits = {}) {
   const spec = buildUpstream(provider, account, ctx);
   const controller = new AbortController();
   const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 30_000;
-  const timer = setTimeout(() => controller.abort(new Error('upstream timeout')), timeoutMs);
+  // The free tier hands in its own, shorter limits: the first byte has to arrive
+  // inside the ladder's remaining budget, not inside the provider's whole-answer
+  // timeout, or a single stalled exit eats the minute on its own.
+  const headMs = Math.max(1_000, Math.min(timeoutMs, Number(limits.headMs) || timeoutMs));
+  const timer = setTimeout(() => controller.abort(new Error('upstream timeout')), headMs);
   if (timer.unref) timer.unref();
 
   let url = spec.url;
@@ -891,7 +914,9 @@ async function callUpstream(provider, account, ctx) {
   // starts direct and only moves into the exit pool after a quota answer - that
   // is what ctx.forceDirect tracks and what the quota branch clears. Every other
   // provider picks from the pool exactly as configured.
-  const picked = proxies && !ctx.forceDirect ? proxies.pick(provider) : null;
+  const picked = proxies && !ctx.forceDirect
+    ? (ctx.lane !== undefined ? proxies.pickLane(provider, ctx.lane) : proxies.pick(provider))
+    : null;
   let upstream;
   try {
     if (picked) {
@@ -902,16 +927,19 @@ async function callUpstream(provider, account, ctx) {
           body: payload,
           proxy: picked.proxy,
           // A dead exit accepts the local TCP connect and then stalls the
-          // CONNECT forever, so the pool path gets a first-byte deadline of its
-          // own instead of the provider's whole-response timeout. A healthy
-          // exit answers its headers in ~1-3s (measured).
-          timeoutMs: Math.min(timeoutMs, EXIT_FIRST_BYTE_MS),
+          // CONNECT/TLS/head path, so the pool path gets a first-byte deadline of
+          // its own instead of the provider's whole-response timeout. A healthy
+          // exit answers its headers in ~1-3s (measured). `idleMs` covers the
+          // body for buffered (non-streaming) callers and is zero for streams,
+          // which the client is already draining.
+          timeoutMs: headMs,
+          idleMs: ctx.aggregate ? Math.max(5_000, Math.min(EXIT_BODY_STALL_MS, Number(limits.bodyIdleMs) || EXIT_BODY_STALL_MS)) : 0,
           insecure: !!proxies.state.settings.insecure,
           signal: controller.signal,
         });
       } catch (err) {
         err.exit = picked.exit;
-        err.exitStall = /timeout/i.test(err.message || '');
+        err.exitStall = err.stall === true || /timeout|stalled/i.test(err.message || '');
         throw err;
       }
     } else {
@@ -1400,7 +1428,11 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   }
 
   // ---- upstream streams, client asked for one JSON object ------------------
-  if (ctx.aggregate && upstream.body && upstream.status < 300) {
+  // Only when the upstream really speaks SSE. Pollinations and friends answer a
+  // non-streaming request with plain JSON; running the SSE aggregator over that
+  // produced a well-formed but *empty* assistant message.
+  const upstreamType = String(upstream.headers.get('content-type') || '').toLowerCase();
+  if (ctx.aggregate && upstream.body && upstream.status < 300 && upstreamType.includes('event-stream')) {
     let payload = '';
     const early = baseResponseHeaders(upstream.status, 'application/json; charset=utf-8', provider);
     early['x-router-account'] = String(account?.id || '');
@@ -1442,6 +1474,7 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   // ---- streaming / passthrough: zero-copy, never buffered -------------------
   const headers = baseResponseHeaders(upstream.status, contentType, provider);
   headers['x-router-account'] = String(account?.id || '');
+  headers['x-router-model'] = String(ctx.model || '');
   headers['x-router-attempts'] = String(attempts);
   headers['x-router-exit'] = ctx.exitId || 'direct';
   headers['x-router-rotations'] = String(ctx.rotations || 0);
@@ -1567,45 +1600,157 @@ const MANAGED_MAX_RENEWALS = 4;
 // Minimum spacing between identity replacements for a managed provider.
 const MANAGED_RENEW_GAP_MS = 10 * 60_000;
 const MANAGED_BACKOFF_MS = 60_000;
+// Free-tier identity lanes.
+//
+// One identity means one IP means one allowance, and an allowance that runs out
+// stops the operator until it refreshes. So the free tier runs several identities
+// in parallel, each pinned to its own exit IP and its own client build: while one
+// lane answers 429 the request simply continues on the next, and the spent lane
+// is rebuilt in the background (new IP, new identity, new build). Nothing here
+// touches Marzban - lanes are plain xray exits from the pool above.
+const MANAGED_POOL_DEFAULT = 4;
+const MANAGED_POOL_MAX = 6;
+// A lane that ran out is parked for this long while it is rebuilt, so it is not
+// picked again in the middle of the rebuild.
+const LANE_REFRESH_COOLDOWN_MS = 30_000;
+// How long a request may wait for a replacement lane when every lane is spent.
+const LANE_WAIT_MS = 12_000;
 // How long a pooled exit gets to produce response headers before it counts as
 // dead and the request moves on. Measured: healthy exits answer in 1-3s; a
 // burned node accepts the connect and then never answers.
 const EXIT_FIRST_BYTE_MS = 25_000;
-// The whole free-tier escalation (new IP -> new identity -> model walk) has to
-// finish inside a minute; past that the caller gets the fallback provider.
+// ...and the same for the body: an exit that hands over a head and then stops
+// sending must be dropped instead of holding an aggregated answer forever.
+const EXIT_BODY_STALL_MS = 20_000;
+
+// The whole free-tier escalation (new IP -> new identity -> next lane -> model
+// walk) has to finish inside a minute; past that the caller gets the fallback
+// provider. The provider ladder stops earlier than the response deadline so the
+// fallback hop still has time to answer inside the minute the caller was promised.
 const FREE_LIMIT_BUDGET_MS = 60_000;
+const FREE_PROVIDER_BUDGET_MS = 25_000;
+// Same ladder, shorter leash, for a provider whose lanes are *already* all spent
+// or rebuilding when the request arrives: the rungs left are a formality (the
+// ceiling is upstream, not local), and the caller should reach the fallback in
+// about the time a cold answer takes instead of riding out the full budget.
+const FREE_PROVIDER_DRY_BUDGET_MS = 20_000;
+// How long the pool is left alone once two lanes have produced the same free-tier
+// quota answer: the ceiling is on the upstream account, so rotating exits and
+// minting identities only burns addresses that the next real request needs.
+const FREE_DRY_MS = 5 * 60_000;
+const freeDry = { hits: 0, until: 0 };
+// A retry that follows a 429 is usually answered quickly (or not at all): a
+// stalled exit is abandoned in eight seconds instead of twenty-five, because the
+// next lane is cheap and the caller's budget is not. The first attempt keeps the
+// full deadline - big contexts are legitimately slow before the first byte.
+const EXIT_RETRY_FIRST_BYTE_MS = 8_000;
+
+// The free tier was measured to hold roughly 900KB of context, so the window the
+// router advertises is a full million tokens. Clients that read the model list
+// take their limit from here; without it they guess a tiny window and trim the
+// conversation long before the upstream does.
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
+// Prefill, not generation: a large body is legitimately slow before the first
+// byte, so the deadline grows with the payload instead of killing a big prompt
+// on a deadline sized for a chat one-liner. ~25ms per extra KB, capped.
+const PROMPT_BUDGET_PER_KB_MS = 25;
+const PROMPT_BUDGET_FREE_KB = 8;
+const PROMPT_BUDGET_MAX_MS = 75_000;
+
+function contextWindowOf(provider) {
+  const n = Number(provider && provider.contextWindow);
+  return n > 0 ? Math.round(n) : DEFAULT_CONTEXT_WINDOW;
+}
+
+/** Extra first-byte time a body of this size deserves, in milliseconds. */
+function promptSizeBudget(bytes) {
+  if (!bytes) return 0;
+  const kb = bytes / 1024 - PROMPT_BUDGET_FREE_KB;
+  if (kb <= 0) return 0;
+  return Math.min(PROMPT_BUDGET_MAX_MS, Math.round(kb * PROMPT_BUDGET_PER_KB_MS));
+}
+
+/** The fields a client reads a model's limits from, OpenAI and Anthropic style. */
+function limitFields(provider) {
+  const context = contextWindowOf(provider);
+  const output = DEFAULT_MAX_OUTPUT_TOKENS;
+  return { limit: { context, output, input: context }, context_length: context, max_input_tokens: context, max_output_tokens: output };
+}
 
 function isManagedProvider(provider) {
   return !!(PROVIDER_TYPES[provider && provider.type] || {}).manageAccounts;
 }
 
-function newManagedAccount(provider) {
-  const n = (state.totals.renewals || 0) + 1;
-  const acc = normalizeAccount({ name: `identity-${n}`, apiKey: '' });
+/** How many identity lanes a managed provider runs (`identityPool`, default 4). */
+function managedPoolSize(provider) {
+  const raw = (provider && provider.identityPool) ?? config.freeIdentityPool ?? process.env.ROUTER_FREE_IDENTITIES;
+  const n = Math.round(Number(raw));
+  if (!Number.isFinite(n) || n <= 0) return MANAGED_POOL_DEFAULT;
+  return Math.min(MANAGED_POOL_MAX, Math.max(1, n));
+}
+
+/** The lane an account belongs to; 0 when the provider is not lane-based. */
+function laneKeyOf(account) {
+  const n = Number(account && account.lane);
+  return String(Number.isFinite(n) && n >= 0 ? n : 0);
+}
+
+function newManagedAccount(provider, lane = 0) {
+  const acc = normalizeAccount({ name: `identity-${lane + 1}`, apiKey: '' });
   acc.keyless = true;
+  acc.lane = lane;
+  acc.gen = 1;
   return acc;
 }
 
+/**
+ * Guarantee the lane pool exists. Rows are positional (index === lane), so a
+ * rebuilt identity keeps its lane and its slot instead of churning the array.
+ */
 function ensureManagedAccount(provider) {
   if (!isManagedProvider(provider)) return null;
   provider.accounts = provider.accounts || [];
-  // One identity is the model: it is replaced, not accumulated. Extra rows
-  // from an older build are pruned so the provider page stays honest.
-  if (provider.accounts.length > 1) {
-    const keep = provider.accounts.find((a) => a.enabled !== false) || provider.accounts[0];
+  const size = managedPoolSize(provider);
+  if (provider.accounts.length > size) {
     const ps = providerState(provider.id);
-    for (const a of provider.accounts) if (a.id !== keep.id && ps.accounts) delete ps.accounts[a.id];
-    provider.accounts = [keep];
+    for (const a of provider.accounts.slice(size)) if (ps.accounts) delete ps.accounts[a.id];
+    provider.accounts = provider.accounts.slice(0, size);
+    if (proxies) for (const lane of Object.keys(proxies.state.lanes[provider.id] || {})) {
+      if (Number(lane) >= size) proxies.releaseLane(provider.id, lane);
+    }
     saveConfig().catch(() => {});
   }
-  const live = provider.accounts.find((a) => a.enabled !== false);
-  if (live) return live;
-  const created = provider.accounts[0] || newManagedAccount(provider);
-  if (!provider.accounts.length) provider.accounts.push(created);
-  created.enabled = true;
-  saveConfig().catch(() => {});
-  pushEvent({ kind: 'identity-created', pid: provider.id, aid: created.id });
-  return created;
+  let created = false;
+  for (let lane = 0; lane < size; lane += 1) {
+    let acc = provider.accounts[lane];
+    if (!acc) {
+      acc = provider.accounts[lane] = newManagedAccount(provider, lane);
+      const as = accountState(provider.id, acc.id);
+      // Spread the builds over the lanes: two lanes presenting the same client
+      // version look more like one client than like two installs.
+      as.uaIndex = lane % OPENCODE_FREE_UAS.length;
+      as.sessionId = '';
+      as.refreshing = false;
+      openCodeSession(provider, acc);
+      created = true;
+      pushEvent({ kind: 'identity-created', pid: provider.id, aid: acc.id, lane });
+    }
+    if (acc.lane === undefined) acc.lane = lane;
+  }
+  // Pin an exit per lane straight away, so every identity has its own address
+  // before its first request and the dashboard can show the one it will use.
+  if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
+    for (let lane = 0; lane < size; lane += 1) {
+      if (provider.accounts[lane]) proxies.pickLane(provider, String(lane));
+    }
+  }
+  if (created) {
+    saveConfig().catch(() => {});
+    console.warn(`[proxy] ${provider.id}: identity pool up with ${size} lane(s), each on its own exit IP`);
+  }
+  const list = provider.accounts.filter((a) => a.enabled !== false);
+  return list.find((a) => !isLimited(accountState(provider.id, a.id))) || list[0] || null;
 }
 
 /**
@@ -1623,37 +1768,98 @@ function ensureManagedAccount(provider) {
  * upstream window instead of reinstalling in a loop.
  */
 function reinstallManagedClient(provider, oldAccount, reason, { rotateExit = false } = {}) {
-  const prevAs = accountState(provider.id, oldAccount.id);
-  const prevUa = Number(prevAs.uaIndex || 0);
-  const idx = (provider.accounts || []).findIndex((a) => a.id === oldAccount.id);
-  if (idx !== -1) provider.accounts.splice(idx, 1);
-  const ps = providerState(provider.id);
-  if (ps.accounts) delete ps.accounts[oldAccount.id];
-  const fresh = newManagedAccount(provider);
-  provider.accounts.push(fresh);
-  state.totals.renewals = (state.totals.renewals || 0) + 1;
-  state.totals.reinstalls = (state.totals.reinstalls || 0) + 1;
-  // The old session is gone with its account, so the next request signs with a
-  // new one; every other fingerprint the router controls is rotated here too.
-  const as = accountState(provider.id, fresh.id);
+  const as = accountState(provider.id, oldAccount.id);
+  const prevUa = Number(as.uaIndex || 0);
+  // In place: the account row, its id and its lane stay, only the identity that
+  // upstream sees is replaced. Replacing the row instead would leave the lane
+  // without a state record and lose its exit pin.
   as.uaIndex = (prevUa + 1) % OPENCODE_FREE_UAS.length;
   as.lastRenewAt = Date.now();
   as.reinstalledAt = Date.now();
   as.reinstallReason = String(reason || '').slice(0, 120);
   as.limitedUntil = 0;
+  as.gen = (Number(as.gen) || 1) + 1;
+  oldAccount.gen = as.gen;
+  state.totals.renewals = (state.totals.renewals || 0) + 1;
+  state.totals.reinstalls = (state.totals.reinstalls || 0) + 1;
   // Mint the session now instead of lazily on the next request, so the rebuilt
   // client is complete and observable the moment this returns (and the admin
   // API can hand back the session it will actually use).
   as.sessionId = '';
-  openCodeSession(provider, fresh);
+  openCodeSession(provider, oldAccount);
   if (rotateExit && provider.proxy === 'rotate' && proxies && proxies.activeExits().length > 1) {
-    proxies.rotate(`reinstall after ${reason}`, provider.id);
+    proxies.rotateLane(provider, laneKeyOf(oldAccount), `reinstall after ${reason}`);
   }
-  pushEvent({ kind: 'reinstall', pid: provider.id, aid: fresh.id, reason });
-  console.warn(`[proxy] ${provider.id}: client reinstalled (${reason}); ${oldAccount.name} -> ${fresh.name}, new session, new project, client ${OPENCODE_FREE_UAS[as.uaIndex]}`);
+  pushEvent({ kind: 'reinstall', pid: provider.id, aid: oldAccount.id, lane: oldAccount.lane, reason });
+  console.warn(`[proxy] ${provider.id}#${laneKeyOf(oldAccount)}: client reinstalled (${reason}); new session, new project, client ${OPENCODE_FREE_UAS[as.uaIndex]}`);
   saveConfig().catch(() => {});
   persistState();
-  return fresh;
+  return oldAccount;
+}
+
+/**
+ * Rebuild one spent lane in the background: new exit IP first, then a new client
+ * identity on it. The request that hit the limit does not wait for this - it
+ * continues on the next lane - which is the whole point of running several.
+ */
+const lanesRefreshing = new Set();
+
+function queueLaneRefresh(provider, account, reason) {
+  const key = `${provider.id}#${laneKeyOf(account)}`;
+  if (lanesRefreshing.has(key)) return false;
+  lanesRefreshing.add(key);
+  const as = accountState(provider.id, account.id);
+  as.refreshing = true;
+  as.limitedUntil = now() + LANE_REFRESH_COOLDOWN_MS;
+  persistState();
+  setImmediate(async () => {
+    try {
+      if (provider.proxy === 'rotate' && proxies) {
+        const burned = proxies.state.lanes[provider.id] ? proxies.state.lanes[provider.id][laneKeyOf(account)] : '';
+        if (burned) proxies.noteResult(burned, false, { burn: true });
+        proxies.releaseLane(provider.id, laneKeyOf(account));
+      }
+      reinstallManagedClient(provider, account, reason);
+      if (provider.proxy === 'rotate' && proxies) proxies.pickLane(provider, laneKeyOf(account));
+      as.refreshing = false;
+      as.limitedUntil = 0;
+      console.warn(`[proxy] ${provider.id}#${laneKeyOf(account)}: lane rebuilt in the background (${reason})`);
+    } catch (err) {
+      as.refreshing = false;
+      as.limitedUntil = now() + LANE_REFRESH_COOLDOWN_MS;
+      console.warn(`[proxy] ${provider.id}#${laneKeyOf(account)}: lane rebuild failed: ${err.message}`);
+    } finally {
+      lanesRefreshing.delete(key);
+      persistState();
+    }
+  });
+  return true;
+}
+
+function laneReady(provider, account) {
+  const as = accountState(provider.id, account.id);
+  return account.enabled !== false && !as.refreshing && !isLimited(as);
+}
+
+/**
+ * Start a pool rebuild in the background, at most once every 20s. A request must
+ * not sit on a subscription fetch and a test run while the caller is waiting, but
+ * an empty pool has to refill itself or every lane loses its only move.
+ */
+let poolKickAt = 0;
+function kickPool(reason) {
+  if (!proxies || Date.now() - poolKickAt < 20_000) return;
+  poolKickAt = Date.now();
+  Promise.resolve(proxies.replenish(reason)).catch(() => {});
+}
+
+async function waitForLane(provider, ms) {
+  const deadline = Date.now() + Math.max(0, ms);
+  while (Date.now() < deadline) {
+    if ((provider.accounts || []).some((a) => laneReady(provider, a))) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return (provider.accounts || []).some((a) => laneReady(provider, a));
 }
 
 // The historical name: the request path, the admin API and the tests use it.
@@ -1721,7 +1927,7 @@ async function handleProxy(req, res, url) {
   // Wall-clock ceiling for the free tier's limit ladder (rotate -> reinstall ->
   // model walk -> rotate -> session). Past it the request falls through to the
   // fallback provider instead of leaving the caller waiting.
-  let freeLimitDeadline = t0 + FREE_LIMIT_BUDGET_MS;
+  let freeLimitDeadline = t0 + FREE_PROVIDER_BUDGET_MS;
   state.totals.requests += 1;
 
   if (config.proxyKeys.length) {
@@ -1738,6 +1944,12 @@ async function handleProxy(req, res, url) {
     try { body = await readJsonBody(req); }
     catch (err) { state.totals.failed += 1; return sendJson(res, err.statusCode || 400, { error: { message: err.message } }); }
   }
+  // Size of what we have to hand over: a million-token context needs a much
+  // longer first-byte ceiling than the one a short chat does, and its budget is
+  // extended by the same amount so the ladder is not cut off mid-prefill.
+  const promptBytes = Buffer.byteLength(JSON.stringify(body || ''));
+  const contextMs = promptSizeBudget(promptBytes);
+  freeLimitDeadline += contextMs;
 
   const { provider, model } = resolveProvider(body, req);
   if (!provider) {
@@ -1785,7 +1997,15 @@ async function handleProxy(req, res, url) {
     translate: isChat && style !== 'openai' && style !== 'opencode-free' && style !== 'freebuff',
   };
   // Free tier: first attempt from the host's own IP, then the pool (see above).
-  if (style === 'opencode-free') ctx.forceDirect = true;
+  if (style === 'opencode-free') {
+    ctx.forceDirect = true;
+    // Every lane is spent or rebuilding already: this request is here to learn
+    // the same limit again, so cap the ladder short. `contextMs` is added back
+    // because a big prompt still needs its own head start.
+    if ((provider.accounts || []).every((a) => !laneReady(provider, a))) {
+      freeLimitDeadline = t0 + FREE_PROVIDER_DRY_BUDGET_MS + contextMs;
+    }
+  }
   if (style === 'freebuff') ctx.responseStyle = 'openai';
   if (style === 'anthropic' && wantAnthropicIn) {
     ctx.suffix = '/messages';
@@ -1812,13 +2032,32 @@ async function handleProxy(req, res, url) {
   if (isManagedProvider(provider)) ensureManagedAccount(provider);
   ctx.includeUsage = !!(body && body.stream_options && body.stream_options.include_usage);
   const tried = new Set();
-  const maxAttempts = provider.maxAttempts > 0 ? provider.maxAttempts : Math.max(1, (provider.accounts || []).length);
+  const maxAttempts = provider.maxAttempts > 0
+    ? provider.maxAttempts
+    : (style === 'opencode-free'
+      // One attempt per lane, plus room for the model walk and the session trick
+      // once every lane is spent, so a handover never eats the last attempt.
+      ? Math.max((provider.accounts || []).length + 4, 8)
+      : Math.max(1, (provider.accounts || []).length));
   let sawLimit = false;
+  let laneWaitDone = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let account = selectAccount(provider, tried);
+    if (!account && style === 'opencode-free' && !laneWaitDone && now() < freeLimitDeadline) {
+      // Every lane is spent or rebuilding. Rather than failing the caller, wait a
+      // moment for the fastest rebuild - that is still far shorter than the
+      // upstream's own retry window, and the lanes are being rebuilt in parallel.
+      laneWaitDone = true;
+      const budget = Math.min(LANE_WAIT_MS, Math.max(0, freeLimitDeadline - now()));
+      if (await waitForLane(provider, budget)) {
+        tried.clear();
+        account = selectAccount(provider, tried);
+      }
+    }
     if (!account) break;
     tried.add(account.id);
+    if (isManagedProvider(provider)) ctx.lane = laneKeyOf(account);
     let renewals = 0;
 
     const rotateWanted = provider.proxy === 'rotate' && !!proxies && proxies.state.settings.enabled;
@@ -1831,10 +2070,21 @@ async function handleProxy(req, res, url) {
     let netRetries = 0;
     let sessionRetries = 0;
     let modelsThisIp = 0;
+    const freeLadder = style === 'opencode-free';
 
     // Inner loop: same account, new exit IP. A rate limit here is usually
     // IP-bound, so rotating the exit beats burning the account for 12 hours.
     for (;;) {
+      // The budget is checked *before* the attempt, not only after a refusal: an
+      // exit that never answers would otherwise run past the minute on its own.
+      const remaining = freeLadder ? freeLimitDeadline - now() : Infinity;
+      if (freeLadder && remaining <= 0) {
+        console.warn(`[proxy] ${provider.id}/${account.name}: free-tier budget spent before the attempt; giving up on this provider`);
+        break;
+      }
+      // A burn promotes a spare and xray is re-pointed at it; dialling while that
+      // restart is in flight would hit a closed port and burn the spare too.
+      if (proxies && proxies.restarting) await proxies.settle(4000);
       const as = accountState(provider.id, account.id);
       as.requests = (as.requests || 0) + 1;
       as.lastUsed = now();
@@ -1844,7 +2094,20 @@ async function handleProxy(req, res, url) {
       let controller;
       let call;
       try {
-        call = await callUpstream(provider, account, ctx);
+        call = await callUpstream(provider, account, ctx, {
+          // Never more than the first-byte deadline, never less than a fair 6s
+          // (the budget check above already guarantees a positive remainder).
+          // Retries get the short deadline: a lane handover costs less than
+          // waiting out a stalled exit - but a large body still gets its prefill
+          // allowance, halved on a retry because the exit, not the prompt, is on
+          // trial there.
+          headMs: Math.min(
+            (attempt === 1 ? EXIT_FIRST_BYTE_MS : EXIT_RETRY_FIRST_BYTE_MS) + (attempt === 1 ? contextMs : Math.round(contextMs / 2)),
+            Math.max(6_000, remaining),
+          ),
+          // Buffered answers also get an idle deadline on the body.
+          bodyIdleMs: remaining,
+        });
         ({ upstream, controller } = call);
       } catch (err) {
         as.failures = (as.failures || 0) + 1;
@@ -1853,23 +2116,35 @@ async function handleProxy(req, res, url) {
         pushEvent({ kind: 'error', pid: provider.id, aid: account.id, st: 0 });
         persistState();
         console.warn(`[proxy] ${provider.id}/${account.name} network error: ${err.message}`);
-        if (err.exit && proxies) proxies.noteResult(err.exit.id, false, { burn: !!err.exitStall });
-        // A stalled exit is the exit's fault, not the identity's: change the
-        // exit immediately instead of spending the two socket retries on it.
-        if (err.exitStall && rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
-          const next = proxies.rotate(`stalled exit on ${provider.id}`, provider.id);
+        // Any exit-level failure leaves the pool: a stalled or resetting exit is
+        // spent the same way a limited one is, and the pool must rebuild from it.
+        if (err.exit && proxies) proxies.noteResult(err.exit.id, false, { burn: true });
+        // The exit is at fault, not the identity, so change the exit first - a
+        // stall and a reset get the same answer. Only when the hops are spent is
+        // the identity rebuilt, and only on the free tier (elsewhere the account
+        // itself is what failed).
+        if (rotateWanted && rotations < Math.max(1, rotateMax) && proxies.activeExits().length > 1) {
+          const next = proxies.rotate(`${err.exitStall ? 'stalled' : 'failed'} exit on ${provider.id}`, provider.id);
           if (next) {
             rotations += 1;
-            console.warn(`[proxy] exit ${err.exit.id} produced no headers in ${EXIT_FIRST_BYTE_MS / 1000}s; rotated to ${next.id} (${rotations}/${Math.max(1, rotateMax)})`);
+            ctx.forceDirect = false;
+            console.warn(`[proxy] exit ${err.exit ? err.exit.id : '?'} ${err.exitStall ? `produced no response in ${Math.round(Math.min(EXIT_FIRST_BYTE_MS, remaining) / 1000)}s` : 'failed'}; rotated to ${next.id} (${rotations}/${Math.max(1, rotateMax)})`);
             continue;
           }
-          void proxies.replenish('every active exit stalled');
+          void proxies.replenish('every active exit failed');
         }
-        // Transient socket drops (TLS reset, upstream idle close) are worth one
-        // retry on the same identity before the provider is called unhealthy.
-        if (netRetries < 2) {
+        if (freeLadder && rotations > 0 && renewals < 1 && now() < freeLimitDeadline) {
+          const fresh = reinstallManagedClient(provider, account, `network error through exit ${err.exit ? err.exit.id : '?'}`);
+          renewals += 1;
+          account = fresh;
+          console.warn(`[proxy] ${provider.id}: no exit answered; reinstalled the client and retrying`);
+          continue;
+        }
+        // Transient socket drops are worth one retry on the same identity before
+        // the provider is called unhealthy.
+        if (netRetries < 1 && now() < freeLimitDeadline) {
           netRetries += 1;
-          await new Promise((r) => setTimeout(r, 400 * netRetries));
+          await new Promise((r) => setTimeout(r, 400));
           continue;
         }
         break;
@@ -1893,6 +2168,10 @@ async function handleProxy(req, res, url) {
         const repeated = rotations > 0 && lastFailureKey === `${upstream.status}|${snippet}`;
         lastFailureKey = `${upstream.status}|${snippet}`;
         const freeTier = (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free';
+        // Remember an account-wide ceiling only once a lane has spent its whole
+        // ladder against it (see the deadline break below): the body itself is not
+        // proof, a ladder that could not clear it is.
+        const accountWide = /subscribe|sign ?up|upgrade|\/go\b/i.test(String(snippet || ''));
         if (isManagedProvider(provider) && renewals < 1 && !freeTier) {
           // Non-free managed providers have no exit pool: reinstall is the only
           // lever, so it runs first for them. The free tier rotates first (see
@@ -1920,21 +2199,60 @@ async function handleProxy(req, res, url) {
           //   1. the next exit IP, retrying the model the client asked for,
           //   2. a reinstalled client (new identity, session, project, UA) on
           //      that fresh IP when it limits as well,
-          //   3. the rest of the free model pool on this IP,
-          //   4. further exit IPs,
-          //   5. a rebuilt session,
+          //   3. then the rest of this lane's model pool on its own IP, and a
+          //      rebuilt session,
+          //   4. only now hand the request to the next identity lane, whose IP
+          //      and identity are untouched, while this lane is rebuilt in the
+          //      background (new IP, new identity, new build),
+          //   5. if every lane is spent, wait briefly for the first rebuild,
           //   6. the caller's configured fallback provider.
-          // The whole ladder is capped by FREE_LIMIT_BUDGET_MS so a caller never
-          // waits a minute for an answer the fallback could give at once. Every
+          // Handing over is deliberately *after* the local rungs: a lane's exit
+          // is the shared resource, and hopping lanes on the first 429 burns four
+          // IPs on a dry model while the model pool beside it is untried. The
+          // order only leaves step 5 on the caller's clock, and the rebuild
+          // happens on the lanes that are parked - never on the serving one. Every
           // exit that answers a limit is burned, so the pool rebuilds itself
-          // instead of cycling back onto spent IPs. Nothing cools the account:
+          // instead of cycling back onto spent IPs. Nothing cools an account:
           // the free tier carries no timer.
           if (now() > freeLimitDeadline) {
-            console.warn(`[proxy] ${provider.id}/${account.name}: free-tier limit ladder spent its ${Math.round(FREE_LIMIT_BUDGET_MS / 1000)}s budget after ${rotations} rotation(s); giving up on this provider`);
+            console.warn(`[proxy] ${provider.id}/${account.name}: free-tier limit ladder spent its ${Math.round((freeLimitDeadline - t0 - contextMs) / 1000)}s budget after ${rotations} rotation(s); giving up on this provider`);
+            // A ladder that burned its whole budget without clearing the limit
+            // means the ceiling is upstream of this box: rotating exits and
+            // minting identities only spend addresses the next real request needs.
+            // Rest the pool for a short window and answer from the fallback.
+            if (accountWide) {
+              freeDry.hits += 1;
+              // Two ladders in a row could not clear it - that is the account, not
+              // the exit. One is kept as a fluke so a single slow burst does not
+              // switch the pool off.
+              if (freeDry.hits >= 2) {
+                freeDry.until = now() + FREE_DRY_MS;
+                console.warn(`[proxy] ${provider.id}: ceiling is upstream, not the exit - resting the pool for ${Math.round(FREE_DRY_MS / 60000)}m`);
+              }
+            }
             break;
           }
-          const rotationPossible = rotateWanted && rotateMax > 0;
-          const canRotate = rotationPossible && rotations < rotateMax;
+          if (freeDry.until > now()) {
+            // Known-dry ceiling: leave the exit in the pool instead of burning it
+            // for an answer this box cannot change, and hand the request on. The
+            // pool still has to refill itself for the moment the ceiling lifts, so
+            // the background rebuild is kicked here too - resting is not sleeping.
+            kickPool(`dry free ceiling for ${provider.id}`);
+            console.warn(`[proxy] ${provider.id}/${account.name}: free ceiling is dry upstream - not burning exit ${call.exit ? call.exit.id : 'direct'}; answering from the fallback`);
+            break;
+          }
+          const laneKey = laneKeyOf(account);
+          // No exit in the pool means there is nothing to hop to: treat the IP
+          // step as impossible rather than attempted, so the identity step (the
+          // next best move from the same IP) still happens - and start refilling
+          // the pool in the background, because the next request will need it.
+          const poolUsable = proxies.activeExits().length > 0;
+          if (!poolUsable) kickPool(`empty exit pool for ${provider.id}`);
+          const rotationPossible = rotateWanted && rotateMax > 0 && poolUsable;
+          // One IP hop per lane and request: with several lanes alive, burning
+          // three exits on one identity before trying a healthy lane next door is
+          // waste - the hops are cheap, the pool is not.
+          const canRotate = rotationPossible && rotations < (freeLadder ? Math.min(rotateMax, 1) : rotateMax);
           // The exit that answered the limit is spent either way - burn it even
           // when the next step is a reinstall rather than another hop.
           if (call.exit) proxies.noteResult(call.exit.id, false, { burn: true });
@@ -1945,23 +2263,25 @@ async function handleProxy(req, res, url) {
             : Math.max(0, Number(rawGap) || 0) * 60_000;
           // One IP change first; the identity goes only when that did not help.
           // A provider with no pool has no IP to move to, so it reinstalls on the
-          // first limit instead. One reinstall per request at most.
+          // first limit instead. One reinstall per lane and request at most; the
+          // free tier ignores the spacing, because a rebuilt identity is exactly
+          // what a spent lane needs.
           const reinstallDue = renewals < 1
             && (rotations > 0 || !rotationPossible)
-            && Date.now() - (rt.lastRenewAt || 0) >= gapMs;
+            && (freeLadder || Date.now() - (rt.lastRenewAt || 0) >= gapMs);
           if (canRotate && !reinstallDue) {
             ctx.forceDirect = false; // never go back to the host IP, it is spent
             const pool = proxies.activeExits();
-            let next = pool.length ? proxies.rotate(`HTTP ${upstream.status} on ${provider.id}`, provider.id) : null;
+            let next = pool.length ? proxies.rotateLane(provider, laneKey, `HTTP ${upstream.status} on ${provider.id}`) : null;
             if (!next) {
               // Pool drained (or never filled): rebuild it now, and give the
               // rebuild's time back to the budget - waiting on the pool is not
               // the caller's fault.
               const rebuildStart = now();
               console.warn(`[proxy] ${provider.id}: no usable exit left, rebuilding the pool with new subscriptions`);
-              const rebuilt = await proxies.replenish(`no usable exit for ${provider.id}`);
+              const rebuilt = await proxies.replenish(`no usable exit for ${provider.id}`, { maxCandidates: 15 });
               freeLimitDeadline += now() - rebuildStart;
-              next = rebuilt && rebuilt.ok ? proxies.rotate(`rebuilt pool for ${provider.id}`, provider.id) : null;
+              next = rebuilt && rebuilt.ok ? proxies.rotateLane(provider, laneKey, `rebuilt pool for ${provider.id}`) : null;
             }
             if (next) {
               rotations += 1;
@@ -1970,7 +2290,7 @@ async function handleProxy(req, res, url) {
               triedModels.add(requestedModel);
               ctx.model = requestedModel;
               modelsThisIp = 0;
-              console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}; retrying ${requestedModel} on exit ${next.id} (${rotations}/${rotateMax})`);
+              console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status}; retrying ${requestedModel} on exit ${next.id} (${rotations}/${rotateMax})`);
               // Running low: refill in the background while this request keeps
               // hopping, so the next request never starts on an empty pool.
               if (proxies.activeExits().length <= 3) void proxies.replenish('pool running low');
@@ -1978,36 +2298,61 @@ async function handleProxy(req, res, url) {
             }
           }
           if (reinstallDue) {
-            const fresh = reinstallManagedClient(provider, account, `HTTP ${upstream.status} on a fresh exit`);
+            reinstallManagedClient(provider, account, `HTTP ${upstream.status} on a fresh exit`);
             renewals += 1;
-            account = fresh;
-            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status}${rotations ? ' on the new exit too' : ''}; reinstalled the client and retrying`);
+            console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status}${rotations ? ' on the new exit too' : ''}; reinstalled this lane and retrying`);
             continue;
           }
-          const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
-          // On the host's own IP walk the whole pool (it is the IP we know is
-          // clean); once we are on a shared exit, two models is enough before
-          // moving on.
-          const modelsPerIp = ctx.forceDirect ? freeFallbacks.length : 2;
-          if (modelsThisIp < modelsPerIp && nextModel && modelFallbacks < freeFallbacks.length) {
-            const dryModel = ctx.model;
-            triedModels.add(nextModel);
-            modelFallbacks += 1;
-            modelsThisIp += 1;
-            ctx.model = nextModel;
-            state.totals.modelFallbacks = (state.totals.modelFallbacks || 0) + 1;
-            pushEvent({ kind: 'model-fallback', pid: provider.id, aid: account.id, from: dryModel, to: nextModel });
-            console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
-            continue;
+          // Hand over only once this lane's own IP step is done, or when no exit
+          // was left to do it with. Anything earlier and four lanes are burned on
+          // a dry model while the model pool beside them is untried; the walk and
+          // the session trick cost one request each and often answer at once.
+          const others = (provider.accounts || []).filter((a) => a.id !== account.id && laneReady(provider, a)).length;
+          const canHandOver = others > 0 && rotations > 0;
+          if (!canHandOver) {
+            const nextModel = freeFallbacks.find((m) => !triedModels.has(m));
+            // On the host's own IP walk the whole pool (it is the IP we know is
+            // clean); once we are on a shared exit, two models is enough before
+            // moving on.
+            const modelsPerIp = ctx.forceDirect ? freeFallbacks.length : 2;
+            if (modelsThisIp < modelsPerIp && nextModel && modelFallbacks < freeFallbacks.length) {
+              const dryModel = ctx.model;
+              triedModels.add(nextModel);
+              modelFallbacks += 1;
+              modelsThisIp += 1;
+              ctx.model = nextModel;
+              state.totals.modelFallbacks = (state.totals.modelFallbacks || 0) + 1;
+              pushEvent({ kind: 'model-fallback', pid: provider.id, aid: account.id, from: dryModel, to: nextModel });
+              console.warn(`[proxy] ${provider.id}/${account.name}: ${dryModel} is out of allowance; answering with ${nextModel} instead (${modelFallbacks}/${freeFallbacks.length})`);
+              continue;
+            }
+            if (sessionRetries < 1 && now() < freeLimitDeadline) {
+              // A new session is a new allowance for per-session accounting.
+              sessionRetries += 1;
+              ctx.freshSession = true;
+              console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying`);
+              continue;
+            }
           }
-          if (sessionRetries < 1 && now() < freeLimitDeadline) {
-            // A new session is a new allowance for per-session accounting.
-            sessionRetries += 1;
-            ctx.freshSession = true;
-            console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} on the free tier; minting a new session and retrying`);
-            continue;
+          // This lane is spent: park it, rebuild it off the request path, and let
+          // the outer loop hand the request to the next lane instead of waiting.
+          markLimited(provider, account, upstream.status, { ms: LANE_REFRESH_COOLDOWN_MS, message: snippet });
+          // The pool is what pays for this ladder, so notice when it has just been
+          // spent dry on an account-wide ceiling: with no exit left there is
+          // nothing for the next lane (or the next request) to move to, and every
+          // further attempt only logs "no working exit to switch to". Rest the pool
+          // for a short window and let the rebuild catch up in the background.
+          if (accountWide && proxies.activeExits().length === 0 && freeDry.until < now()) {
+            freeDry.until = now() + FREE_DRY_MS;
+            console.warn(`[proxy] ${provider.id}: pool spent dry on an upstream ceiling - resting it for ${Math.round(FREE_DRY_MS / 60000)}m while it rebuilds`);
           }
-          console.warn(`[proxy] ${provider.id}/${account.name} -> ${upstream.status} [quota] after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); failing over`);
+          const queued = queueLaneRefresh(provider, account, `HTTP ${upstream.status} - lane spent`);
+          console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status} [quota] lane spent${snippet ? ` (${snippet.slice(0, 80)})` : ''} after ${rotations} rotation(s), ${renewals} reinstall(s), ${modelFallbacks} model(s); ${queued ? 'rebuilding it in the background' : 'already rebuilding'}, ${others} lane(s) ready; handing over`);
+          // The next attempt starts on the requested model regardless.
+          ctx.model = requestedModel;
+          triedModels.clear();
+          triedModels.add(requestedModel);
+          modelsThisIp = 0;
           break;
         }
         if (kind === 'quota' && !repeated && rotateWanted && rotations < rotateMax && proxies.activeExits().length > 1) {
@@ -2410,10 +2755,10 @@ async function providerModelIds(provider) {
 async function routerModelList() {
   const per = await Promise.all(config.providers.map(async (p) => {
     const ids = await providerModelIds(p);
-    if (ids) return ids.map((m) => ({ id: `${p.id}/${m}`, object: 'model', owned_by: p.id, provider: p.id, type: p.type }));
+    if (ids) return ids.map((m) => ({ id: `${p.id}/${m}`, object: 'model', owned_by: p.id, provider: p.id, type: p.type, ...limitFields(p) }));
     const def = PROVIDER_TYPES[p.type] || PROVIDER_TYPES.custom;
     if (!providerIsReachable(p, def)) return [];
-    return [{ id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type }];
+    return [{ id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type, ...limitFields(p) }];
   }));
   return per.flat();
 }
@@ -2474,7 +2819,7 @@ async function handleAdmin(req, res, url) {
     // value (accounts above all — an "edit provider" must never orphan keys).
     const seeded = {};
     if (existing) {
-      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type', 'proxy', 'rotateEveryMinutes']) {
+      for (const key of ['accounts', 'headers', 'modelStyles', 'maxAttempts', 'cooldownHours', 'timeoutMs', 'strategy', 'baseUrl', 'name', 'type', 'proxy', 'rotateEveryMinutes', 'identityPool', 'contextWindow', 'freeFallback']) {
         if (body[key] === undefined) seeded[key] = existing[key];
       }
     }
@@ -2618,27 +2963,34 @@ async function handleAdmin(req, res, url) {
     // itself when the pool drains; this is the manual lever for it.
     if (method === 'POST' && b === 'replenish') {
       const body = await readJsonBody(req);
-      const out = await proxies.replenish(body.reason || 'manual (dashboard)');
+      const out = await proxies.replenish(body.reason || 'manual (dashboard)', { maxCandidates: Number(body.maxCandidates) || 0 });
       return sendJson(res, 200, { ok: true, ...out, snapshot: proxies.snapshot() });
     }
     // Reinstall the client: new identity, session, project handle and client
     // version, with any cooldown cleared. `renew` stays as the historical path.
+    // Every lane is rebuilt, which is what "reinstall the client" means now that
+    // one provider runs several; `?lane=N` limits it to one.
     if (method === 'POST' && b === 'provider' && c && (d === 'reinstall' || d === 'renew')) {
       const provider = findProvider(c);
       if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
       if (!isManagedProvider(provider)) return sendJson(res, 409, { error: { message: `provider "${provider.id}" does not manage its identities`, type: 'not_managed' } });
-      const old = (provider.accounts || [])[0];
-      const fresh = old ? reinstallManagedClient(provider, old, 'manual') : ensureManagedAccount(provider);
+      ensureManagedAccount(provider);
+      const only = url.searchParams.get('lane');
+      const lanes = (provider.accounts || []).filter((a) => only === null || laneKeyOf(a) === String(only));
+      const rebuilt = [];
+      for (const lane of lanes) rebuilt.push(reinstallManagedClient(provider, lane, 'manual', { rotateExit: true }));
       await saveConfig();
-      const as = fresh ? accountState(provider.id, fresh.id) : {};
+      const first = rebuilt[0] || null;
+      const as = first ? accountState(provider.id, first.id) : {};
       return sendJson(res, 200, {
-        ok: true,
-        account: fresh ? accountSummary(provider, fresh) : null,
-        client: fresh ? {
-          name: fresh.name,
+        ok: rebuilt.length > 0,
+        identities: rebuilt.map((a) => accountSummary(provider, a)),
+        account: first ? accountSummary(provider, first) : null,
+        client: first ? {
+          name: first.name,
           session: maskKey(as.sessionId || ''),
           project: as.projectId || 'global',
-          userAgent: openCodeUA(provider, fresh),
+          userAgent: openCodeUA(provider, first),
           cooldownCleared: !(as.limitedUntil > now()),
         } : null,
         reinstalls: state.totals.reinstalls || 0,
@@ -2649,6 +3001,16 @@ async function handleAdmin(req, res, url) {
       const provider = findProvider(c);
       if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
       if (provider.proxy !== 'rotate') return sendJson(res, 409, { error: { message: `provider "${provider.id}" is not using the rotating pool (proxy=${provider.proxy})`, type: 'not_rotating' } });
+      // Next IP: every identity lane moves to a fresh exit, so the whole pool of
+      // identities is on new addresses rather than one of them.
+      const lanes = (provider.accounts || []).map((a) => laneKeyOf(a));
+      if (lanes.length > 1) {
+        const moved = lanes.map((lane) => {
+          const exit = proxies.rotateLane(provider, lane, 'next ip (dashboard)');
+          return exit ? { lane, exit: { id: exit.id, host: exit.host, exitIp: exit.exitIp } } : null;
+        }).filter(Boolean);
+        return sendJson(res, 200, { ok: moved.length > 0, exits: moved, exit: moved[0] ? moved[0].exit : null });
+      }
       const exit = proxies.rotate('manual (dashboard)', provider.id);
       return sendJson(res, 200, { ok: !!exit, exit: exit ? { id: exit.id, host: exit.host, exitIp: exit.exitIp, latencyMs: exit.latencyMs } : null });
     }
@@ -2968,6 +3330,7 @@ const STATIC_TYPES = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
   '.webmanifest': 'application/manifest+json',
 };
 
@@ -3031,7 +3394,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === '/admin' || url.pathname === '/admin/' || url.pathname === '/' || url.pathname.startsWith('/assets/')) {
+  if (url.pathname === '/admin' || url.pathname === '/admin/' || url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/sub/')) {
     return serveStatic(req, res, url);
   }
 
@@ -3043,7 +3406,7 @@ const server = http.createServer(async (req, res) => {
     try { data = await routerModelList(); } catch { data = []; }
     if (!data.length) {
       data = config.providers.flatMap((p) => (p.accounts || []).filter((a) => a.enabled !== false).map((a) => ({
-        id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type,
+        id: `${p.id}/*`, object: 'model', owned_by: p.id, provider: p.id, type: p.type, ...limitFields(p),
       })));
     }
     return sendJson(res, 200, { object: 'list', data });

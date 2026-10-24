@@ -180,6 +180,8 @@
               <span x-show="p.id === s.defaultProvider" class="pill bg-violet-500/10 text-violet-300">default</span>
               <span x-show="p.managed" class="pill bg-emerald-500/10 text-emerald-300" title="The router creates, replaces and deletes this provider's identities itself">
                 <i data-lucide="dna" class="h-3 w-3"></i>auto-managed</span>
+              <span x-show="p.managed" class="pill bg-sky-500/10 text-sky-300" title="Identities running in parallel, each on its own exit IP and client build. One hitting a limit hands the request to the next while it is rebuilt."
+                    x-text="p.identityPool + ' lanes'"></span>
               <span x-show="p.rotateEveryMinutes > 0" class="pill bg-violet-500/10 text-violet-300" x-text="'swap every ' + p.rotateEveryMinutes + 'm'"></span>
               <span x-show="p.proxy && p.proxy !== 'direct'" class="pill bg-accent/10 text-accent">
                 <i data-lucide="waypoints" class="h-3 w-3"></i><span x-text="p.proxy === 'rotate' ? 'rotating exits' : ('exit ' + p.proxy)"></span>
@@ -243,12 +245,17 @@
                     <span x-show="a.limitedUntil > 0" class="pill bg-rose-500/10 text-rose-300 pulse-dot">
                       <i data-lucide="ban" class="h-3 w-3"></i>Limited
                     </span>
-                    <span x-show="a.limitedUntil === 0 && a.enabled" class="pill bg-emerald-500/10 text-emerald-300">
+                    <span x-show="a.refreshing" class="pill bg-amber-500/10 text-amber-300 pulse-dot">
+                      <i data-lucide="rotate-cw" class="h-3 w-3"></i>rebuilding
+                    </span>
+                    <span x-show="a.limitedUntil === 0 && a.enabled && !a.refreshing" class="pill bg-emerald-500/10 text-emerald-300">
                       <i data-lucide="check" class="h-3 w-3"></i>Active
                     </span>
                     <span x-show="!a.enabled" class="pill bg-slate-500/10 text-slate-400">disabled</span>
                   </div>
                   <div class="mono mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
+                    <span x-text="'lane ' + (a.lane + 1) + ' · build ' + String(a.build || '').replace('opencode/latest/', 'v').replace('/cli', '') + ' · gen ' + a.gen"></span>
+                    <span x-show="a.exit" x-text="'exit ' + a.exit"></span>
                     <span x-text="a.maskedKey || 'no key'"></span>
                     <span x-text="num(a.requests) + ' req'"></span>
                     <span x-show="a.limits" x-text="a.limits + ' limit hit(s)'"></span>
@@ -598,6 +605,16 @@
         <label class="fld">Upstream timeout (ms)</label>
         <input class="input mono" type="number" min="1000" step="1000" x-model.number="pf.timeoutMs" />
       </div>
+      <div>
+        <label class="fld">Context window (tokens)</label>
+        <input class="input mono" type="number" min="0" step="1000" x-model.number="pf.contextWindow" />
+        <p class="mt-1 text-[11px] text-slate-500">Advertised in <span class="mono">/v1/models</span> so the client stops trimming early. Measured: ~900KB of context passes. Empty or 0 = 1,000,000.</p>
+      </div>
+      <div class="sm:col-span-2">
+        <label class="fld">Identity lanes (free tier)</label>
+        <input class="input mono" type="number" min="0" max="6" x-model.number="pf.identityPool" />
+        <p class="mt-1 text-[11px] text-slate-500">How many identities run in parallel, each on its own exit IP and client build: one that hits a limit is rebuilt in the background while the others keep answering. 4 is the default, 1 is the old single-identity behaviour.</p>
+      </div>
       <div class="sm:col-span-2">
         <label class="fld">Max failover attempts</label>
         <input class="input mono" type="number" min="0" max="32" x-model.number="pf.maxAttempts" />
@@ -889,10 +906,12 @@
             <div class="flex items-center gap-2">
               <span class="truncate text-[13px] text-slate-100" x-text="a.name"></span>
               <span x-show="a.limitedUntil > 0" class="pill bg-rose-500/10 text-rose-300">limited</span>
-              <span x-show="a.limitedUntil === 0 && a.enabled" class="pill bg-emerald-500/10 text-emerald-300">active</span>
+              <span x-show="a.refreshing" class="pill bg-amber-500/10 text-amber-300">rebuilding</span>
+              <span x-show="a.limitedUntil === 0 && a.enabled && !a.refreshing" class="pill bg-emerald-500/10 text-emerald-300">active</span>
               <span x-show="a.keyless" class="pill bg-amber-500/10 text-amber-300">no key</span>
             </div>
             <div class="mono mt-0.5 flex flex-wrap gap-x-3 text-[11px] text-slate-500">
+              <span x-show="pd && pd.managed" x-text="'lane ' + (a.lane + 1) + ' · gen ' + a.gen + (a.exit ? ' · exit ' + a.exit : '')"></span>
               <span x-text="a.maskedKey || 'no credential'"></span>
               <span x-text="num(a.requests) + ' req'"></span>
               <span x-show="a.limitedUntil > 0" x-text="countdown(a.limitedUntil)"></span>
@@ -1323,10 +1342,12 @@ function app() {
       if (p) {
         this.pf = { editing: true, id: p.id, name: p.name, type: p.type, baseUrl: p.baseUrl, strategy: p.strategy,
                     cooldownHours: p.cooldownHours, timeoutMs: p.timeoutMs || 30000, maxAttempts: p.maxAttempts || 0,
-                    headersText: '', hasHeaders: !!p.hasCustomHeaders, proxy: p.proxy || 'direct', rotateEveryMinutes: p.rotateEveryMinutes || 0, error: '' };
+                    headersText: '', hasHeaders: !!p.hasCustomHeaders, proxy: p.proxy || 'direct', rotateEveryMinutes: p.rotateEveryMinutes || 0,
+                    identityPool: p.identityPool || 4, contextWindow: p.contextWindow || 1000000, error: '' };
       } else {
         this.pf = { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin',
-                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, proxy: 'direct', rotateEveryMinutes: 0, error: '' };
+                    cooldownHours: this.s.cooldownHours || 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', hasHeaders: false, proxy: 'direct',
+                    rotateEveryMinutes: 0, identityPool: 4, contextWindow: 1000000, error: '' };
       }
       this.modal = 'provider';
       this.refreshIcons();
@@ -1346,7 +1367,8 @@ function app() {
       const body = {
         id: (this.pf.id || '').trim(), name: this.pf.name, type: this.pf.type, baseUrl: this.pf.baseUrl,
         strategy: this.pf.strategy, cooldownHours: this.pf.cooldownHours, timeoutMs: this.pf.timeoutMs,
-        maxAttempts: this.pf.maxAttempts, proxy: this.pf.proxy, rotateEveryMinutes: this.pf.rotateEveryMinutes || 0, force: true,
+        maxAttempts: this.pf.maxAttempts, proxy: this.pf.proxy, rotateEveryMinutes: this.pf.rotateEveryMinutes || 0,
+        identityPool: this.pf.identityPool || 0, contextWindow: this.pf.contextWindow || 0, force: true,
       };
       // Blank field = keep whatever is already stored, never silently wipe it.
       if (headers || !this.pf.hasHeaders) body.headers = headers;
@@ -1506,14 +1528,16 @@ function app() {
       } catch (err) { this.lf.error = err.message; if (!silent) this.lf.status = ''; }
     },
     // Reinstall the client: a new identity that presents a different session,
-    // project handle and client version, with any cooldown cleared.
+    // project handle and client version, with any cooldown cleared. Every lane
+    // is rebuilt - the free tier runs several so a spent one never blocks.
     async renewIdentity(p) {
       try {
         const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/reinstall', { method: 'POST', body: {} });
-        if (!r.account) { this.toast('No identity to reinstall', 'warn'); }
+        const n = (r.identities || []).length;
+        if (!n) { this.toast('No identity to reinstall', 'warn'); }
         else {
           const c = r.client || {};
-          this.toast(`${p.id}: reinstalled as ${r.account.name} (${c.userAgent || 'client'}, ${c.project || 'project'})`, 'ok');
+          this.toast(`${p.id}: ${n} identit${n === 1 ? 'y' : 'ies'} reinstalled (${c.userAgent || 'client'}, ${c.project || 'project'})`, 'ok');
         }
         await this.load(true);
         await this.loadProxies(true);
@@ -1522,7 +1546,11 @@ function app() {
     async nextExit(p) {
       try {
         const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/rotate-exit', { method: 'POST', body: {} });
-        this.toast(r.exit ? `${p.id} → ${r.exit.exitIp || r.exit.host || r.exit.id}` : 'No working exit to switch to', r.exit ? 'ok' : 'warn');
+        if (Array.isArray(r.exits) && r.exits.length) {
+          this.toast(`${p.id}: ${r.exits.length} lanes moved to new IPs (${r.exits.map((m) => m.exit.exitIp || m.exit.host || m.exit.id).join(', ')})`, 'ok');
+        } else {
+          this.toast(r.exit ? `${p.id} → ${r.exit.exitIp || r.exit.host || r.exit.id}` : 'No working exit to switch to', r.exit ? 'ok' : 'warn');
+        }
         await this.loadProxies(true);
         await this.load();
       } catch (err) { this.toast(err.message, 'err'); }

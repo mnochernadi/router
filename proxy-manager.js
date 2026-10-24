@@ -304,6 +304,30 @@ const waitPort = (port, timeoutMs = 10_000) => new Promise((resolve) => {
   attempt();
 });
 
+/**
+ * Wait until every port stops answering, i.e. the previous throwaway xray has
+ * really let go of its inbounds. SIGTERM plus a fixed sleep is not enough: the
+ * next batch then binds into a socket the dying process still owns, xray logs
+ * `failed to listen` and moves on, and every probe on that port ends as a
+ * bogus ECONNREFUSED -- a working exit gets marked dead.
+ */
+const portFree = (port) => new Promise((resolve) => {
+  const sock = net.connect({ host: '127.0.0.1', port });
+  sock.once('connect', () => { sock.destroy(); resolve(false); });
+  sock.once('error', () => { sock.destroy(); resolve(true); });
+});
+
+const waitPortsFree = async (ports, timeoutMs = 3000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await Promise.all(ports.map(portFree));
+    if (res.every(Boolean) || Date.now() > deadline) return;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+};
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---------------------------------------------------------------------------
 
 class ProxyManager {
@@ -318,6 +342,10 @@ class ProxyManager {
       sources: DEFAULT_SOURCES.map((s, i) => ({ id: `s${i + 1}`, url: s.url, enabled: s.enabled, lastFetched: 0, count: 0, error: '' })),
       exits: [],
       active: [],
+      // Lane pins: one exit per free-tier identity lane, per provider. Kept in
+      // the persisted state so a restart does not collapse four identities onto
+      // the same IP (which would hand them one shared quota).
+      lanes: {},
       // Scheduled-upkeep bookkeeping (last run, what it found) survives restarts.
       auto: { lastRun: 0 },
       updatedAt: 0,
@@ -344,6 +372,7 @@ class ProxyManager {
       if (Array.isArray(raw.sources) && raw.sources.length) this.state.sources = raw.sources;
       if (Array.isArray(raw.exits)) this.state.exits = raw.exits;
       if (Array.isArray(raw.active)) this.state.active = raw.active;
+      if (raw.lanes && typeof raw.lanes === 'object') this.state.lanes = raw.lanes;
       if (raw.auto && typeof raw.auto === 'object') this.state.auto = raw.auto;
       this.state.updatedAt = raw.updatedAt || 0;
     } catch { /* first boot */ }
@@ -516,7 +545,7 @@ class ProxyManager {
     const ports = exits.map((_, i) => (basePort || settings.inboundBasePort) + i);
     const ready = await Promise.race([Promise.all(ports.map((p) => waitPort(p, 8000))), died]);
     const up = Array.isArray(ready) && ready.some(Boolean) && !exited;
-    return { child, ports, up, stderr, exited };
+    return { child, ports, up, stderr, exited, done: died };
   }
 
   primePort(port) {
@@ -527,6 +556,41 @@ class ProxyManager {
     });
   }
 
+  /**
+   * Kill xray processes that a previous run left behind on throwaway configs.
+   *
+   * Every test batch writes its own config into a temp directory and runs its own
+   * xray on the test ports. If such a process outlives the run that spawned it, it
+   * keeps holding ports - and because Xray sets SO_REUSEPORT, the *next* main
+   * instance binds the same numbers "successfully" and then dies with exit 255 as
+   * soon as the two disagree about who owns them. That is the "xray down" loop:
+   * the pool looks empty, restarts do nothing, and the real cause is a stray
+   * listener from yesterday. Sweeping at startup costs one directory read.
+   */
+  sweepStrays() {
+    if (process.platform !== 'linux') return 0;
+    let killed = 0;
+    let entries = [];
+    try { entries = fs.readdirSync('/proc'); } catch { return 0; }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      if (Number(entry) === process.pid) continue;
+      try {
+        const comm = fs.readFileSync(`/proc/${entry}/comm`, 'utf8').trim();
+        if (comm !== 'xray') continue;
+        const cmd = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8').replace(/\0/g, ' ');
+        if (!/llm-router-(burn|sched)-/.test(cmd)) continue;
+        process.kill(Number(entry), 'SIGTERM');
+        killed += 1;
+      } catch { /* already gone, or not ours to signal */ }
+    }
+    if (killed) {
+      this.log(`[xray] killed ${killed} stray test instance(s) holding the pool ports`);
+      this.pushEvent({ kind: 'xray-sweep', killed });
+    }
+    return killed;
+  }
+
   async startMain() {
     await this.stopMain();
     const exits = this.activeExits();
@@ -534,6 +598,7 @@ class ProxyManager {
     if (!exits.length) { this.xray.error = 'no working exits yet - run a test'; return { running: false, reason: 'no-exits' }; }
     const { version, error } = await this.version();
     if (error) { this.xray.error = `xray binary not usable (${error})`; this.pushEvent({ kind: 'xray-missing', error }); return { running: false, reason: 'no-binary', error }; }
+    this.sweepStrays();
     const started = await this.startProcess(exits, this.state.settings, { basePort: this.state.settings.inboundBasePort, tag: 'main' });
     this.xray.running = started.up;
     this.xray.pid = started.child.pid || 0;
@@ -587,7 +652,7 @@ class ProxyManager {
     };
   }
 
-  async testAll({ limit = 0, protocols = null, retest = false, sourceIds = null } = {}) {
+  async testAll({ limit = 0, protocols = null, retest = false, sourceIds = null, ids = null } = {}) {
     if (this.test.running) return { error: 'a test run is already in progress' };
 
     // Pre-flight: without a usable binary every batch would burn its port
@@ -603,7 +668,14 @@ class ProxyManager {
     const settings = this.state.settings;
     let candidates = this.state.exits.filter((e) => (!sourceIds || sourceIds.includes(e.sourceId)));
     if (protocols && protocols.length) candidates = candidates.filter((e) => protocols.includes(e.protocol));
-    if (!retest) candidates = candidates.filter((e) => e.status === 'untested');
+    if (ids && ids.length) {
+      // An explicit list means the caller wants these retested whatever their
+      // current status is (a refill retests the exits that are still in the pool).
+      const want = new Set(ids);
+      candidates = candidates.filter((e) => want.has(e.id));
+    } else if (!retest) {
+      candidates = candidates.filter((e) => e.status === 'untested');
+    }
     if (limit > 0) candidates = candidates.slice(0, limit);
 
     if (!candidates.length) {
@@ -659,10 +731,21 @@ class ProxyManager {
    */
   async testBatch(batch, settings) {
     if (!batch.length) return;
-    const { child, up, stderr } = await this.startProcess(batch, settings, { basePort: settings.testBasePort, tag: 'test' });
+    const { child, up, stderr, done } = await this.startProcess(batch, settings, { basePort: settings.testBasePort, tag: 'test' });
     this.tester.child = child;
+    const ports = batch.map((_, i) => settings.testBasePort + i);
+    const release = async () => {
+      try { child.kill('SIGTERM'); } catch { /* noop */ }
+      const exited = await Promise.race([done.then(() => true), delay(2500).then(() => false)]);
+      if (!exited) {
+        try { child.kill('SIGKILL'); } catch { /* noop */ }
+        await Promise.race([done, delay(1000)]);
+      }
+      this.tester.child = null;
+      await waitPortsFree(ports, 2000);
+    };
     if (!up) {
-      try { child.kill(); } catch { /* noop */ }
+      await release();
       const reason = `test instance failed to start: ${(stderr || '').split('\n').filter(Boolean).pop() || 'unknown'}`;
       if (batch.length > 1) {
         const mid = Math.ceil(batch.length / 2);
@@ -676,7 +759,7 @@ class ProxyManager {
       this.test.done += 1;
       return;
     }
-    const queue = batch.map((exit, i) => ({ exit, port: settings.testBasePort + i }));
+    const queue = ports.map((port, i) => ({ exit: batch[i], port }));
     const workers = Array.from({ length: Math.min(Math.max(1, settings.testConcurrency), queue.length) }, async () => {
       for (;;) {
         const job = queue.shift();
@@ -685,26 +768,56 @@ class ProxyManager {
         this.test.done += 1;
       }
     });
-    await Promise.all(workers);
-    try { child.kill('SIGTERM'); } catch { /* noop */ }
-    await new Promise((r) => setTimeout(r, 200));
+    // A batch must not be able to stop the run: every probe has its own deadline,
+    // but a stuck one used to hold `Promise.all` open forever and left the pool at
+    // zero active with the run "in progress". Cap the whole batch.
+    const batchDeadline = Math.ceil(queue.length / Math.max(1, settings.testConcurrency)) * settings.testTimeoutMs * 3 + 10_000;
+    const finished = await Promise.race([Promise.all(workers).then(() => true), delay(batchDeadline).then(() => false)]);
+    if (!finished) {
+      this.log(`[pool] batch of ${queue.length} candidate(s) did not settle in ${Math.round(batchDeadline / 1000)}s - moving on`);
+      this.pushEvent({ kind: 'test-stall', stuck: queue.length });
+      this.test.done += queue.length;
+      queue.length = 0;
+    }
+    await release();
   }
 
   async testOne(exit, port) {
     const settings = this.state.settings;
     const proxy = { host: '127.0.0.1', port };
-    try {
-      const res = await proxiedGet(settings.testUrl, proxy, {
-        timeoutMs: settings.testTimeoutMs,
-        insecure: settings.insecure,
-      });
-      if (!res.ok || res.status === 0) throw new Error(`HTTP ${res.status}`);
-      let ip = '';
-      try { const j = JSON.parse(res.text); ip = j.ip || j.origin || j.query || ''; } catch { ip = (res.text || '').trim().slice(0, 64); }
-      this.recordTest(exit, true, res.ms, ip, '');
-    } catch (err) {
-      this.recordTest(exit, false, 0, '', err.message);
+    // Hard cap on the probe itself. The tunnel has its own deadlines, but a
+    // cancelled read or a half-open socket can still leave the promise pending;
+    // this guarantees the worker moves on.
+    const cap = settings.testTimeoutMs * 3 + 2_000;
+    const verdict = await Promise.race([
+      this.probeExit(exit, proxy, settings),
+      delay(cap).then(() => ({ ok: false, reason: `probe hung past ${Math.round(cap / 1000)}s` })),
+    ]);
+    if (verdict.ok) this.recordTest(exit, true, verdict.ms, verdict.ip, '');
+    else this.recordTest(exit, false, 0, '', verdict.reason);
+  }
+
+  async probeExit(exit, proxy, settings) {
+    let last = null;
+    // A refused inbound is ambiguous: the exit may be fine and the local listener
+    // merely late. One short retry before condemning it.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const res = await proxiedGet(settings.testUrl, proxy, {
+          timeoutMs: settings.testTimeoutMs,
+          insecure: settings.insecure,
+        });
+        if (!res.ok || res.status === 0) throw new Error(`HTTP ${res.status}`);
+        let ip = '';
+        try { const j = JSON.parse(res.text); ip = j.ip || j.origin || j.query || ''; } catch { ip = (res.text || '').trim().slice(0, 64); }
+        return { ok: true, ms: res.ms, ip };
+      } catch (err) {
+        last = err;
+        if (attempt === 0 && /ECONNREFUSED|ECONNRESET|EPIPE/.test(err.message)) await delay(600);
+        else break;
+      }
     }
+    return { ok: false, reason: last.message };
   }
 
   recordTest(exit, ok, latencyMs, exitIp, error) {
@@ -737,23 +850,77 @@ class ProxyManager {
     } else {
       target.failures = (target.failures || 0) + 1;
       target.error = (error || '').slice(0, 200);
+      // An exit a lane is holding right now may be failing the probe only because
+      // it is busy carrying the request this test runs beside: the probe competes
+      // with it for the same node. Such an exit keeps its status, its egress IP and
+      // its slot in the pool, so a refill triggered by a request cannot knock the
+      // pool over while the answer is still in flight.
+      const pinned = Object.values(this.state.lanes || {})
+        .some((pins) => Object.values(pins || {}).includes(target.id));
+      if (pinned) {
+        target.retryAfter = 0;
+        this.test.dead += 1;
+        this.save();
+        return;
+      }
       target.exitIp = '';
-      if (target.failures >= this.state.settings.markDeadAfter) target.status = 'dead';
+      // A failed test always clears `ok` from the record: the entry has no egress
+      // IP behind it any more, so calling it good would only put a dead address in
+      // front of `workingExits()` (which requires an IP) and leave the pool reading
+      // "eleven working, zero usable". The failure count still decides how quickly
+      // it drops out of the retry queue, not what the record claims.
+      const wasActive = this.state.active.includes(target.id);
+      if (wasActive) this.state.active = this.state.active.filter((id) => id !== target.id);
+      target.status = 'dead';
       this.test.dead += 1;
+      if (target.failures < this.state.settings.markDeadAfter) {
+        // Below the threshold it is worth another look sooner than the dead pile.
+        target.retryAfter = Date.now() + 10 * 60_000;
+      } else {
+        target.retryAfter = 0;
+      }
     }
     this.save();
   }
 
   // ---- pool / rotation ---------------------------------------------------
 
-  async apply() {
-    const best = this.workingExits().slice(0, this.state.settings.maxActive);
-    this.state.active = best.map((e) => e.id);
+  /**
+   * Point xray at a pool.
+   *
+   * The exits already in the pool keep their slots: inbounds are numbered by
+   * position in `active`, so reordering a healthy entry moves its port and breaks
+   * the socket a request is using at that very moment. Whatever is in the pool and
+   * still good stays at the front in the order it already has; the candidates only
+   * fill the space behind it. A refill therefore tops the pool up instead of
+   * reshuffling it under the caller.
+   */
+  async apply({ preferFresh = false } = {}) {
+    const maxActive = this.state.settings.maxActive;
+    const usable = (e) => e && e.status === 'ok' && e.testedBy === TELEMETRY_SCHEMA && e.exitIp && e.exitIp !== this.localIp;
+    const held = this.state.active.filter((id) => usable(this.byId.get(id)));
+    const heldSet = new Set(held);
+    const ranked = (preferFresh ? this.freshFirst() : this.workingExits()).map((e) => e.id).filter((id) => !heldSet.has(id));
+    const best = [...held, ...ranked].slice(0, maxActive);
+    this.state.active = best;
     this.index = 0;
     this.cursors.clear();
     this.save();
     this.pushEvent({ kind: 'apply', active: best.length });
     return this.startMain();
+  }
+
+  /**
+   * Working exits with the just-tested ones first. A refill must not hand the
+   * pool back to stale entries that only look good because their latency was
+   * measured hours ago; within each group latency still decides.
+   */
+  freshFirst(windowMs = 15 * 60_000) {
+    const cutoff = Date.now() - windowMs;
+    return this.workingExits().sort((a, b) => {
+      const fresh = (e) => (Number(e.lastTested) > cutoff ? 1 : 0);
+      return fresh(b) - fresh(a) || (a.latencyMs || 1e9) - (b.latencyMs || 1e9);
+    });
   }
 
   // ---- scheduled upkeep: fetch -> test what is new -> fold into the pool -----
@@ -887,6 +1054,77 @@ class ProxyManager {
     return { mode: 'fixed', exit, proxy: { host: '127.0.0.1', port: this.portForExit(exit) } };
   }
 
+  /**
+   * Sticky exit per lane. A lane is one self-managed free-tier identity: it must
+   * keep its own egress IP, because the quota is accounted per source IP and four
+   * identities behind one address share one allowance. Two lanes therefore never
+   * get the same exit while the pool has room, and a lane keeps its pin across
+   * requests and restarts.
+   */
+  laneExit(pid, laneKey, pool, { avoid = '' } = {}) {
+    const pins = this.state.lanes[pid] || (this.state.lanes[pid] = {});
+    const mine = pins[laneKey] || '';
+    const takenBy = (id) => Object.entries(pins).some(([k, v]) => k !== laneKey && v === id);
+    const alive = (id) => {
+      const e = this.byId.get(id);
+      return !!e && e.status === 'ok' && this.state.active.includes(id);
+    };
+    if (!avoid && mine && alive(mine) && !takenBy(mine)) return this.byId.get(mine);
+    const candidates = pool.filter((e) => e.id !== mine && e.id !== avoid && !takenBy(e.id));
+    const free = candidates.length ? candidates : pool.filter((e) => e.id !== mine);
+    if (!free.length) return this.byId.get(mine) || pool[0];
+    // Prefer an exit whose egress IP no other lane already holds.
+    const held = new Set(Object.entries(pins).filter(([k]) => k !== laneKey).map(([, v]) => (this.byId.get(v) || {}).exitIp));
+    const distinct = free.find((e) => !e.exitIp || !held.has(e.exitIp));
+    const at = this.cursors.get(`lane:${pid}`) || 0;
+    const exit = distinct || free[at % free.length];
+    this.cursors.set(`lane:${pid}`, (at + 1) % Math.max(1, free.length));
+    pins[laneKey] = exit.id;
+    this.save();
+    return exit;
+  }
+
+  /** Sticky (or newly pinned) proxy for a lane. */
+  pickLane(provider, laneKey) {
+    if (!this.state.settings.enabled) return null;
+    const pid = (provider && provider.id) || 'default';
+    const pool = this.activeExits();
+    if (!pool.length) return null;
+    const exit = this.laneExit(pid, laneKey, pool);
+    if (!exit) return null;
+    return { mode: 'rotate', exit, proxy: { host: '127.0.0.1', port: this.portForExit(exit) } };
+  }
+
+  /** Move a lane to a different exit and keep the pin there. */
+  rotateLane(provider, laneKey, reason = 'rotate') {
+    if (!this.state.settings.enabled) return null;
+    const pid = (provider && provider.id) || 'default';
+    const pool = this.activeExits();
+    if (!pool.length) return null;
+    const pins = this.state.lanes[pid] || (this.state.lanes[pid] = {});
+    const exit = this.laneExit(pid, laneKey, pool, { avoid: pins[laneKey] || '' });
+    if (!exit) return null;
+    pins[laneKey] = exit.id;
+    this.save();
+    this.pushEvent({ kind: 'rotate', reason, exit: exit.id, host: exit.host, ip: exit.exitIp || '', provider: pid, lane: laneKey });
+    this.log(`[proxy] ${pid}#${laneKey} switched to exit=${exit.id} host=${exit.host}${exit.exitIp ? ` egress=${exit.exitIp}` : ' egress=unknown'} - ${reason}`);
+    return exit;
+  }
+
+  releaseLane(providerId, laneKey) {
+    const pid = providerId || 'default';
+    const pins = this.state.lanes[pid];
+    if (!pins || !(laneKey in pins)) return;
+    delete pins[laneKey];
+    this.save();
+  }
+
+  /** Exits currently pinned by any lane, for the admin page. */
+  laneSummary(providerId) {
+    const pins = this.state.lanes[providerId || 'default'] || {};
+    return Object.entries(pins).map(([lane, id]) => ({ lane, exit: id }));
+  }
+
   rotate(reason = 'manual', providerId = null) {
     const pool = this.activeExits();
     if (!pool.length) return null;
@@ -930,17 +1168,81 @@ class ProxyManager {
       this.log(`[proxy] exit ${exit.id} ${burn ? 'burned (spent on a rate limit)' : 'marked dead'} - ${this.state.active.length} left in the pool`);
     }
     this.save();
+    // Keep the pool at strength without waiting for a request to run dry: an
+    // exit leaving takes a spare's place, and if there is no spare the pool is
+    // rebuilt in the background so the next request does not have to wait.
+    const filled = this.promote();
+    if (this.needsRebuild()) {
+      setImmediate(() => { this.replenish(`${this.state.active.length} exits left in the pool`).catch(() => {}); });
+    }
+    void filled;
   }
 
   /**
-   * Rebuild the pool once the burn pile has eaten it.
-   *
-   * The fifteen spent exits are deleted outright (the subscriptions re-publish
-   * the same URIs on the next fetch, so nothing is lost), a new batch is tested,
-   * and the working results are applied. Bounded to `maxActive * 3` candidates
-   * so a full rebuild stays inside a normal request budget.
+   * Top the active list back up to `maxActive` from exits that already tested
+   * good. Cheap (no network) and it is what keeps "15 in the pool" true between
+   * burns instead of letting a spare sit idle while the pool shrinks.
    */
-  async replenish(reason = 'pool empty') {
+  promote() {
+    const maxActive = Math.max(1, Number(this.state.settings.maxActive) || 1);
+    const active = new Set(this.state.active);
+    if (active.size >= maxActive) return 0;
+    let added = 0;
+    for (const exit of this.workingExits()) {
+      if (active.size >= maxActive) break;
+      if (active.has(exit.id)) continue;
+      active.add(exit.id);
+      this.state.active.push(exit.id);
+      added += 1;
+    }
+    if (!added) return 0;
+    // Ports are assigned by position in `active`, so the inbound set has to be
+    // rebuilt for the new exits to have listeners. Existing exits keep their
+    // index (append-only), so their ports do not move; `settle()` keeps callers
+    // from dialling a port while that restart is in flight.
+    this.save();
+    this.log(`[pool] promoted ${added} spare exit(s) into the pool - ${this.state.active.length} active`);
+    this.pushEvent({ kind: 'promote', added, active: this.state.active.length });
+    this._restarting = this.startMain()
+      .catch(() => {})
+      .finally(() => { this._restarting = null; });
+    return added;
+  }
+
+  /** True while xray is being re-pointed at a changed pool. */
+  get restarting() { return !!this._restarting; }
+
+  /** Wait (bounded) for a pool restart so a hop never dials a dead port. */
+  async settle(ms = 4000) {
+    if (!this._restarting) return;
+    await Promise.race([this._restarting, new Promise((r) => setTimeout(r, ms))]);
+  }
+
+  /** True when the pool has burned/dead through most of its depth. */
+  needsRebuild() {
+    if (this._replenishing) return false;
+    const maxActive = Math.max(1, Number(this.state.settings.maxActive) || 1);
+    const floor = Math.max(2, Math.ceil(maxActive / 2));
+    if (this.state.active.length > floor) return false;
+    return this.state.exits.some((e) => e.status === 'untested') || this.state.exits.some((e) => e.status === 'burned');
+  }
+
+  /**
+   * Rebuild the pool after the burn pile has eaten it.
+   *
+   * The spent exits are deleted outright (the subscriptions re-publish the same
+   * URIs on the next fetch, so nothing is lost), the exits that are still in the
+   * pool are retested together with a fresh batch, and the working results are
+   * applied - fresh ones first. The point is a pool of fifteen *new* addresses,
+   * not fifteen entries that were good two hours ago, so the current active set
+   * is retested as part of the same run.
+   *
+   * `maxActive` replacements are wanted, so `maxActive * 3` candidates are tried
+   * (roughly a third of shared subscription exits survive a test). A rebuild
+   * triggered from a request tests a smaller batch so it can finish inside the
+   * caller's budget; the background path takes the full batch.
+   */
+  async replenish(reason = 'pool empty', { maxCandidates = 0 } = {}) {
     if (this._replenishing) return { skipped: 'a replenish is already running' };
     this._replenishing = true;
     try {
@@ -952,29 +1254,50 @@ class ProxyManager {
         this.state.exits = this.state.exits.filter((e) => !gone.has(e.id));
         for (const id of gone) this.byId.delete(id);
         this.state.active = this.state.active.filter((id) => !gone.has(id));
-        this.log(`[pool] dropped ${spent.length} burned exit(s) from the pool`);
+        this.log(`[pool] dropped ${spent.length} spent exit(s) out of the pool`);
         this.save();
       }
       const maxActive = Math.max(1, Number(this.state.settings.maxActive) || 1);
+      const wanted = Math.max(maxActive, maxCandidates || maxActive * 3);
+      // Retest what is still active (it may have aged) plus fresh candidates.
+      const retest = this.state.active.slice(0, maxActive);
       let untested = this.state.exits.filter((e) => e.status === 'untested').length;
-      if (untested < maxActive) {
+      if (untested + retest.length < wanted) {
         this.log(`[pool] only ${untested} untested exit(s) on hand - re-fetching the subscriptions first`);
         await this.refresh({});
         untested = this.state.exits.filter((e) => e.status === 'untested').length;
       }
-      if (!untested) {
+      const fresh = this.state.exits.filter((e) => e.status === 'untested').slice(0, Math.max(0, wanted - retest.length)).map((e) => e.id);
+      // Dead is not a life sentence: most of that pile failed once on a timeout
+      // that says nothing about the node, and their URIs are already known. With
+      // room left in the batch, retest the ones that failed least.
+      const room = Math.max(0, wanted - retest.length - fresh.length);
+      const revisit = room > 0
+        ? this.state.exits
+          .filter((e) => e.status === 'dead')
+          .sort((a, b) => ((a.failures || 0) - (b.failures || 0))
+            || ((b.lastTested || 0) - (a.lastTested || 0)))
+          .slice(0, Math.min(room, maxActive))
+          .map((e) => e.id)
+        : [];
+      const ids = [...retest, ...fresh, ...revisit];
+      if (!ids.length) {
         this.log('[pool] nothing left to test - the pool stays as it is');
         return { ok: false, reason: 'no untested exits left' };
       }
-      const started = await this.testAll({ limit: maxActive * 3 });
-      if (started && started.started) {
+      this.log(`[pool] testing ${ids.length} candidate(s): ${retest.length} current + ${fresh.length} new + ${revisit.length} retry`);
+      const started = await this.testAll({ ids });
+      // Wait for whichever run is actually doing the work - ours, or one that was
+      // already in flight (testAll refuses a second run) - and then apply.
+      if ((started && started.started) || (started && started.error && this.test.running)) {
         const deadline = Date.now() + 2 * 3600_000;
         while (this.test.running && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1000));
       }
-      const applied = await this.apply();
-      this.pushEvent({ kind: 'replenished', active: this.state.active.length, ok: this.test.ok });
-      this.log(`[pool] replenished: ${this.test.ok} working found, ${this.state.active.length} active`);
-      return { ok: true, tested: started ? started.total : 0, ok_: this.test.ok, active: this.state.active.length, running: !!applied.running };
+      const applied = await this.apply({ preferFresh: true });
+      const working = this.state.active.length;
+      this.pushEvent({ kind: 'replenished', active: working, ok: this.test.ok });
+      this.log(`[pool] replenished: ${this.test.ok} working found, ${working} active${working < maxActive ? ' (below target - the next cycle tops it up)' : ''}`);
+      return { ok: true, tested: started ? started.total : 0, working: this.test.ok, active: working, running: !!applied.running };
     } finally {
       this._replenishing = false;
     }

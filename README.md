@@ -191,16 +191,46 @@ The same measurement also shows the allowance is accounted **per model**, not pe
 | `flint-40b-free` | `503` (their endpoint, not a quota) |
 | `jev-1.13-free` | `400 ModelProtocolUnsupported` on both chat and responses |
 
-So on a quota answer the router moves, and the order is fixed: **IP first, identity second**. A spent exit is burned (left out of the pool) and the next one takes the request, retrying the model the client actually asked for; only when the fresh IP limits as well is the client reinstalled there; then the model pool on that IP; then more IPs; then a rebuilt session. The client sees a normal `200` from somewhere in that ladder, `x-router-model` (and the response's `model`) names the model that actually answered, and the Activity tab logs every hop:
+So on a quota answer the router moves, and the order is fixed: **IP first, identity second**. A spent exit is burned (left out of the pool) and the next one takes the request, retrying the model the client actually asked for; only when the fresh IP limits as well is the client reinstalled there; then the model pool on that IP; then the next identity lane. The client sees a normal `200` from somewhere in that ladder, `x-router-model` (and the response's `model`) names the model that actually answered, and the Activity tab logs every hop:
 
 ```
-[proxy] opencode-free/identity-27: 429 on exit 6f1a...; retrying deepseek-v4.1-flash-free on exit b60a... (1/3)
-[proxy] opencode-free/identity-27: 429 on the new exit too; reinstalled the client and retrying
+[proxy] opencode-free#0/identity-1: 429 on exit 6f1a...; retrying deepseek-v4.1-flash-free on exit b60a... (1/1)
+[proxy] opencode-free#0/identity-1: 429 on the new exit too; reinstalled this lane and retrying
+[proxy] opencode-free#0/identity-1: 429 [quota] lane 0 spent after 1 rotation(s), 1 reinstall(s); rebuilding it in the background, 3 lane(s) ready; handing over
 ```
 
-The whole ladder is capped at **60 s** (`FREE_LIMIT_BUDGET_MS`); past it the request goes to the configured fallback provider instead of leaving the caller waiting. Each exit gets a **25 s first-byte deadline** of its own, so a dead or throttled exit is dropped rather than eating the budget. A nuanced point that matters on this box: the shared subscription exits are themselves spent for the popular free models, so a *fresh identity on a fresh IP* is tried before walking models.
+### Identity lanes
+
+One identity on one IP is one allowance, and an allowance that runs out used to mean waiting. So the free tier runs **four identities in parallel** (`identityPool`, 1-6). Each lane is a separate identity pinned to its own exit IP and its own client build; a request picks a ready lane, and which lane it was handed shows up as `#<lane>` in the log.
+
+When a lane answers `429` the request does not sit there being rebuilt - it changes the lane's IP, reinstalls the lane's identity, walks the model pool on that lane, and the moment the lane is spent the request is **handed to the next lane**, whose IP and identity are untouched and which has its own allowance. The spent lane is parked and rebuilt **in the background** (burn its exit, pin a fresh one, new session, new project, new build), then returns to rotation. Only when *every* lane is spent does a request wait for the first rebuild to finish, and only for `LANE_WAIT_MS` (12 s) at most.
+
+| Lane fingerprint | Rotated per rebuild |
+|---|---|
+| session id (`x-opencode-session`) | yes |
+| project handle (`x-opencode-project`) | yes |
+| client build (`user-agent`) | yes, round-robin over the builds that pass attestation |
+| exit IP | yes, and the spent one is burned out of the pool |
+| lane slot | no - the slot and its state survive, so limits cannot pile up on one lane |
+
+The whole ladder is capped at **60 s** (`FREE_LIMIT_BUDGET_MS`); past it the request goes to the configured fallback provider instead of leaving the caller waiting. The budget is checked *before* every attempt, and the remaining budget - never more than the 25 s first-byte deadline - is handed to that attempt, so one silent exit cannot spend the minute on its own. The first-byte deadline covers the CONNECT **and the TLS handshake**; a buffered (non-streaming) answer additionally gets a 20 s idle deadline on the body. Both burn the exit and move on. A nuanced point that matters on this box: the shared subscription exits are themselves spent for the popular free models, so a *fresh identity on a fresh IP* is tried before walking models.
 
 Order and behaviour are configurable per provider (`freeFallback: false` disables the model walk, `freeFallbackModels: [...]` overrides the order) or globally (`freeFallbackModels` in `config.json`). Default: the validated list above, in that order.
+
+### Context window
+
+The free tier holds roughly **900 KB of context** - measured, and the number the whole design is sized for. A client that is not told the window guesses a small one and truncates the conversation long before the upstream does, so the router advertises a full **1,000,000 tokens** on every model it lists:
+
+```
+GET /v1/models
+{ "id": "opencode-free/deepseek-v4.1-flash-free", ...
+  "limit": { "context": 1000000, "input": 1000000, "output": 32000 },
+  "context_length": 1000000, "max_input_tokens": 1000000, "max_output_tokens": 32000 }
+```
+
+Both spellings are present because clients disagree: OpenAI-compatible ones read `context_length`/`max_*_tokens`, models.dev-style clients read `limit.context`. Override per provider with `contextWindow` (dashboard: **Context window (tokens)**); `0` or empty means the million default. The window does not have to be honest to be safe - the upstream still 400s with `maximum context length` past ~900 KB, and the router already maps that error to its own message.
+
+The deadlines scale with what is sent, because prefill of a big body is slow *before the first byte*: the first-byte ceiling grows by ~25 ms per KB over 8 KB (capped at +75 s) and the free tier's 60 s ladder budget grows by the same amount. A small chat keeps the tight 25 s / 8 s deadlines, a 900 KB conversation gets the prefill time it needs instead of being killed as if its exit were stalled. Request bodies are read at up to 32 MB, which is ~8M tokens of JSON - far past the ceiling the upstream applies.
 
 ### Cross-provider last resort
 
@@ -230,20 +260,21 @@ Three consequences in this router:
 
 ### Reinstalling the client (automatic, and on demand)
 
-The router reinstalls the client by itself. Whenever a managed provider answers a cooldown status, `reinstallManagedClient` drops that identity and mints one that differs in **every** field the router controls:
+The router reinstalls the client by itself. Whenever a managed provider answers a cooldown status, `reinstallManagedClient` rebuilds **that lane's** identity in place, differing in every field the router controls:
 
 | Field | Before -> after |
 |---|---|
-| account | `identity-N` -> `identity-N+1` |
+| lane slot / account id | unchanged (limits must not pile up on one identity) |
+| generation (`gen`) | `N` -> `N+1` |
 | session (`x-opencode-session` + 3 aliases) | freshly minted `ses_<12 hex><14 base62>` |
 | project (`x-opencode-project`) | `p-<16 hex>`, freshly minted |
 | client version (`user-agent`) | next entry of the validated list (`2.0.26` -> `2.0.31` -> `2.1.0`) |
 | cooldown | cleared |
 | exit IP | the router rotates the exit *before* the reinstall on the free tier, and burns the spent one |
 
-It runs at most once per request and never more often than `reinstallGapMinutes` (default `10`), so upstream does not read the churn as abuse. On the free tier it runs only after an exit change failed to clear the limit — an identity is more expensive than an IP.
+It runs at most once per lane and request and never more often than `reinstallGapMinutes` (default `10`, ignored on the free tier), so upstream does not read the churn as abuse. A lane that keeps limiting is parked and rebuilt off the request path by `queueLaneRefresh`.
 
-On demand — the dashboard's **Reinstall client** button, or the bundled CLI:
+On demand — the dashboard's **Reinstall client** button (every lane, or `?lane=N` for one), or the bundled CLI:
 
 ```bash
 # every managed provider, with a probe that reports the upstream verdict
@@ -539,7 +570,8 @@ Notes that save time:
 
 * Every routed response carries `x-router-exit` (exit id or `direct`) and `x-router-rotations`, so `curl -i` shows which address served it.
 * Testing walks the list in batches (`testBatchSize`, default 40) through a second xray instance, so 1000 configs never all live at once. The best `maxActive` (default 15) go into the live pool.
-* An exit that answers a rate limit is **burned** — it leaves the pool at once, whatever its failure count, and is never cycled back into during the same burst. When the pool drains (or an exit produces no first byte within 25 s) `replenish()` deletes the burn pile, re-fetches the subscriptions if the untested reserve is thin, tests a fresh batch and applies it. Fifteen burned exits therefore become fifteen new ones without a human.
+* An exit that answers a rate limit, stalls or resets is **burned** — it leaves the pool at once, whatever its failure count, and is never cycled back into during the same burst. A spare takes its slot immediately (`promote()`, no network: a tested exit is already waiting for it), and once the pool is down to half its depth `replenish()` runs in the background.
+* `replenish()` deletes the burn pile, re-fetches the subscriptions if the untested reserve is thin, **retests the exits still in the pool as well**, tests a fresh batch (`maxActive * 3` candidates) and applies the working ones, fresh results first. Fifteen burned exits therefore become fifteen newly tested ones without a human. A request that runs dry mid-ladder waits for a smaller rebuild (`maxActive` candidates) so it can still answer inside its budget; a burn promotes a waiting spare so that case stays rare.
 * Dead exits are dropped after `markDeadAfter` failures and retried on the next run; `rotateAttempts` (default 3) caps retries per request.
 * The `xray` binary: `install.sh --with-xray` installs it, the Docker image already contains it, or install it from your package manager. No binary = no pool, and the router reports that instead of failing requests.
 * `testUrl` defaults to `https://api.ipify.org?format=json` because it returns the exit IP; any JSON endpoint with an `ip` field works.
@@ -562,6 +594,49 @@ curl -X POST localhost:8787/admin/api/proxies/settings -H "$K" \
 ```
 
 `refreshIntervalHours: 0` also disables it. The **Network** tab carries both fields and the next-run countdown.
+
+### Publishing the pool as its own subscription
+
+The pool can feed a subscription instead of only consuming one. `scripts/build-sub.js` writes every exit that currently tests good as a plain URI list under `public/sub/`, which the server already serves statically at `/sub/<file>`:
+
+```bash
+node scripts/build-sub.js                       # public/sub/monols.txt, 644
+node scripts/build-sub.js --out public/sub/x.txt --min 5   # keep the old file below 5 exits
+```
+
+A cron entry every 30 minutes keeps it current (`/etc/cron.d/llm-router-sub`):
+
+```cron
+*/30 * * * * root cd /opt/llm-router && /usr/bin/node scripts/build-sub.js --quiet
+```
+
+Put that path behind a hostname and point a source at it — that is a self-hosted feed that keeps working when an upstream subscription goes stale. On this server a `cloudflared` ingress rule maps `monols.dpdns.org` to the router, so the URL is `https://monols.dpdns.org/sub/monols.txt`:
+
+```bash
+# /etc/cloudflared/config.yml (additive: the existing hostnames keep their rules)
+ingress:
+  - hostname: omni.monols.dpdns.org
+    service: http://localhost:20128
+  - hostname: monols.dpdns.org
+    service: http://localhost:8787
+  - service: http_status:404
+
+cloudflared tunnel route dns omni monols.dpdns.org
+systemctl restart cloudflared
+curl -s -X POST localhost:8787/admin/api/proxies/sources -H "$K" \
+  -d '{"sources":[{"url":"https://monols.dpdns.org/sub/monols.txt"}]}'
+```
+
+`sources` is replaced wholesale by that call, so send every URL you want to keep.
+
+### When the ceiling is upstream of the pool
+
+Rotating exits fixes a limit that is accounted per IP. It does nothing when the allowance is accounted per *account*: the same `429 ... Subscribe to Plan` body comes back from every address and every freshly minted identity. The router therefore watches for that specific outcome — a lane that burned its whole ladder without clearing an account-wide body — and then rests the pool for `FREE_DRY_MS` (5 min), answering from the fallback provider in the meantime while the pool rebuilds itself in the background. The burn pile is what pays for the ladder, so this is the difference between "forty seconds and four addresses per request" and "two seconds and none".
+
+Two related defects are fixed alongside it, both visible as "the pool is empty but eleven exits say `ok`":
+
+- A failed test now always clears `ok` from the record. It used to keep `ok` with an empty `exitIp`, which `workingExits()` rejects, so the dashboard counted working exits the pool could never use.
+- `apply()` keeps the exits already in the pool in their existing slots and only fills the space behind them. Inbound ports are numbered by position in `active`, so re-ranking a healthy exit moved its port out from under an in-flight request.
 
 ## freebuff (Codebuff) as a provider
 
@@ -624,6 +699,8 @@ The deployment budget was raised for this workload: 512 MB RAM and 1 vCPU is com
 | Streams stall behind Nginx | Keep proxy buffering off; responses already send `X-Accel-Buffering: no` and `Cache-Control: no-transform`. |
 | `fetch failed (cause: UND_ERR_SOCKET: other side closed)` on requests with a large prompt, while small ones work | The *client's* egress is mangling big plaintext HTTP uploads — not the router. Seen with sing-box/v2rayN TUN mode (adapter MTU 9000): a 36KB POST dies with `ECONNRESET` at ~0.70s, while the same body over TLS, or through the local proxy port (`127.0.0.1:10808`), returns 200. Route the client through its proxy instead of the TUN, e.g. for this harness put `HTTP_PROXY`/`HTTPS_PROXY` (plus `NO_PROXY=localhost,127.0.0.1`) in `$DSH_HOME/.env`, and restart it. Diagnosis recipe: POST the same body to the router and to any plain HTTP host, then the same body over TLS — plaintext-only failures point at the client, not the server. |
 | A non-streaming request that generates for a long time gets cut by the client or an intermediary | The router now opens the response after 7s and writes a JSON-legal newline every 4s while the upstream is still generating, so a buffered answer never leaves the socket idle. Leading whitespace is valid JSON, so `fetch().json()` is unaffected; fast answers still carry `content-length` and no padding. |
+| `[xray:main] xray exited with code 255` in a loop, pool looks empty, restarts do not help | A stray `xray` from an earlier run (a test batch, or a copy of the repo started from `/tmp`) is still holding the inbound ports, and Xray's `SO_REUSEPORT` lets the new instance bind them and then die. `ps -o pid,args -C xray` shows the offender; `startMain()` now sweeps `llm-router-burn-*`/`llm-router-sched-*` instances on every start, and `test/smoke.js` runs its own manager on ports 23800+ so a test can never squat on the production range. |
+| The pool reports `ok` exits but `active` stays 0 and requests log "no working exit to switch to" | Older builds left failed exits marked `ok` with an empty `exitIp`; `workingExits()` ignores those, so nothing could be promoted. Fixed by clearing `ok` on any failed test and by letting a replenish retest a few of the least-failed `dead` entries instead of only `untested` ones. |
 
 ## Verification
 
