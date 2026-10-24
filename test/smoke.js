@@ -154,7 +154,9 @@ const mock = http.createServer(async (req, res) => {
     // every other model on the same identity keeps answering.
     if (Array.isArray(fb.modelQuotaExhausted) && fb.modelQuotaExhausted.includes(String(json.model))) {
       fb.modelQuota429 += 1;
-      res.writeHead(429, { 'content-type': 'application/json' });
+      // The live edge always quotes a retry-after on a quota 429. Off by default
+      // here so tests that do not care see the bare 429 they were written for.
+      res.writeHead(429, { 'content-type': 'application/json', ...(fb.quotaRetryAfter ? { 'retry-after': String(fb.quotaRetryAfter) } : {}) });
       return res.end(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached. Subscribe to OpenCode Go to keep going.' } }));
     }
     if (fb.stallNext > 0) {
@@ -388,6 +390,7 @@ const fb = {
   freeTierRejects: 0,
   modelQuotaExhausted: [],
   modelQuota429: 0,
+  quotaRetryAfter: 0,
   burn429: 0,
   stallNext: 0,
   stalled: 0,
@@ -668,6 +671,12 @@ async function memOf() {
     check('exhausted response carries retryAfterSeconds + retryable provider info',
       Number(parsed.error.retryAfterSeconds) > 0 && parsed.error.healthyRemaining === 0 && parsed.error.tried.length === 3,
       rr.text.slice(0, 240));
+    // Body-only retryAfterSeconds is invisible to every SDK that reads the header
+    // (openai client, opencode CLI, fetch-retry): they re-ask in milliseconds.
+    const ra = Number(rr.headers.get('retry-after'));
+    check('exhausted response also carries a Retry-After header matching the body',
+      Number.isFinite(ra) && ra > 0 && Math.abs(ra - Number(parsed.error.retryAfterSeconds)) <= 2,
+      `header=${rr.headers.get('retry-after')} body=${parsed.error.retryAfterSeconds}`);
   }
 
   // 5b. a hard upstream 5xx is relayed (never dressed up as success)
@@ -1171,8 +1180,12 @@ async function memOf() {
       && /^opencode\/latest\//.test(String(first.client && first.client.userAgent))
       && String(first.client && first.client.session).length > 0,
       JSON.stringify(first).slice(0, 200));
-    check('reinstall: two rebuilds present a different project handle and client version',
-      first.client.project !== second.client.project && first.client.userAgent !== second.client.userAgent,
+    // The build is pinned, so a rebuild changes the project handle and the session
+    // and leaves the client version alone.
+    check('reinstall: two rebuilds present a different project handle, on the newest build',
+      first.client.project !== second.client.project
+      && first.client.userAgent === second.client.userAgent
+      && first.client.userAgent === 'opencode/latest/2.1.0/cli',
       `${first.client.project}/${first.client.userAgent} vs ${second.client.project}/${second.client.userAgent}`);
     check('reinstall: the cooldown is cleared and the rebuild is counted',
       first.client.cooldownCleared === true && second.reinstalls > first.reinstalls, `cleared=${first.client.cooldownCleared} ${first.reinstalls}->${second.reinstalls}`);
@@ -1269,6 +1282,26 @@ async function memOf() {
       String(esc.headers.get('x-router-exit')));
     check('lanes: the sweep floor is exposed and defaults to a minute',
       afterEsc.allLanesRenewGapMinutes === 1, String(afterEsc.allLanesRenewGapMinutes));
+    // The two dials an operator uses to choose "keep rotating" over "wait it out":
+    // 0 is a real setting on both, so it must survive the settings route and be
+    // reported by the snapshot (the dialog labels its inputs with these numbers).
+    check('dials: the day horizon and the pool rest are reported',
+      afterEsc.freeDayHorizonMinutes === 30 && afterEsc.freePoolRestMinutes >= 0,
+      `horizon=${afterEsc.freeDayHorizonMinutes} rest=${afterEsc.freePoolRestMinutes}`);
+    await fetch(routerUrl('/admin/api/settings'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ freeDayHorizonMinutes: 0, freePoolRestMinutes: 0 }),
+    });
+    const zeroed = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    check('dials: 0 on both means never park and never rest',
+      zeroed.freeDayHorizonMinutes === 0 && zeroed.freePoolRestMinutes === 0,
+      `horizon=${zeroed.freeDayHorizonMinutes} rest=${zeroed.freePoolRestMinutes}`);
+    await fetch(routerUrl('/admin/api/settings'), {
+      method: 'POST', headers: ADMIN, body: JSON.stringify({ freeDayHorizonMinutes: 30, freePoolRestMinutes: 5 }),
+    });
+    const restored = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
+    check('dials: a positive value pins the window again',
+      restored.freeDayHorizonMinutes === 30 && restored.freePoolRestMinutes === 5,
+      `horizon=${restored.freeDayHorizonMinutes} rest=${restored.freePoolRestMinutes}`);
     const snap2 = await (await fetch(routerUrl('/admin/api/proxies'), { headers: ADMIN })).json();
     const burnedIds = (snap2.events || []).filter((e) => e.kind === 'exit-burned').map((e) => e.exit);
     const activeIds = snap1.exits.filter((e) => e.active).map((e) => e.id);
@@ -1312,16 +1345,16 @@ async function memOf() {
 
     // ...and every one of them really is a new identity: the rebuild runs off the
     // request path, so wait for it and compare each lane against itself - new
-    // generation, new client build, nothing left presenting the spent one.
+    // generation and new session, presenting the same newest build.
     let swept = deadLanes;
     for (let i = 0; i < 50 && swept.some((a) => a.refreshing); i += 1) {
       await sleep(100);
       const st = await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json();
       swept = st.providers.find((p) => p.id === 'free-rotate-test').accounts;
     }
-    check('lanes: the sweep finishes - every lane steps to a new generation and build',
+    check('lanes: the sweep finishes - every lane steps to a new generation, build unchanged',
       swept.length === 2 && swept.every((a) => !a.refreshing && beforeSweep.get(a.id) !== `${a.gen}:${a.build}`)
-      && new Set(swept.map((a) => a.build)).size === 2,
+      && new Set(swept.map((a) => a.build)).size === 1,
       swept.map((a) => `${a.name}gen${a.gen}/${a.build}${a.refreshing ? ' refreshing' : ''}`).join(','));
 
     // The burn pile is deleted and a fresh batch is taken on for the next hops.
@@ -1339,10 +1372,10 @@ async function memOf() {
     const req = await chat({ model: 'big-pickle', headers: { 'x-router-provider': 'lane-default-test' } });
     check('lanes: the default pool is minted on the first request', req.status === 200, `${req.status} ${req.text.slice(0, 120)}`);
     const seeded = (await (await fetch(routerUrl('/admin/api/state'), { headers: ADMIN })).json()).providers.find((p) => p.id === 'lane-default-test');
-    check('lanes: four separate identities exist, each with its own session and build',
+    check('lanes: four separate identities exist, each with its own session on the newest build',
       seeded.accountCount === 4
       && new Set(seeded.accounts.map((a) => a.lane)).size === 4
-      && new Set(seeded.accounts.map((a) => a.build)).size === 3,
+      && new Set(seeded.accounts.map((a) => a.build)).size === 1,
       `count=${seeded.accountCount} lanes=${seeded.accounts.map((a) => a.lane).join(',')} builds=${seeded.accounts.map((a) => a.build).join(',')}`);
   }
 
@@ -1722,15 +1755,20 @@ async function memOf() {
         // because a previous ladder marked the ceiling dry.
         const before = fb.modelQuota429;
         fb.modelQuotaExhausted = ['big-pickle'];
+        fb.quotaRetryAfter = 2; // the live edge always quotes one; short = a lane limit
         const dry1 = await exChat({ model: 'opencode-free/big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] });
         const dry2 = await exChat({ model: 'opencode-free/big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] });
         fb.modelQuotaExhausted = [];
+        fb.quotaRetryAfter = 0;
         check('exclusive: a dry free model fails with this provider\'s own 429, never a substitution',
           dry1.status === 429 && dry1.headers.get('x-router-provider') !== 'pollinations'
           && !dry1.text.includes('openai-fast') && !dry2.text.includes('openai-fast'),
           `status=${dry1.status} provider=${dry1.headers.get('x-router-provider')} body=${dry1.text.slice(0, 200)}`);
         check('exclusive: a known-dry ceiling is tried again instead of being skipped (no fallback to hand over to)',
           fb.modelQuota429 - before >= 2, `tier attempts=${fb.modelQuota429 - before}`);
+        const dryRa = Number(dry1.headers.get('retry-after'));
+        check('exclusive: a 429 carries Retry-After (never absent, never 0), so a client sleeps instead of hot-looping',
+          Number.isFinite(dryRa) && dryRa >= 2, `retry-after=${dry1.headers.get('retry-after')}`);
       }
     } finally {
       if (exChild) exChild.kill('SIGTERM');

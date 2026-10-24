@@ -572,14 +572,22 @@ class ProxyManager {
     let killed = 0;
     let entries = [];
     try { entries = fs.readdirSync('/proc'); } catch { return 0; }
+    const liveTest = this.tester && this.tester.child ? this.tester.child.pid : 0;
     for (const entry of entries) {
       if (!/^\d+$/.test(entry)) continue;
       if (Number(entry) === process.pid) continue;
+      if (liveTest && Number(entry) === liveTest) continue;
       try {
         const comm = fs.readFileSync(`/proc/${entry}/comm`, 'utf8').trim();
         if (comm !== 'xray') continue;
         const cmd = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8').replace(/\0/g, ' ');
-        if (!/llm-router-(burn|sched)-/.test(cmd)) continue;
+        // The test instance writes `xray-test-config.json` in the data dir, not a
+        // temp dir, so the `(burn|sched)` pattern never matched it. A test xray
+        // that outlived its run held 30801.. forever; every later batch then died
+        // on `bind: address already in use` (exit 23), and because a failed start
+        // splits the batch down to single exits, the whole run condemned good
+        // exits as dead - 591 of 1647 on 2026-10-24. Match it here too.
+        if (!/llm-router-(burn|sched)-|xray-test-config\.json/.test(cmd)) continue;
         process.kill(Number(entry), 'SIGTERM');
         killed += 1;
       } catch { /* already gone, or not ours to signal */ }
@@ -654,6 +662,11 @@ class ProxyManager {
 
   async testAll({ limit = 0, protocols = null, retest = false, sourceIds = null, ids = null } = {}) {
     if (this.test.running) return { error: 'a test run is already in progress' };
+
+    // A test xray left behind by an earlier run still owns the test ports; every
+    // batch of this run would then die on `address already in use`. Clear them
+    // before the first spawn (the guard above keeps a live run safe).
+    this.sweepStrays();
 
     // Pre-flight: without a usable binary every batch would burn its port
     // timeout and report the exits dead for the wrong reason.

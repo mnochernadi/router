@@ -96,7 +96,7 @@ An account is **healthy** when `enabled !== false` and `limitedUntil <= now`.
 1. The router calls the selected account.
 2. On `429`, `402` or `403` (configurable via `cooldownStatuses`) the account is marked `limited` until `now + cooldownHours` — the deadline is written to `state.json` immediately.
 3. The request is retried with the **next healthy account in the same provider**, transparently — the client sees a single successful response and the headers `x-router-account` (which key answered) and `x-router-attempts` (how many were tried).
-4. When every account is cooling, the client gets `429` with `retryAfterSeconds`, `nextUnlockAt`, `tried` and `healthyRemaining` so it can back off precisely.
+4. When every account is cooling, the client gets `429` with `retryAfterSeconds`, `nextUnlockAt`, `tried` and `healthyRemaining` so it can back off precisely — and the same clock is stamped on the response as a `retry-after` header in seconds, because most SDKs read the header and never look inside the body.
 5. A sweeper runs every 30 s and unlocks expired accounts automatically — no restart, no cron.
 
 `5xx` responses are retried across accounts too (`retryStatuses`) but never trigger a cooldown; if the last attempt is still a `5xx` it is relayed to the client as-is rather than dressed up as a success.
@@ -207,6 +207,20 @@ When a lane answers `429` the request does not sit there being rebuilt - it chan
 
 A limit that survives that whole ladder is the *provider's* problem, not that lane's. So the moment a lane is spent, the router mints a **new identity on every lane at once** (`queueAllLaneRefreshes`) rather than only on the one that reported it: the next request then starts on a complete set of fresh identities instead of spending itself rediscovering that the other three are spent too. The sweep drives the same per-lane rebuild - new session, new project handle, next client build, and a newly pinned exit - through the background queue, so the reporting request does not pay for four exit re-pins. It is throttled to **one sweep per minute**, `allLanesRenewGapMinutes` in `config.json` (top-level, next to `freeLadderBudgetSeconds`; `0` means every limit, clamped to a day), because a burst of cold requests would otherwise mint a fresh set of identities for every `429` the ladder collects. Whatever that floor says, a single request sweeps **at most once**: a ladder can end "spent" on several lanes in a row, and four new identities per lane-ending is a mint storm rather than a fresh start, while one sweep already leaves the next request a complete set. The dashboard's activity list shows it as a single `reinstall-all` event covering all lanes, and the snapshot exposes the floor as `allLanesRenewGapMinutes` and each provider's own last sweep as `allLanesSweptAt`.
 
+**Identity burst: the sweep is for the next request, not for this one.** Everything above is written for a client that asks one thing at a time. A client that asks several - an agent fanning out tool calls, two panes, an SDK retry that overlaps - used to serialise behind that design: the first `429` swept every lane, the sweep parked all four for `LANE_REFRESH_COOLDOWN_MS` (30 s), and the second request arrived to find no ready lane, waited out `LANE_WAIT_MS` (12 s) and collected the same `429` the ladder was built to clear. So identity rotation is also **demand driven**. The router counts the requests inside each provider's ladder and, while that count is above one:
+
+* a spent lane is **rebuilt in place and stays in service** (`rebuildLaneNow`) instead of being parked - burn its exit, drop the pin, mint a session, pin another exit; every step is local state, so the lane is usable again the moment it returns;
+* the **all-lane sweep stands down** (`queueAllLaneRefreshes` returns without sweeping), because those lanes are in other requests' hands and taking them away is what starved them;
+* a request that finds **every** lane spent or parked gets an identity minted on the lane that has waited longest (`lendIdentity`) rather than sitting out the 12 s wait, and the activity list shows it as `identity-lent` next to the usual `lane-rebuilt`.
+
+Each request mints at most `LANE_BURST_MINT_MAX` (2) identities per lane, so a burst of N requests costs O(N) identities and never a mint storm; the second fresh identity failing too rests that lane for one second instead of offering it to the next request as if it were new. A single request behaves exactly as it did before, sweep and floor included. `identityBurst: false` in `config.json` (or the settings POST) turns the whole mechanism off and restores the strictly one-request-at-a-time ladder; the snapshot reports `identityBurst` and each provider's current `demand` so the dashboard can show "N in the ladder".
+
+```
+[proxy] opencode-free#1/identity-2: every lane is spent while 3 requests are in the ladder - minting this lane's identity now instead of waiting for a rebuild
+[proxy] opencode-free#1: lane rebuilt in place (identity on demand (3 requests in the ladder)); it stays in service for the other requests
+[proxy] opencode-free: all-lane sweep stood down - 3 requests are in the ladder, each minting its own identity (HTTP 429 - lane spent)
+```
+
 | Lane fingerprint | Rotated per rebuild |
 |---|---|
 | session id (`x-opencode-session`) | yes |
@@ -257,6 +271,14 @@ Only plain OpenAI-compatible targets are used, so the hop never changes the wire
 ```
 [proxy] fallback-provider: answering with fallback-model (configured fallback; the first-choice provider had nothing left)
 ```
+
+**A hop's limit is not the caller's limit.** One pass over the list is not enough for a free tier, because the most common refusal there is not "no": it is "not yet" — pollinations' `Your previous request is still running`, a shared allowance that resets, a `429` with a short window. So the hops are walked in **rounds**: when every hop has refused, the router waits out the shortest `retry-after` any of them quoted (1.2 s floor, 6 s ceiling, `fallbackRetrySeconds` deadline, default 30 s, at most 6 rounds) and walks them again. Hops that are *deterministically* dead — no such provider, no enabled account, wrong wire format — are dropped from the walk instead of being re-tried, so a misconfigured entry cannot hold the chain open. With a healthy anchor in the list this turns "rate limited" into "answered a moment later"; the caller waits, and gets a completion.
+
+```
+[proxy] opencode-free: every fallback hop refused (pollinations/openai-fast 402 "..." ); retrying in 1.2s (round 1/6)
+```
+
+If even that runs out, the error tells the truth instead of blaming the first-choice provider: the status is the last hop's limit status (`429`) rather than a `503`, and the body carries `error.fallback` — every hop, its status, and what it said. `fallbackRetrySeconds` is the dial: `0`/unset keeps the 30 s default, `45` is a good value for an agent that would rather wait than be interrupted.
 
 **This is exactly what `exclusiveProvider` switches off.** With the lock set the router answers from the locked provider or not at all, because a client that pinned `opencode-free/deepseek-v4.1-flash-free` did not ask for `pollinations/openai-fast`. The same applies to the per-model walk inside the free tier: `freeFallback: false` on the provider keeps every rung of the ladder on the model the client asked for, so a dry model ends in that provider's own `429` (`error.type: router_no_provider`/the upstream quota message) instead of a different model's `200`.
 
@@ -318,7 +340,7 @@ Auth accepts anything real clients send: `Authorization: Bearer <router key>`, `
 | `GET` | `/v1/models` | Lists configured providers as model owners. |
 | `GET` | `/health` | `{ ok, version, node, uptimeSeconds, rss, requests, providers, accounts }`. |
 
-Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-router-attempts`.
+Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-router-attempts`. A refusal also carries `retry-after` in seconds whenever the router can name the instant: the upstream's own window when it quoted one, or the parked free-day reset when the ceiling is the longer story. No `429` leaves here without it, so a client that honours the header sleeps to the reset instead of re-asking in a loop.
 
 ### Admin (requires `x-admin-key`)
 
@@ -355,6 +377,11 @@ Response headers on a routed call: `x-router-provider`, `x-router-account`, `x-r
 | `exclusiveProvider` | `""` | **Exclusive mode.** The id (or type) of the only provider this router may serve. Set, every other provider is dropped at load, `fallbackProviders` is ignored, a request naming a different provider is refused with `404 router_unknown_provider`, and the admin API rejects adding one back. Use it when a client pins one free tier (`opencode-free/deepseek-v4.1-flash-free`) and must never be answered by another vendor. |
 | `freeLadderBudgetSeconds` | `25` | `3`-`120`: time-boxes the free-tier ladder on a cold request (the already-dry leash is 80 % of it - 20 s at the default; the 60 s ceiling is fixed). Set `6`-`8` when the free allowance is spent and the fallback should answer. Unset = 25 s / 20 s, i.e. unchanged. |
 | `allLanesRenewGapMinutes` | `1` | `0`-`1440`: floor between "mint a new identity on every lane at once" sweeps. `0` = sweep on every limit (the most aggressive setting: every lane gets a new session, project and client build the moment one of them is spent). One request never sweeps twice whatever this says, so `0` cannot mint four identities per lane-ending. Per provider, stamped in `state.json`, so a restart does not grant a free sweep. |
+| `identityBurst` | `true` | `true`/`false`: while **more than one** request is inside a provider's free-tier ladder, each request mints its own identity on demand, a spent lane is rebuilt in place instead of parked for 30 s, and the all-lane sweep stands down (its lanes are in other requests' hands). This is what keeps a fan-out of concurrent requests from serialising behind one parked lane and collecting the same `429`. `false` restores the strictly one-request-at-a-time ladder: every limit sweeps all lanes and a spent lane waits out its park. |
+| `freeDayHorizonMinutes` | `30` | `0`-`1440`: what counts as a spent **day** rather than a spent exit or identity. A quota answer quoting a `retry-after` at least this long is the daily bucket — every address, identity, build and model answers it identically — so the tier is parked until the instant the upstream named instead of being probed. **`0` parks nothing**: every limit runs the ladder (rotate the exit, mint an identity, walk the pool). That clears a limit while the day still has allowance, and once the day is spent it keeps answering the upstream's own `429` with its clock in `retry-after`. |
+| `freePoolRestMinutes` | *escalating* | `0`-`1440`: how long the pool rests after a ladder that could not clear a ceiling. Unset keeps the escalating 5m → 2h backoff; a positive value pins that window; **`0` never rests**, so the next request runs the whole ladder again. |
+| `fallbackRetrySeconds` | `30` | `1`-`300`: how long the cross-provider last resort keeps retrying refusing hops before the caller is told it could not be served. A hop that answers `429`/`402` is a queue, not a verdict — the chain waits out the shortest quoted window (1.2-6 s per round) and walks the list again. Unset keeps 30 s. |
+| `exclusiveProvider` | `""` | Hard lock to one provider id: no cross-provider hop, no per-model walk. The client's answer is never substituted — and a dry provider fails with its own limit instead. Empty = normal routing. |
 | `cors` | `true` | Send permissive CORS headers to proxy clients. |
 | `logging.requests` | `false` | Routing lines in the process log. Off by default — counters live in the dashboard. |
 | `rotateEveryMinutes` | `0` | Time-boxed rotation: keep one account for N minutes, then move to the next. Use it when a provider's free quota resets on a clock — OpenCode: `120` for two-hour tokens. Per-account override allowed. `0` = off. |

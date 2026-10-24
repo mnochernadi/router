@@ -986,6 +986,16 @@
         <p class="mt-1 text-[11px] text-slate-500" x-text="'Caps how long a request walks the free tier (rotate exit, mint identity, walk models, new session) before the fallback answers. Default 25, range 3-120; use 6-8 when the upstream allowance is spent. Dry-provider leash: ' + (Math.round((Number(sf.freeLadderBudgetSeconds) || 25) * 0.8 * 10) / 10) + ' s (80%).'"></p>
       </div>
       <div>
+        <label class="fld">Treat as a spent <em>day</em> at (minutes, 0 = never)</label>
+        <input class="input mono" type="number" min="0" max="1440" step="1" placeholder="30" x-model.number="sf.freeDayHorizonMinutes" />
+        <p class="mt-1 text-[11px] text-slate-500">A quota answer quoting a window at least this long is parked until the upstream's own reset instant instead of being probed. <span class="text-slate-400">0 keeps the ladder live on every limit</span> — rotate the exit and mint an identity each time, which clears a limit while the day still has allowance, and keeps answering the upstream's 429 with its own clock once the day is spent.</p>
+      </div>
+      <div>
+        <label class="fld">Rest the pool after a dry ladder (minutes, 0 = never)</label>
+        <input class="input mono" type="number" min="0" max="1440" step="1" placeholder="5,3,9…" x-model.number="sf.freePoolRestMinutes" />
+        <p class="mt-1 text-[11px] text-slate-500">Blank keeps the escalating 5m → 2h backoff after a ladder that could not clear a ceiling. <span class="text-slate-400">0 never rests</span>: the next request runs the whole ladder again.</p>
+      </div>
+      <div>
         <label class="fld">Default provider</label>
         <select class="input" x-model="sf.defaultProvider">
           <option value="">— auto (first healthy) —</option>
@@ -1146,7 +1156,7 @@ function app() {
 
     pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', rotateEveryMinutes: 0, error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
-    sf: { cooldownHours: 12, freeLadderBudgetSeconds: 25, defaultProvider: '', proxyKeysText: '', clearProxyKeys: false, cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
+    sf: { cooldownHours: 12, freeLadderBudgetSeconds: 25, freeDayHorizonMinutes: null, freePoolRestMinutes: null, defaultProvider: '', proxyKeysText: '', clearProxyKeys: false, cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
     mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
     cf: { title: '', body: '', run: null },
 
@@ -1694,6 +1704,10 @@ function app() {
       this.sf = {
         cooldownHours: this.s.cooldownHours || 12,
         freeLadderBudgetSeconds: this.s.freeLadderBudgetSeconds ?? 25,
+        // Blank in the box means "the built-in": the route skips null, so opening
+        // this dialog and saving cannot silently pin a dial the operator never set.
+        freeDayHorizonMinutes: this.s.freeDayHorizonMinutes ?? null,
+        freePoolRestMinutes: this.s.freePoolRestMinutes ?? null,
         defaultProvider: this.s.defaultProvider || '',
         proxyKeysText: '',
         clearProxyKeys: false,
@@ -1711,6 +1725,8 @@ function app() {
       const body = {
         cooldownHours: this.sf.cooldownHours,
         freeLadderBudgetSeconds: this.sf.freeLadderBudgetSeconds,
+        freeDayHorizonMinutes: this.sf.freeDayHorizonMinutes,
+        freePoolRestMinutes: this.sf.freePoolRestMinutes,
         defaultProvider: this.sf.defaultProvider,
         cors: this.sf.cors,
         loggingRequests: this.sf.loggingRequests,

@@ -160,7 +160,7 @@ function timingSafeEqual(a, b) {
   try { return crypto.timingSafeEqual(ba, bb); } catch { return false; }
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, extra = null) {
   const payload = JSON.stringify(obj);
   // Proxy answers are CORS-open (clients call them from browsers); the admin
   // API is not, unless the operator opts in -- it takes the x-admin-key header.
@@ -170,6 +170,7 @@ function sendJson(res, status, obj) {
     'content-length': Buffer.byteLength(payload),
     'cache-control': 'no-store',
     ...(cors ? { 'access-control-allow-origin': '*' } : {}),
+    ...(extra || {}),
   });
   res.end(payload);
 }
@@ -338,6 +339,33 @@ function normalizeConfig(cfg) {
     const sweepMinutes = Number(out.allLanesRenewGapMinutes);
     if (Number.isFinite(sweepMinutes) && sweepMinutes >= 0) out.allLanesRenewGapMinutes = Math.min(1440, sweepMinutes);
     else delete out.allLanesRenewGapMinutes;
+  }
+  // Identity burst: while several requests are in the free tier's ladder, each
+  // gets its own identity instead of queueing behind a lane parked for a rebuild.
+  // Default on; `false` restores the strictly one-request-at-a-time ladder (every
+  // limit sweeps all lanes and a spent lane waits out its park).
+  out.identityBurst = out.identityBurst !== false;
+  // What counts as "the day is spent" rather than "this exit/identity is spent".
+  // Absent keeps the measured 30 minutes; 0 is meaningful and means *never park* -
+  // every limit runs the ladder (rotate the exit, mint an identity, walk the pool)
+  // instead of being parked until the upstream's reset instant. Clamped to a day.
+  if (out.freeDayHorizonMinutes === undefined || out.freeDayHorizonMinutes === null || out.freeDayHorizonMinutes === '') {
+    delete out.freeDayHorizonMinutes;
+  } else {
+    const horizonMinutes = Number(out.freeDayHorizonMinutes);
+    if (Number.isFinite(horizonMinutes) && horizonMinutes >= 0) out.freeDayHorizonMinutes = Math.min(1440, horizonMinutes);
+    else delete out.freeDayHorizonMinutes;
+  }
+  // How long the pool rests after a ladder that could not clear a ceiling.
+  // Absent keeps the escalating 5m -> 2h backoff; 0 means *never rest* - the next
+  // request runs the whole ladder again instead of being told to wait. A positive
+  // value pins a fixed window. Clamped to a day.
+  if (out.freePoolRestMinutes === undefined || out.freePoolRestMinutes === null || out.freePoolRestMinutes === '') {
+    delete out.freePoolRestMinutes;
+  } else {
+    const restMinutes = Number(out.freePoolRestMinutes);
+    if (Number.isFinite(restMinutes) && restMinutes >= 0) out.freePoolRestMinutes = Math.min(1440, restMinutes);
+    else delete out.freePoolRestMinutes;
   }
   // How long the last resort keeps retrying before the caller is told the truth.
   // Unset/nonsense keeps the built-in 30s; clamped to 1s..5min so a typo cannot hold
@@ -775,6 +803,10 @@ function providerSummary(provider) {
     // When every lane was last given a new identity at once (0 = never). The floor
     // between those sweeps is `allLanesRenewGapMinutes` in the snapshot.
     allLanesSweptAt: Number(providerState(provider.id).allLanesSweptAt) || 0,
+    // How many requests are inside this provider's free-tier ladder right now. More
+    // than one and identity rotation mints per request instead of parking lanes
+    // (see "Identity burst" above); the dashboard shows it as "N in the ladder".
+    demand: freeDemandOf(provider.id),
     // Advertised context window; clients read it and stop trimming at 8k.
     contextWindow: contextWindowOf(provider),
     // The dashboard reads this to render the "rotating exits" pill and to seed
@@ -1502,6 +1534,14 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
     headers['x-router-model'] = String(ctx.model || '');
     headers['x-router-attempts'] = String(attempts);
     headers['x-router-exit'] = 'direct';
+    // Pass the upstream's own clock through, not just its sentence: a client that
+    // never sees retry-after will re-ask within milliseconds and burn the ladder.
+    // When the free-day ceiling is the longer story, the ceiling wins - it is the
+    // same instant every lane reports, and the only clock worth sleeping on.
+    const upstreamWait = Math.ceil(retryAfterMs(upstream.headers) / 1000);
+    const ceilingWait = freeDry.until > now() ? Math.round((freeDry.until - now()) / 1000) : 0;
+    const waitSecs = Math.max(upstreamWait, ceilingWait);
+    if (waitSecs > 0) headers['retry-after'] = String(waitSecs);
     res.writeHead(upstream.status, headers);
     res.end(JSON.stringify({ error: { message: `${message}${hint}`, type, upstreamStatus: upstream.status, provider: provider.id } }));
     return;
@@ -1560,6 +1600,10 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
   headers['x-router-rotations'] = String(ctx.rotations || 0);
   const len = upstream.headers.get('content-length');
   if (!ctx.stream && len) headers['content-length'] = len;
+  if (upstream.status >= 400) {
+    const upstreamWait = Math.ceil(retryAfterMs(upstream.headers) / 1000);
+    if (upstreamWait > 0) headers['retry-after'] = String(upstreamWait);
+  }
   res.writeHead(upstream.status, headers);
   if (res.socket && res.socket.setNoDelay) res.socket.setNoDelay(true);
 
@@ -1606,7 +1650,14 @@ async function relay(provider, account, upstream, controller, ctx, res, attempts
 function allExhausted(provider, tried, dueToLimit) {
   const accounts = (provider.accounts || []).filter((a) => a.enabled !== false);
   const healthyLeft = accounts.filter((a) => !tried.has(a.id) && !isLimited(accountState(provider.id, a.id)));
-  const nextUnlock = accounts
+  // The parked free tier has one unlock instant for the whole provider - the daily
+  // reset the upstream named - and it applies even to a lane that never answered a
+  // 429 itself. Reporting it is what lets a client back off to the right moment
+  // instead of retrying on a 12h default (or being told "try again" with no figure).
+  const parkedUntil = (PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style === 'opencode-free' && freeDry.until > now()
+    ? freeDry.until
+    : 0;
+  const nextUnlock = parkedUntil || accounts
     .map((a) => accountState(provider.id, a.id).limitedUntil)
     .filter((t) => t > now())
     .sort((a, b) => a - b)[0] || 0;
@@ -1621,7 +1672,12 @@ function allExhausted(provider, tried, dueToLimit) {
       status: as.lastStatus || 0,
       kind: as.lastLimitedKind || '',
       message: as.lastMessage || '',
-      unlocksInSeconds: as.limitedUntil > now() ? Math.round((as.limitedUntil - now()) / 1000) : 0,
+      unlocksInSeconds: parkedUntil
+        // The free tier's park is one instant for the whole provider. Reporting a
+        // lane's own 1-second park next to a multi-hour `retry-after` is what made
+        // the exhausted-provider answer read as "cooling down" on a spent day.
+        ? Math.max(0, Math.round((parkedUntil - now()) / 1000))
+        : (as.limitedUntil > now() ? Math.round((as.limitedUntil - now()) / 1000) : 0),
     };
   });
   const reasons = detail.filter((d) => d.message).map((d) => `${d.name}: HTTP ${d.status} ${d.message}`);
@@ -1641,7 +1697,15 @@ function allExhausted(provider, tried, dueToLimit) {
         : (policy
           ? `Provider "${provider.id}" refused the request upstream: HTTP ${last.status} ${last.message || ''}`.trim() + ' This is not an account or exit limit, so nothing was rotated.'
           : (dueToLimit
-            ? `All accounts for provider "${provider.id}" are rate-limited and cooling down.`
+            ? (parkedUntil
+              // The account is not "cooling down". The router measured the upstream
+              // window at >= FREE_DAY_HORIZON_MS and positively identified the
+              // *day*: `parkedUntil` is the reset instant the upstream named. Say
+              // that, and name the instant, instead of reporting a 1-second lane
+              // park next to a 9-hour `retry-after` and sending the caller looking
+              // for a rotation that cannot exist.
+              ? `Provider "${provider.id}" has spent its upstream free allowance - the ceiling is the day, not this box. Every egress IP, identity, client build and model this router can mint was already measured against it, and the allowance is not keyed on any of them, so rotation cannot clear it. It returns at ${new Date(parkedUntil).toISOString()}.`
+              : `All accounts for provider "${provider.id}" are rate-limited and cooling down.`)
             : `No healthy account available for provider "${provider.id}".`)) + rotateHint,
       type: notEnabled ? 'router_no_enabled_accounts' : (policy ? 'upstream_error' : 'router_no_healthy_account'),
       upstreamStatus: last ? last.status : 0,
@@ -1701,6 +1765,54 @@ const MANAGED_POOL_MAX = 6;
 const LANE_REFRESH_COOLDOWN_MS = 30_000;
 // How long a request may wait for a replacement lane when every lane is spent.
 const LANE_WAIT_MS = 12_000;
+
+// Identity burst.
+//
+// The all-lane sweep is written for the *next* request: one limit, four fresh
+// identities waiting. It is the wrong answer for the requests that are already
+// here. A sweep parks every lane for `LANE_REFRESH_COOLDOWN_MS` and its floor
+// throttles the next one to `allLanesRenewGapMinutes`, so a client that sends
+// several requests at once (an agent fanning out, two panes, a retry loop) has
+// them serialising behind one parked lane, waiting out an interval that exists to
+// protect the pool, and collecting the same 429 the ladder was built to clear.
+//
+// So identity rotation is demand driven as well. While more than one request is
+// in the free tier's ladder:
+//   - a spent lane is rebuilt in place and stays in service instead of being
+//     parked for half a minute (its identity is local state: burn the exit, drop
+//     the pin, mint a session, pin another exit - no network, no waiting);
+//   - the all-lane sweep stands down, because those lanes are in other requests'
+//     hands and taking them away is what starved them;
+//   - a request that finds every lane parked mints an identity on the lane that
+//     has waited longest, instead of sitting out `LANE_WAIT_MS` and then failing.
+// Each request mints at most `LANE_BURST_MINT_MAX` identities per lane, so a
+// burst of N requests costs O(N) identities - never a mint storm - and a single
+// request behaves exactly as it did before this existed.
+const LANE_BURST_MINT_MAX = 2;
+
+/** How many requests are inside the free tier's ladder right now, per provider. */
+const freeDemand = new Map();
+
+function freeDemandOf(providerId) {
+  return freeDemand.get(providerId) || 0;
+}
+
+function noteFreeDemand(providerId, delta) {
+  const next = Math.max(0, freeDemandOf(providerId) + delta);
+  if (next) freeDemand.set(providerId, next);
+  else freeDemand.delete(providerId);
+  return next;
+}
+
+/** The kill switch: `identityBurst: false` restores the one-request-at-a-time ladder. */
+function identityBurstEnabled() {
+  return config.identityBurst !== false;
+}
+
+/** More than one request in the ladder: rotation has to serve all of them. */
+function freeDemandConcurrent(providerId) {
+  return identityBurstEnabled() && freeDemandOf(providerId) > 1;
+}
 // How long a pooled exit gets to produce response headers before it counts as
 // dead and the request moves on. Measured: healthy exits answer in 1-3s; a
 // burned node accepts the connect and then never answers.
@@ -1746,11 +1858,31 @@ const FREE_DRY_BASE_MS = 5 * 60_000;
 const FREE_DRY_MAX_MS = 2 * 60 * 60_000;
 const freeDry = { hits: 0, until: 0, backoffMs: FREE_DRY_BASE_MS, ...(state.freeDry || {}) };
 
+/**
+ * How long the pool rests after a ceiling the ladder could not clear.
+ * `null` means resting is switched off (`freePoolRestMinutes: 0`): the operator's
+ * choice is to keep rotating on every request rather than wait, so the ladder is
+ * always live. A positive `freePoolRestMinutes` pins that window; otherwise the
+ * escalating backoff is used.
+ */
+function poolRestMs() {
+  const raw = config.freePoolRestMinutes;
+  if (raw === undefined || raw === null || raw === '') return freeDry.backoffMs;
+  const minutes = Math.max(0, Number(raw) || 0);
+  return minutes > 0 ? minutes * 60_000 : null;
+}
+
 /** Rest the pool for the current backoff window, then double the next one. */
 function restFreePool(providerId, why) {
-  freeDry.until = now() + freeDry.backoffMs;
-  const rested = Math.round(freeDry.backoffMs / 60_000);
-  freeDry.backoffMs = Math.min(FREE_DRY_MAX_MS, Math.round(freeDry.backoffMs * 3));
+  const wait = poolRestMs();
+  if (wait === null) {
+    console.warn(`[proxy] ${providerId}: ${why} - resting is switched off (freePoolRestMinutes: 0), so the next request runs the ladder again`);
+    return;
+  }
+  freeDry.until = now() + wait;
+  const rested = Math.round(wait / 60_000);
+  if (Number(config.freePoolRestMinutes) > 0) freeDry.backoffMs = wait;
+  else freeDry.backoffMs = Math.min(FREE_DRY_MAX_MS, Math.round(freeDry.backoffMs * 3));
   state.freeDry = { hits: freeDry.hits, until: freeDry.until, backoffMs: freeDry.backoffMs };
   persistState();
   console.warn(`[proxy] ${providerId}: ${why} - resting the pool for ${rested}m; the fallback answers until then`);
@@ -1770,6 +1902,20 @@ function restFreePool(providerId, why) {
 // is (which is the ladder below, and it is right for a limit that moving clears).
 const FREE_DAY_HORIZON_MS = 30 * 60_000;
 const FREE_DAY_HORIZON_MAX_MS = 36 * 60 * 60_000;
+
+/**
+ * The horizon actually in force. `freeDayHorizonMinutes` overrides the measured
+ * default; **0 means never park** - every limit is treated as exit/identity-scale
+ * and runs the ladder (rotate the exit, mint an identity, walk the pool). That is
+ * the operator's setting when they would rather keep moving than wait: the ladder
+ * is still the thing that clears a limit while the day has allowance, and a spent
+ * day simply keeps answering 429 with the upstream's own clock in `retry-after`.
+ */
+function freeDayHorizonMs() {
+  const raw = config.freeDayHorizonMinutes;
+  if (raw === undefined || raw === null || raw === '') return FREE_DAY_HORIZON_MS;
+  return Math.max(0, Number(raw) || 0) * 60_000;
+}
 
 /**
  * Park the free tier until the reset instant the upstream itself named.
@@ -1922,9 +2068,9 @@ function ensureManagedAccount(provider) {
     if (!acc) {
       acc = provider.accounts[lane] = newManagedAccount(provider, lane);
       const as = accountState(provider.id, acc.id);
-      // Spread the builds over the lanes: two lanes presenting the same client
-      // version look more like one client than like two installs.
-      as.uaIndex = lane % OPENCODE_FREE_UAS.length;
+      // Pinned to the newest build, shared by every lane: the build is not part of
+      // the rotating identity (see OPENCODE_FREE_UAS).
+      as.uaIndex = OPENCODE_FREE_UA_INDEX;
       as.sessionId = '';
       as.refreshing = false;
       openCodeSession(provider, acc);
@@ -1952,8 +2098,8 @@ function ensureManagedAccount(provider) {
  * Reinstall the client: drop a spent identity and mint a replacement that
  * presents a *completely* different client, not just a new token.
  *
- * What changes: account id and name, session id, `x-opencode-project` handle and
- * the client version (`user-agent`), plus the previous cooldown and (when the
+ * What changes: account id and name, session id and `x-opencode-project` handle,
+ * plus the previous cooldown and (when the
  * provider opted into the pool) the exit IP. A quota that is accounted per
  * session/instance is cleared by this; a quota accounted upstream against the
  * whole free pool is not - measured against the live service, a freshly minted
@@ -1964,11 +2110,10 @@ function ensureManagedAccount(provider) {
  */
 function reinstallManagedClient(provider, oldAccount, reason, { rotateExit = false } = {}) {
   const as = accountState(provider.id, oldAccount.id);
-  const prevUa = Number(as.uaIndex || 0);
-  // In place: the account row, its id and its lane stay, only the identity that
-  // upstream sees is replaced. Replacing the row instead would leave the lane
-  // without a state record and lose its exit pin.
-  as.uaIndex = (prevUa + 1) % OPENCODE_FREE_UAS.length;
+  // The build stays on the newest one. A limit is answered with a new session, a
+  // new project handle and (when the provider opted into the pool) a new exit IP -
+  // never by stepping the client version down.
+  as.uaIndex = OPENCODE_FREE_UA_INDEX;
   as.lastRenewAt = Date.now();
   as.reinstalledAt = Date.now();
   as.reinstallReason = String(reason || '').slice(0, 120);
@@ -2065,6 +2210,14 @@ function allLanesRenewGapMs() {
  */
 function queueAllLaneRefreshes(provider, reason) {
   if (!isManagedProvider(provider)) return { swept: false, queued: 0 };
+  // Concurrent requests own the lanes. Sweeping would park four identities out
+  // from under them and hand this request the very wait it is trying to avoid, so
+  // the sweep stands down and every request mints its own identity as it needs one
+  // (lendIdentity / rebuildLaneNow). One request alone still sweeps as before.
+  if (freeDemandConcurrent(provider.id)) {
+    console.warn(`[proxy] ${provider.id}: all-lane sweep stood down - ${freeDemandOf(provider.id)} requests are in the ladder, each minting its own identity (${reason})`);
+    return { swept: false, queued: 0 };
+  }
   // Per provider, not global: one provider sitting on a dry ceiling must not
   // suppress another provider's sweep. Kept in the provider's runtime state so it
   // survives a restart instead of granting a free sweep on every boot.
@@ -2115,6 +2268,70 @@ async function waitForLane(provider, ms) {
     await new Promise((r) => setTimeout(r, 250));
   }
   return (provider.accounts || []).some((a) => laneReady(provider, a));
+}
+
+/**
+ * Rebuild a lane on the caller's own thread, keeping it in service.
+ *
+ * The same work as `queueLaneRefresh` - burn the exit that answered the limit,
+ * drop its pin, mint a new identity, pin another exit - minus the park. The
+ * background version is right when nobody else wants the lane, and wrong when
+ * several requests do: the 30s park is exactly what makes the second request wait
+ * 12s and then collect the same 429. Every step here is local state, so this
+ * returns in microseconds and the lane is usable the moment it does.
+ */
+function rebuildLaneNow(provider, account, reason) {
+  const laneKey = laneKeyOf(account);
+  const as = accountState(provider.id, account.id);
+  try {
+    if (provider.proxy === 'rotate' && proxies) {
+      const burned = proxies.state.lanes[provider.id] ? proxies.state.lanes[provider.id][laneKey] : '';
+      if (burned) proxies.noteResult(burned, false, { burn: true });
+      proxies.releaseLane(provider.id, laneKey);
+    }
+    reinstallManagedClient(provider, account, reason);
+    if (provider.proxy === 'rotate' && proxies) proxies.pickLane(provider, laneKey);
+    as.refreshing = false;
+    as.limitedUntil = 0;
+    pushEvent({ kind: 'lane-rebuilt', pid: provider.id, aid: account.id, lane: account.lane, reason });
+    console.warn(`[proxy] ${provider.id}#${laneKey}: lane rebuilt in place (${reason}); it stays in service for the other requests`);
+    return true;
+  } catch (err) {
+    as.refreshing = false;
+    as.limitedUntil = now() + LANE_REFRESH_COOLDOWN_MS;
+    console.warn(`[proxy] ${provider.id}#${laneKey}: in-place rebuild failed: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Mint an identity for a request that found every lane spent or parked.
+ *
+ * Picks the lane that would otherwise wait longest (the one parked furthest into
+ * the future, then the one idle longest), rebuilds it in place and hands it back.
+ * A lane already under a background rebuild is skipped - it is getting a new
+ * identity anyway - and `tried` keeps one request from lending itself the same
+ * lane twice.
+ */
+function lendIdentity(provider, tried) {
+  const lanes = (provider.accounts || []).filter((a) => a.enabled !== false);
+  const eligible = lanes.filter((a) => {
+    if (tried && tried.has(a.id)) return false;
+    return !accountState(provider.id, a.id).refreshing;
+  });
+  if (!eligible.length) return null;
+  eligible.sort((x, y) => {
+    const ax = accountState(provider.id, x.id);
+    const ay = accountState(provider.id, y.id);
+    return (Number(ay.limitedUntil) || 0) - (Number(ax.limitedUntil) || 0)
+      || (Number(ax.lastUsed) || 0) - (Number(ay.lastUsed) || 0);
+  });
+  const lane = eligible[0];
+  const demand = freeDemandOf(provider.id);
+  pushEvent({ kind: 'identity-lent', pid: provider.id, aid: lane.id, lane: lane.lane, demand });
+  console.warn(`[proxy] ${provider.id}#${laneKeyOf(lane)}: every lane is spent while ${demand} requests are in the ladder - minting this lane's identity now instead of waiting for a rebuild`);
+  rebuildLaneNow(provider, lane, `identity on demand (${demand} requests in the ladder)`);
+  return lane;
 }
 
 // The historical name: the request path, the admin API and the tests use it.
@@ -2247,7 +2464,7 @@ async function relayFallbackChain(provider, body, res, hops) {
         continue;
       }
       live += 1;
-      failures.push({ provider: hop.provider, model: hop.model, status: out.status || 0, kind: out.reason, message: String(out.message || '').slice(0, 180) });
+      failures.push({ provider: hop.provider, model: hop.model, status: out.status || 0, kind: out.reason, message: String(out.message || '').slice(0, 180), retryMs: Number(out.retryMs) || 0 });
       // The shortest window any hop offered is the one worth waiting: a hop that
       // quoted nothing gets the floor, so one silent hop cannot stretch the round.
       const quoted = Number(out.retryMs) > 0 ? Number(out.retryMs) : 0;
@@ -2351,12 +2568,28 @@ async function handleProxy(req, res, url) {
     translate: isChat && style !== 'openai' && style !== 'opencode-free' && style !== 'freebuff',
   };
   // Free tier: first attempt from the host's own IP, then the pool (see above).
+  // The request is counted into the provider's ladder demand here, because
+  // everything below reads it: two requests in the ladder need two identities, and
+  // the all-lane sweep must stand down instead of parking the lane the other one
+  // is using (see "Identity burst" above).
+  let freeDemandHeld = false;
+  let releaseFreeDemand = () => {};
   if (style === 'opencode-free') {
     ctx.forceDirect = true;
+    noteFreeDemand(provider.id, 1);
+    freeDemandHeld = true;
+    releaseFreeDemand = () => {
+      if (!freeDemandHeld) return;
+      freeDemandHeld = false;
+      noteFreeDemand(provider.id, -1);
+    };
+    // Backstop: a client that hangs up mid-ladder must not leave the count high.
+    res.on('close', releaseFreeDemand);
     // Every lane is spent or rebuilding already: this request is here to learn
     // the same limit again, so cap the ladder short. `contextMs` is added back
-    // because a big prompt still needs its own head start.
-    if ((provider.accounts || []).every((a) => !laneReady(provider, a))) {
+    // because a big prompt still needs its own head start. A concurrent request is
+    // the exception: it can mint a lane of its own, so its long ladder is real.
+    if ((provider.accounts || []).every((a) => !laneReady(provider, a)) && !freeDemandConcurrent(provider.id)) {
       freeLimitDeadline = t0 + freeProviderDryBudgetMs() + contextMs;
     }
   }
@@ -2394,7 +2627,16 @@ async function handleProxy(req, res, url) {
       ? Math.max((provider.accounts || []).length + 4, 8)
       : Math.max(1, (provider.accounts || []).length));
   let sawLimit = false;
+  // The longest window any upstream quoted during this request, carried to the
+  // final answer. A lane-scale 429 (`retry-after: 2`) used to end up as a bare
+  // 429 with no header, and every SDK that honours `retry-after` - the openai
+  // client, the opencode CLI, fetch-retry - then re-asks within milliseconds and
+  // burns the ladder it was supposed to wait out.
+  let lastUpstreamRetryMs = 0;
   let laneWaitDone = false;
+  // Identities this request minted for lanes that were all parked (see "Identity
+  // burst" above). Capped, so one request cannot mint a storm on its own.
+  let burstMints = 0;
   // Set the moment a day-scale quota answer parks the tier. It ends the whole
   // provider attempt loop, not just this lane's: every remaining lane shares the
   // same daily bucket, so attempt 2 would only spend another exit-free 429 and,
@@ -2426,6 +2668,11 @@ async function handleProxy(req, res, url) {
   // what makes the request start working the moment the allowance returns.
   const freeCeilingDry = style === 'opencode-free' && freeDry.until > now() && fallbackHops.length > 0;
   if (freeCeilingDry) {
+    // A known-dry day is a limit, not a missing account: if the fallback hops cannot
+    // answer either, the client is told when the tier is back (429 +
+    // retryAfterSeconds) instead of being handed a 503 that reads like a broken
+    // configuration. In exclusive mode that 429 is the answer.
+    sawLimit = true;
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - skipping the ladder, answering from the fallback`);
   } else if (style === 'opencode-free' && freeDry.until > now()) {
     console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - trying it anyway, there is no fallback provider to hand the request to`);
@@ -2442,14 +2689,25 @@ async function handleProxy(req, res, url) {
   for (let attempt = 1; !freeCeilingDry && !dayCeiling && attempt <= maxAttempts; attempt += 1) {
     let account = selectAccount(provider, tried);
     if (!account && style === 'opencode-free' && !laneWaitDone && now() < freeLimitDeadline) {
-      // Every lane is spent or rebuilding. Rather than failing the caller, wait a
-      // moment for the fastest rebuild - that is still far shorter than the
-      // upstream's own retry window, and the lanes are being rebuilt in parallel.
       laneWaitDone = true;
-      const budget = Math.min(LANE_WAIT_MS, Math.max(0, freeLimitDeadline - now()));
-      if (await waitForLane(provider, budget)) {
-        tried.clear();
-        account = selectAccount(provider, tried);
+      // Concurrent request: mint the identity it needs on the lane that has waited
+      // longest, rather than queue behind a rebuild it is not the only customer of.
+      if (freeDemandConcurrent(provider.id) && burstMints < LANE_BURST_MINT_MAX) {
+        const lent = lendIdentity(provider, tried);
+        if (lent) {
+          burstMints += 1;
+          account = lent;
+        }
+      }
+      if (!account) {
+        // Every lane is spent or rebuilding. Rather than failing the caller, wait a
+        // moment for the fastest rebuild - that is still far shorter than the
+        // upstream's own retry window, and the lanes are being rebuilt in parallel.
+        const budget = Math.min(LANE_WAIT_MS, Math.max(0, freeLimitDeadline - now()));
+        if (await waitForLane(provider, budget)) {
+          tried.clear();
+          account = selectAccount(provider, tried);
+        }
       }
     }
     if (!account) break;
@@ -2562,6 +2820,7 @@ async function handleProxy(req, res, url) {
         // saying "mode required" is not a rate limit, and a 60s retry-after
         // must not cost 12 hours.
         const retryMs = retryAfterMs(upstream.headers);
+        if (retryMs > lastUpstreamRetryMs) lastUpstreamRetryMs = retryMs;
         const snippet = await peekError(upstream);
         const kind = classifyFailure(upstream.status, snippet);
         lastFailure = { status: upstream.status, kind, message: snippet };
@@ -2625,9 +2884,20 @@ async function handleProxy(req, res, url) {
           // one cheap 429 (no exit burned, no identity minted, no rebuild queued),
           // which is what an exclusive deployment (no hop to hand over to) wants
           // too: it is retried on the next request instead of being probed.
-          if (retryMs >= FREE_DAY_HORIZON_MS) {
+          // `freeDayHorizonMinutes: 0` switches the park off entirely: the answer is
+          // then treated as exit/identity-scale like any other limit and the ladder
+          // below runs, which is what an operator asks for when they would rather
+          // keep rotating than wait out the upstream's clock.
+          const dayHorizonMs = freeDayHorizonMs();
+          if (dayHorizonMs > 0 && retryMs >= dayHorizonMs) {
             parkFreeTier(provider.id, retryMs, snippet);
-            markLimited(provider, account, upstream.status, { ms: retryMs, message: snippet });
+            // Every lane of the provider shares the one bucket, so every lane is
+            // spent - and marking them is also what puts the reset instant on the
+            // *first* answer a client gets, instead of making each lane learn it
+            // with an attempt of its own.
+            for (const lane of provider.accounts || []) {
+              markLimited(provider, lane, upstream.status, { ms: retryMs, message: snippet });
+            }
             dayCeiling = true;
             break;
           }
@@ -2772,6 +3042,42 @@ async function handleProxy(req, res, url) {
               continue;
             }
           }
+          // Concurrent requests: this lane is spent for *this* one, but parking it
+          // (and sweeping the rest) would take the lanes the other requests are
+          // using and hand them the same 12s wait. Rebuild it in place instead -
+          // new identity, new exit - and leave it in service; the outer loop hands
+          // this request to the next lane meanwhile.
+          // A lane that is the last one any request could use must never be parked.
+          // With no spare, parking it turns a rate limit into `router_no_healthy_account`
+          // for the whole park window - the router refusing on its own account, not
+          // the upstream's, which is exactly the "rate-limited and cooling down"
+          // the operator saw with `identityPool: 1`. Same reasoning as the
+          // concurrent case: the lanes in flight belong to other requests and a
+          // sweep would take them away. Either way, rebuild in place, stay in
+          // service, and hand this request over.
+          const readyLanes = (provider.accounts || []).filter((a) => laneReady(provider, a));
+          const soleLane = readyLanes.length <= 1;
+          if (freeDemandConcurrent(provider.id) || soleLane) {
+            const beside = freeDemandOf(provider.id) - 1;
+            if (soleLane || renewals < LANE_BURST_MINT_MAX) {
+              renewals += 1;
+              rebuildLaneNow(provider, account, soleLane
+                ? `HTTP ${upstream.status} - last ready lane, rebuilt in place so the provider stays answerable`
+                : `HTTP ${upstream.status} - spent beside ${beside} concurrent request(s)`);
+            } else {
+              // Two fresh identities did not clear it either: rest the lane for a
+              // second rather than offer it to the next request as if it were new.
+              const tired = accountState(provider.id, account.id);
+              tired.limitedUntil = now() + 1_000;
+              persistState();
+            }
+            console.warn(`[proxy] ${provider.id}#${laneKey}/${account.name} -> ${upstream.status} [quota] ${soleLane ? 'last ready lane' : `spent beside ${beside} concurrent request(s)`}; rebuilt in place, no park and no sweep; handing over`);
+            ctx.model = requestedModel;
+            triedModels.clear();
+            triedModels.add(requestedModel);
+            modelsThisIp = 0;
+            break;
+          }
           // This lane is spent: park it, rebuild it off the request path, and let
           // the outer loop hand the request to the next lane instead of waiting.
           markLimited(provider, account, upstream.status, { ms: LANE_REFRESH_COOLDOWN_MS, message: snippet });
@@ -2865,10 +3171,17 @@ async function handleProxy(req, res, url) {
       break;
     }
 
-    if (relayed) return;
+    if (relayed) {
+      // The ladder is over for this request, so it stops counting towards demand:
+      // the response may stream for minutes, and a stream is not a request that
+      // needs an identity.
+      releaseFreeDemand();
+      return;
+    }
     if (rotations) pushEvent({ kind: 'rotated', pid: provider.id, aid: account.id, n: rotations });
     void lastExitId;
   }
+  releaseFreeDemand();
 
   // Configured cross-provider fallback, tried only when nothing on this provider
   // could answer (every model out of allowance or every account cooling). Empty
@@ -2895,7 +3208,22 @@ async function handleProxy(req, res, url) {
     // story decide (429 after a limit, 503 otherwise).
     const lastHopStatus = fallbackFailures.length ? Number(fallbackFailures[fallbackFailures.length - 1].status) : 0;
     const lastHopLimited = lastHopStatus === 429 || lastHopStatus === 402 || lastHopStatus === 403;
-    sendJson(res, lastHopLimited ? 429 : (status || (sawLimit ? 429 : 503)), { error });
+    const answerStatus = lastHopLimited ? 429 : (status || (sawLimit ? 429 : 503));
+    // A 429 with no Retry-After is an invitation to hot-loop. The body already
+    // carries retryAfterSeconds, but every SDK that honours the header (the
+    // openai client, the opencode CLI, fetch-retry) looks only at the header, so
+    // the answer is also stamped with it. For the free-day ceiling this is the
+    // ~16h clock to 00:00 UTC: the client sleeps once instead of retrying in a
+    // storm. Never advertise 0 -- that reads as "retry now".
+    const dryUntil = provider && (PROVIDER_TYPES[provider.type] || {}).style === 'opencode-free' && freeDry.until > now() ? freeDry.until : 0;
+    const hopRetryMs = fallbackFailures.length ? Number(fallbackFailures[fallbackFailures.length - 1].retryMs) || 0 : 0;
+    const waitSecs = Math.max(
+      Number(error.retryAfterSeconds) || 0,
+      dryUntil ? Math.round((dryUntil - now()) / 1000) : 0,
+      lastUpstreamRetryMs ? Math.ceil(lastUpstreamRetryMs / 1000) : 0,
+      hopRetryMs ? Math.ceil(hopRetryMs / 1000) : 0,
+    );
+    sendJson(res, answerStatus, { error }, waitSecs > 0 ? { 'retry-after': String(Math.max(1, waitSecs)) } : null);
   }
 }
 
@@ -2940,6 +3268,15 @@ function snapshot() {
     // Floor between all-lane identity sweeps (minutes); 0 means every limit. Each
     // provider reports its own last sweep as `allLanesSweptAt`.
     allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000,
+    // Identity burst: while several requests are in the ladder, each mints its own
+    // identity instead of queueing behind a parked lane (see LANE_BURST_MINT_MAX).
+    identityBurst: identityBurstEnabled(),
+    // What counts as a spent *day* rather than a spent exit/identity (minutes), and
+    // how long the pool rests after a dry ladder (0 = never). Both are the numbers
+    // the router is actually using, so the settings dialog labels its inputs with
+    // them instead of a stale default.
+    freeDayHorizonMinutes: freeDayHorizonMs() / 60_000,
+    freePoolRestMinutes: poolRestMs() === null ? 0 : Math.round(poolRestMs() / 60_000),
     // How long the last resort retries before the caller is told it could not be
     // served. 30s unless `fallbackRetrySeconds` says otherwise.
     fallbackRetryMs: fallbackRetryDeadlineMs(),
@@ -3013,13 +3350,20 @@ const OPENCODE_FREE_FALLBACK_MODELS = [
   'nemotron-3.5-super-vl-free',
 ];
 // Client versions that pass the free tier's attestation gate (measured: each
-// answers a quota error rather than a 403 "only from within OpenCode"). A
-// reinstalled identity steps to the next one.
+// answers a quota error rather than a 403 "only from within OpenCode").
+//
+// The build is NOT part of the rotating identity. An old build is what the gate's
+// own floor rejects (HTTP 426) and a newer one never changed a quota answer, so
+// every identity presents the newest entry in this list. What rotates on a limit
+// is the session, the project handle and the exit IP - never the build.
 const OPENCODE_FREE_UAS = [
   'opencode/latest/2.0.26/cli',
   'opencode/latest/2.0.31/cli',
   'opencode/latest/2.1.0/cli',
 ];
+
+/** The build every identity presents. Append a newer validated build above. */
+const OPENCODE_FREE_UA_INDEX = OPENCODE_FREE_UAS.length - 1;
 const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
@@ -3051,10 +3395,11 @@ function openCodeProject(provider, account) {
   return accountState(provider.id, account.id).projectId || 'global';
 }
 
-/** The client version this identity presents; a rebuilt identity steps to the next. */
+/** The client version this identity presents: the newest validated build, always.
+ *  The build does not rotate - a limit is answered with a new session, a new
+ *  project handle and a new exit IP, never by stepping the client backwards. */
 function openCodeUA(provider, account) {
-  const i = Number(accountState(provider.id, account.id).uaIndex || 0);
-  return OPENCODE_FREE_UAS[i % OPENCODE_FREE_UAS.length];
+  return OPENCODE_FREE_UAS[OPENCODE_FREE_UA_INDEX];
 }
 
 /** "model (high)" -> "model": the upstream knows only the base id. */
@@ -3740,8 +4085,21 @@ async function handleAdmin(req, res, url) {
       const sweepMinutes = Number(body.allLanesRenewGapMinutes);
       if (Number.isFinite(sweepMinutes) && sweepMinutes >= 0) config.allLanesRenewGapMinutes = Math.min(1440, sweepMinutes);
     }
+    if (body.identityBurst != null) config.identityBurst = !!body.identityBurst;
+    // What counts as a spent *day* rather than a spent exit/identity. 0 is a real
+    // setting ("never park - always run the ladder"), so it is stored, not dropped.
+    if (body.freeDayHorizonMinutes != null && body.freeDayHorizonMinutes !== '') {
+      const horizonMinutes = Number(body.freeDayHorizonMinutes);
+      if (Number.isFinite(horizonMinutes) && horizonMinutes >= 0) config.freeDayHorizonMinutes = Math.min(1440, horizonMinutes);
+    }
+    // Pool rest after a ceiling the ladder could not clear. 0 is a real setting
+    // ("never rest - the next request tries again"), positive pins a fixed window.
+    if (body.freePoolRestMinutes != null && body.freePoolRestMinutes !== '') {
+      const restMinutes = Number(body.freePoolRestMinutes);
+      if (Number.isFinite(restMinutes) && restMinutes >= 0) config.freePoolRestMinutes = Math.min(1440, restMinutes);
+    }
     await saveConfig();
-    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25, allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
+    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25, allLanesRenewGapMinutes: allLanesRenewGapMs() / 60_000, identityBurst: identityBurstEnabled(), freeDayHorizonMinutes: freeDayHorizonMs() / 60_000, freePoolRestMinutes: poolRestMs() === null ? 0 : Math.round(poolRestMs() / 60_000), hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
   }
 
   return sendJson(res, 404, { error: { message: `unknown admin route ${method} ${url.pathname}`, type: 'not_found' } });

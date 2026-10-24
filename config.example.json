@@ -18,6 +18,7 @@
   ],
   "freeLadderBudgetSeconds": 25,
   "allLanesRenewGapMinutes": 1,
+  "identityBurst": true,
   "cors": true,
   "logging": {
     "requests": false
