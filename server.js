@@ -2429,8 +2429,29 @@ function recycleLane(provider, account, reason) {
   return { account: fresh, lane: Number(lane), burnedExit: burned, exit: next ? (next.exitIp || next.id || '') : '' };
 }
 
-/** One signed request to the provider, so a recycle can report what the edge said. */
-async function probeProviderOnce(provider, account, model = 'deepseek-v4.1-flash-free') {
+/**
+ * Recycle every lane the operator asked for, then ask the edge once.
+ * Shared by `/admin/api/provider/<id>/recycle` and the pool-prefixed alias
+ * `/admin/api/proxies/provider/<id>/recycle`, so either guess works.
+ */
+async function handleRecycle(req, res, provider) {
+  if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+  const payload = await readJsonBody(req).catch(() => ({}));
+  const enabled = (provider.accounts || []).filter((a) => a.enabled !== false);
+  const targets = payload.allLanes ? enabled : enabled.slice(0, 1);
+  if (!targets.length) return sendJson(res, 409, { error: { message: `provider "${provider.id}" has no enabled identity to recycle`, type: 'no_accounts' } });
+  const done = targets.map((acc) => {
+    const r = recycleLane(provider, acc, `manual recycle (${payload.reason || 'dashboard'})`);
+    return { lane: r.lane, account: r.account.name, burnedExit: r.burnedExit, exit: r.exit };
+  });
+  await saveConfig();
+  const probe = payload.probe === false ? null : await probeProviderOnce(provider, targets[0]);
+  if (probe && probe.status === 200) clearFreeDry(provider.id);
+  console.warn(`[proxy] ${provider.id}: recycled ${done.length} lane(s) - new IP + new identity; edge said ${probe ? `${probe.status}${probe.retryAfterSeconds ? ` retry-after ${probe.retryAfterSeconds}s` : ''}` : '(not probed)'}`);
+  return sendJson(res, 200, { ok: true, recycled: done, probe });
+}
+
+/** One signed request to the provider, so a recycle can report what the edge said. */async function probeProviderOnce(provider, account, model = 'deepseek-v4.1-flash-free') {
   let built;
   try {
     built = buildUpstream(provider, account, {
@@ -3993,6 +4014,12 @@ async function handleAdmin(req, res, url) {
     return sendJson(res, 200, { ok: true, provider: providerSummary(provider) });
   }
 
+  // Alias for the same action on the unprefixed path (the pool-prefixed one lives
+  // with the other pool routes), so either URL the operator guesses works.
+  if (method === 'POST' && a === 'provider' && b && c === 'recycle') {
+    return handleRecycle(req, res, findProvider(b));
+  }
+
   // ---- sign-in: add a principal (its own daily allowance) ------------------
   // The anonymous free tier is one shared bucket that no address, identity, build,
   // session, project, model or path moves. A signed-in principal is a different
@@ -4186,22 +4213,7 @@ async function handleAdmin(req, res, url) {
     // Their own recipe as one call: drop the client, move the IP, install a new
     // identity - and say what the edge answered, so the result is never a guess.
     if (method === 'POST' && b === 'provider' && c && d === 'recycle') {
-      const provider = findProvider(c);
-      if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
-      const payload = await readJsonBody(req).catch(() => ({}));
-      const targets = payload.allLanes
-        ? (provider.accounts || []).filter((a) => a.enabled !== false)
-        : [(provider.accounts || []).find((a) => a.enabled !== false)].filter(Boolean);
-      if (!targets.length) return sendJson(res, 409, { error: { message: `provider "${provider.id}" has no enabled identity to recycle`, type: 'no_accounts' } });
-      const done = targets.map((acc) => {
-        const r = recycleLane(provider, acc, `manual recycle (${payload.reason || 'dashboard'})`);
-        return { lane: r.lane, account: r.account.name, burnedExit: r.burnedExit, exit: r.exit };
-      });
-      await saveConfig();
-      const probe = payload.probe === false ? null : await probeProviderOnce(provider, targets[0]);
-      if (probe && probe.status === 200) clearFreeDry(provider.id);
-      console.warn(`[proxy] ${provider.id}: recycled ${done.length} lane(s) - new IP + new identity; edge said ${probe ? `${probe.status}${probe.retryAfterSeconds ? ` retry-after ${probe.retryAfterSeconds}s` : ''}` : '(not probed)'}`);
-      return sendJson(res, 200, { ok: true, recycled: done, probe });
+      return handleRecycle(req, res, findProvider(c));
     }
 
     if (method === 'POST' && b === 'provider' && c && d === 'rotate-exit') {

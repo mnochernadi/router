@@ -1613,7 +1613,7 @@ function app() {
     // a new identity - then report what the edge answered, so the result is a fact.
     async recycleLanes(p) {
       try {
-        const r = await this.api('/provider/' + encodeURIComponent(p.id) + '/recycle', { method: 'POST', body: { allLanes: true, reason: 'dashboard' } });
+        const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/recycle', { method: 'POST', body: { allLanes: true, reason: 'dashboard' } });
         const pr = r.probe || {};
         const verdict = pr.status === 200
           ? `the edge answered 200 on ${pr.model || 'the requested model'}`
