@@ -319,6 +319,13 @@ function normalizeConfig(cfg) {
   out.adminCors = out.adminCors === true;
   out.respectRetryAfter = out.respectRetryAfter !== false;
   out.errorCooldownMinutes = Number(out.errorCooldownMinutes) > 0 ? Number(out.errorCooldownMinutes) : 5;
+  // Operator dial on the free-tier ladder, in seconds (see freeProviderBudgetMs()).
+  // Absent, 0 or nonsense keeps the built-in 25s cold / 20s dry pair; anything else
+  // is clamped to 3..120s so a fat-fingered value cannot disable the ladder outright
+  // or hold a caller for ten minutes.
+  const ladderSeconds = clampLadderSeconds(out.freeLadderBudgetSeconds);
+  if (ladderSeconds) out.freeLadderBudgetSeconds = ladderSeconds;
+  else delete out.freeLadderBudgetSeconds;
   out.providers = Array.isArray(out.providers) ? out.providers.map(normalizeProvider) : [];
   if (process.env.ADMIN_KEY) out.adminKey = process.env.ADMIN_KEY;
   return out;
@@ -1628,12 +1635,25 @@ const EXIT_BODY_STALL_MS = 20_000;
 // provider. The provider ladder stops earlier than the response deadline so the
 // fallback hop still has time to answer inside the minute the caller was promised.
 const FREE_LIMIT_BUDGET_MS = 60_000;
-const FREE_PROVIDER_BUDGET_MS = 25_000;
+// `freeLadderBudgetSeconds` is the operator's dial on the cold-request ladder: 25s
+// is right while the free tier still answers, but when the upstream allowance is
+// spent the same 25s is spent proving it on every cold request. Deployments sitting
+// on a dry ceiling set it to 6-8s and the fallback provider answers instead.
+//
+// Read per request, never captured in a module-level constant: at this point in the
+// file `config` is still the compiled-in default (loadConfigSync() runs at the
+// bottom), so a frozen value would silently ignore the operator's dial and keep
+// spending the old 25s.
+function freeProviderBudgetMs() {
+  return clampBudgetMs(config.freeLadderBudgetSeconds, 25_000);
+}
 // Same ladder, shorter leash, for a provider whose lanes are *already* all spent
 // or rebuilding when the request arrives: the rungs left are a formality (the
 // ceiling is upstream, not local), and the caller should reach the fallback in
 // about the time a cold answer takes instead of riding out the full budget.
-const FREE_PROVIDER_DRY_BUDGET_MS = 20_000;
+function freeProviderDryBudgetMs() {
+  return clampBudgetMs(config.freeLadderBudgetSeconds, 20_000, 0.8);
+}
 // How long the pool is left alone once two lanes have produced the same free-tier
 // quota answer: the ceiling is on the upstream account, so rotating exits and
 // minting identities only burns addresses that the next real request needs.
@@ -1657,6 +1677,37 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
 const PROMPT_BUDGET_PER_KB_MS = 25;
 const PROMPT_BUDGET_FREE_KB = 8;
 const PROMPT_BUDGET_MAX_MS = 75_000;
+// How much of that allowance the *ladder* may spend. A quota answer is fast, so the
+// ladder gets a small slice and the rest stays with the attempt that actually streams.
+const PROMPT_BUDGET_LADDER_MAX_MS = 15_000;
+
+/**
+ * The free-tier ladder budget, in milliseconds.
+ *
+ * `freeLadderBudgetSeconds` (config) is the operator's dial; `defaultMs` is the
+ * already-final value used when nothing is configured (25s cold, 20s dry - the 20s is
+ * 80% of the 25s, so the pair keeps the ratio the ladder was tuned for). `fraction`
+ * therefore applies only to a *configured* value, and the 3s floor keeps an
+ * aggressively short dial from switching the ladder off; the dry leash never drops
+ * below that floor either.
+ */
+function clampBudgetMs(seconds, defaultMs, fraction = 1) {
+  const raw = Number(seconds);
+  if (!Number.isFinite(raw) || raw <= 0) return Math.round(defaultMs);
+  return Math.max(3_000, Math.min(120_000, Math.round(raw * 1000 * fraction)));
+}
+
+/**
+ * `freeLadderBudgetSeconds` as it is stored: a positive number of seconds clamped to
+ * 3..120 (one decimal), or `undefined` when unset/invalid, which means "use the
+ * built-in 25s cold / 20s dry pair". Used by both the config loader and the admin
+ * settings route so a hand-edited config and a dashboard POST cannot disagree.
+ */
+function clampLadderSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.round(Math.max(3, Math.min(120, n)) * 10) / 10;
+}
 
 function contextWindowOf(provider) {
   const n = Number(provider && provider.contextWindow);
@@ -1886,6 +1937,44 @@ function providerFallbackHops(provider) {
     .filter((h) => h.provider && h.model && h.provider !== (provider && provider.id));
 }
 
+/**
+ * Look at the first SSE frame of a 200 response and report it when it is really an
+ * error, leaving the stream intact for the caller.
+ *
+ * Some OpenAI-compatible hops answer `200 text/event-stream` and then push
+ * `data: {"error":...}` - a big prompt is the usual trigger. Relaying that verbatim
+ * hands the client a stream that never produces a token, so the hop is skipped
+ * instead.
+ *
+ * The peek reads a *clone* of the body: a native Response exposes `body` as a
+ * getter-only accessor, so a consumed stream cannot be put back. Reading a tee'd
+ * clone leaves the response the caller will relay untouched, whatever Response
+ * implementation produced it.
+ */
+async function peekSseError(upstream) {
+  const type = String(upstream.headers.get('content-type') || '').toLowerCase();
+  if (!type.includes('event-stream') || !upstream.body || !upstream.body.getReader) return null;
+  let probe;
+  try { probe = upstream.clone(); } catch { return null; }
+  if (!probe.body || !probe.body.getReader) return null;
+  const reader = probe.body.getReader();
+  const buffered = [];
+  let seen = '';
+  try {
+    while (seen.length < 512) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered.push(value);
+      seen += Buffer.from(value).toString('utf8');
+      if (seen.includes('\n\n')) break;
+    }
+  } catch { /* fall through with whatever arrived */ }
+  try { await reader.cancel().catch(() => {}); } catch { /* noop */ }
+  const m = seen.match(/"error"\s*:\s*\{[^}]*"message"\s*:\s*"([^"]*)"/);
+  const message = m ? m[1] : (/"error"\s*:/.test(seen) && !/"choices"\s*:/.test(seen) ? 'error frame' : null);
+  return { message };
+}
+
 async function relayViaFallback(hop, body, res) {
   const fb = findProvider(hop.provider);
   if (!fb) return false;
@@ -1910,6 +1999,16 @@ async function relayViaFallback(hop, body, res) {
       try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
       return false;
     }
+    // A big body is where a hop is most likely to answer 200 with an SSE error frame
+    // instead of a completion (measured on pollinations: `usage_missing`). Peek the
+    // first frame before committing the client to this hop.
+    const peek = await peekSseError(call.upstream);
+    if (peek && peek.message) {
+      console.warn(`[proxy] ${fb.id}: fallback hop ${hop.model} answered an error frame (${peek.message.slice(0, 80)}); trying the next hop`);
+      try { if (call.upstream.body && call.upstream.body.cancel) await call.upstream.body.cancel(); } catch { /* noop */ }
+      try { if (call.controller && call.controller.abort) call.controller.abort(); } catch { /* noop */ }
+      return false;
+    }
     ctx2.exitId = call.exit ? call.exit.id : 'direct';
     state.totals.providerFallbacks = (state.totals.providerFallbacks || 0) + 1;
     pushEvent({ kind: 'provider-fallback', pid: fb.id, to: hop.model });
@@ -1927,7 +2026,7 @@ async function handleProxy(req, res, url) {
   // Wall-clock ceiling for the free tier's limit ladder (rotate -> reinstall ->
   // model walk -> rotate -> session). Past it the request falls through to the
   // fallback provider instead of leaving the caller waiting.
-  let freeLimitDeadline = t0 + FREE_PROVIDER_BUDGET_MS;
+  let freeLimitDeadline = t0 + freeProviderBudgetMs();
   state.totals.requests += 1;
 
   if (config.proxyKeys.length) {
@@ -1949,7 +2048,10 @@ async function handleProxy(req, res, url) {
   // extended by the same amount so the ladder is not cut off mid-prefill.
   const promptBytes = Buffer.byteLength(JSON.stringify(body || ''));
   const contextMs = promptSizeBudget(promptBytes);
-  freeLimitDeadline += contextMs;
+  // `contextMs` is a *first-byte* allowance, not ladder time: a quota refusal comes
+  // back in ~300ms whatever the prompt weighs, so adding it to the ladder deadline
+  // made a 3MB agent turn sit for 95s before the fallback was even tried.
+  freeLimitDeadline += Math.min(contextMs, PROMPT_BUDGET_LADDER_MAX_MS);
 
   const { provider, model } = resolveProvider(body, req);
   if (!provider) {
@@ -2003,7 +2105,7 @@ async function handleProxy(req, res, url) {
     // the same limit again, so cap the ladder short. `contextMs` is added back
     // because a big prompt still needs its own head start.
     if ((provider.accounts || []).every((a) => !laneReady(provider, a))) {
-      freeLimitDeadline = t0 + FREE_PROVIDER_DRY_BUDGET_MS + contextMs;
+      freeLimitDeadline = t0 + freeProviderDryBudgetMs() + contextMs;
     }
   }
   if (style === 'freebuff') ctx.responseStyle = 'openai';
@@ -2041,8 +2143,16 @@ async function handleProxy(req, res, url) {
       : Math.max(1, (provider.accounts || []).length));
   let sawLimit = false;
   let laneWaitDone = false;
+  // The ceiling is upstream and account-wide, so while the pool is resting a fresh
+  // ladder only re-learns the same 429 and costs the caller its first byte - which
+  // is exactly what made a big prompt look like "the router is broken". Go straight
+  // to the configured fallback hops and leave the free tier alone until it recovers.
+  const freeCeilingDry = style === 'opencode-free' && freeDry.until > now();
+  if (freeCeilingDry) {
+    console.warn(`[proxy] ${provider.id}: free ceiling known dry (${Math.round((freeDry.until - now()) / 1000)}s left) - skipping the ladder, answering from the fallback`);
+  }
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = 1; !freeCeilingDry && attempt <= maxAttempts; attempt += 1) {
     let account = selectAccount(provider, tried);
     if (!account && style === 'opencode-free' && !laneWaitDone && now() < freeLimitDeadline) {
       // Every lane is spent or rebuilding. Rather than failing the caller, wait a
@@ -2101,9 +2211,14 @@ async function handleProxy(req, res, url) {
           // waiting out a stalled exit - but a large body still gets its prefill
           // allowance, halved on a retry because the exit, not the prompt, is on
           // trial there.
+          //
+          // The 6s floor is capped by the operator's own ladder budget: it exists so
+          // an attempt is not handed a token deadline, not to overrule
+          // `freeLadderBudgetSeconds`. Without the cap a 3s dial still spent 6s on
+          // every request, which is the exact cost the dial was added to remove.
           headMs: Math.min(
             (attempt === 1 ? EXIT_FIRST_BYTE_MS : EXIT_RETRY_FIRST_BYTE_MS) + (attempt === 1 ? contextMs : Math.round(contextMs / 2)),
-            Math.max(6_000, remaining),
+            Math.max(Math.min(6_000, freeProviderBudgetMs()), remaining),
           ),
           // Buffered answers also get an idle deadline on the body.
           bodyIdleMs: remaining,
@@ -2468,6 +2583,11 @@ function snapshot() {
     defaultProvider: config.defaultProvider,
     cooldownHours: clampHours(config.cooldownHours),
     cooldownStatuses: config.cooldownStatuses,
+    // Free-tier ladder dial (seconds); 25 is what an unset config behaves as, and
+    // the dry leash is always 80% of it - both shown so the dashboard can label the
+    // input with the numbers the router is actually using.
+    freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25,
+    freeLadderDryBudgetMs: freeProviderDryBudgetMs(),
     cors: !!config.cors,
     hasProxyKeys: config.proxyKeys.length > 0,
     memory: {
@@ -3219,8 +3339,15 @@ async function handleAdmin(req, res, url) {
     if (body.respectRetryAfter != null) config.respectRetryAfter = !!body.respectRetryAfter;
     if (body.errorCooldownMinutes != null) config.errorCooldownMinutes = Math.max(1, Number(body.errorCooldownMinutes) || 5);
     if (Array.isArray(body.cooldownStatuses) && body.cooldownStatuses.length) config.cooldownStatuses = body.cooldownStatuses.map(Number);
+    // Free-tier ladder dial. An empty box or 0 means "back to the default", which is
+    // why this deletes the key instead of storing a zero the loader would drop anyway.
+    if (body.freeLadderBudgetSeconds != null) {
+      const ladderSeconds = clampLadderSeconds(body.freeLadderBudgetSeconds);
+      if (ladderSeconds) config.freeLadderBudgetSeconds = ladderSeconds;
+      else delete config.freeLadderBudgetSeconds;
+    }
     await saveConfig();
-    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
+    return sendJson(res, 200, { ok: true, settings: { cooldownHours: config.cooldownHours, defaultProvider: config.defaultProvider, cors: config.cors, cooldownStatuses: config.cooldownStatuses, freeLadderBudgetSeconds: config.freeLadderBudgetSeconds ?? 25, hasProxyKeys: config.proxyKeys.length > 0, loggingRequests: !!(config.logging && config.logging.requests) } });
   }
 
   return sendJson(res, 404, { error: { message: `unknown admin route ${method} ${url.pathname}`, type: 'not_found' } });

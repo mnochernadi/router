@@ -15,6 +15,7 @@
     504
   ],
   "defaultProvider": "",
+  "freeLadderBudgetSeconds": 25,
   "cors": true,
   "proxyKeys": [],
   "providers": [

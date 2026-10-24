@@ -981,6 +981,11 @@
         <input class="input mono" type="number" min="0.05" step="0.5" x-model.number="sf.cooldownHours" />
       </div>
       <div>
+        <label class="fld">Free-tier ladder budget (seconds)</label>
+        <input class="input mono" type="number" min="3" max="120" step="1" x-model.number="sf.freeLadderBudgetSeconds" />
+        <p class="mt-1 text-[11px] text-slate-500" x-text="'Caps how long a request walks the free tier (rotate exit, mint identity, walk models, new session) before the fallback answers. Default 25, range 3-120; use 6-8 when the upstream allowance is spent. Dry-provider leash: ' + (Math.round((Number(sf.freeLadderBudgetSeconds) || 25) * 0.8 * 10) / 10) + ' s (80%).'"></p>
+      </div>
+      <div>
         <label class="fld">Default provider</label>
         <select class="input" x-model="sf.defaultProvider">
           <option value="">— auto (first healthy) —</option>
@@ -1141,7 +1146,7 @@ function app() {
 
     pf: { editing: false, id: '', name: '', type: 'openai', baseUrl: TYPES.openai.baseUrl, strategy: 'round-robin', cooldownHours: 12, timeoutMs: 30000, maxAttempts: 0, headersText: '', proxy: 'direct', rotateEveryMinutes: 0, error: '' },
     af: { editing: false, pid: '', providerName: '', aid: '', name: '', apiKey: '', maskedKey: '', enabled: true, bulk: '', error: '' },
-    sf: { cooldownHours: 12, defaultProvider: '', proxyKeysText: '', clearProxyKeys: false, cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
+    sf: { cooldownHours: 12, freeLadderBudgetSeconds: 25, defaultProvider: '', proxyKeysText: '', clearProxyKeys: false, cooldownStatusesText: '429,402,403', cors: true, loggingRequests: false, adminKey: '', error: '' },
     mf: { pid: '', loading: false, total: 0, models: [], source: '', error: '', filter: '' },
     cf: { title: '', body: '', run: null },
 
@@ -1688,6 +1693,7 @@ function app() {
     openSettings() {
       this.sf = {
         cooldownHours: this.s.cooldownHours || 12,
+        freeLadderBudgetSeconds: this.s.freeLadderBudgetSeconds ?? 25,
         defaultProvider: this.s.defaultProvider || '',
         proxyKeysText: '',
         clearProxyKeys: false,
@@ -1704,6 +1710,7 @@ function app() {
       this.sf.error = '';
       const body = {
         cooldownHours: this.sf.cooldownHours,
+        freeLadderBudgetSeconds: this.sf.freeLadderBudgetSeconds,
         defaultProvider: this.sf.defaultProvider,
         cors: this.sf.cors,
         loggingRequests: this.sf.loggingRequests,

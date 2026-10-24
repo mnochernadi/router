@@ -1471,6 +1471,121 @@ async function memOf() {
     check('scheduler: a skipped cycle still stamps lastRun', (pm.state.auto.lastRun || 0) > 0);
   }
 
+  // 31. the free-tier ladder's wall clock is an operator dial: top-level
+  //     `freeLadderBudgetSeconds` (3..120, default 25s) has to be read per
+  //     request. A regression that snapshots it once at module load - before
+  //     loadConfigSync() has run - silently keeps the compiled-in 25s, so every
+  //     cold request spends 25s proving a ceiling the operator already dialled
+  //     down. This router is given 3s against an upstream that accepts the
+  //     request and never answers: only the ladder's own deadline can end it
+  //     inside 9s, and the configured fallback must be the one that answers.
+  {
+    const ladderTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-ladder-'));
+    // An upstream that reads the body and never sends a first byte: the ladder
+    // has to give up on it by itself (a stall, not an HTTP error).
+    const hang = { hits: 0, sockets: new Set() };
+    const hangMock = http.createServer((req, res) => {
+      hang.hits += 1;
+      hang.sockets.add(res.socket);
+      req.on('data', () => {});
+      req.on('end', () => { /* accepted, deliberately never answered */ });
+    });
+    const portProbe = net.createServer();
+    let ladderChild = null;
+    try {
+      await new Promise((r) => hangMock.listen(0, '127.0.0.1', r));
+      const HANG_PORT = hangMock.address().port;
+      await new Promise((r) => portProbe.listen(0, '127.0.0.1', r));
+      const LADDER_PORT = portProbe.address().port;
+      await new Promise((r) => portProbe.close(() => r()));
+
+      const ladderCfg = {
+        adminKey: 'test-admin-key', host: '127.0.0.1', port: LADDER_PORT, cooldownHours: 12,
+        cooldownStatuses: [429, 402, 403], retryStatuses: [500, 502, 503, 504],
+        defaultProvider: 'ladder-free', cors: true, proxyKeys: [],
+        // 3s, not the 25s default: the dial is the only thing that may cut this
+        // ladder short. Two lanes, so a second rung exists that a dial-ignoring
+        // build would still be entitled to climb (and blow the client guard on).
+        freeLadderBudgetSeconds: 3,
+        providers: [
+          {
+            id: 'ladder-free', name: 'Hanging Free Tier', type: 'opencode-free',
+            baseUrl: `http://127.0.0.1:${HANG_PORT}/inference/v1`, strategy: 'round-robin',
+            timeoutMs: 60000, proxy: 'direct', identityPool: 2,
+            accounts: [{ id: 'ladder-1', name: 'hanging-lane', apiKey: '', enabled: true }],
+            fallbackProviders: [{ provider: 'ladder-fallback', model: 'fallback-model' }],
+          },
+          {
+            id: 'ladder-fallback', name: 'Ladder Fallback', type: 'custom',
+            baseUrl: `http://127.0.0.1:${MOCK_PORT}/v1`, strategy: 'sequential', timeoutMs: 10000,
+            accounts: [{ id: 'ladder-fb-1', name: 'fallback-ok', apiKey: 'key-ok', enabled: true }],
+          },
+        ],
+      };
+      const ladderConfig = path.join(ladderTmp, 'config.json');
+      fs.writeFileSync(ladderConfig, JSON.stringify(ladderCfg, null, 2));
+      ladderChild = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+        cwd: REPO,
+        env: { ...process.env, ROUTER_CONFIG: ladderConfig, ROUTER_STATE: path.join(ladderTmp, 'state.json'), PORT: String(LADDER_PORT), HOST: '127.0.0.1', FB_API_HOST: `http://127.0.0.1:${MOCK_PORT}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let ladderLog = '';
+      ladderChild.stdout.on('data', (d) => { ladderLog += d.toString(); });
+      ladderChild.stderr.on('data', (d) => { ladderLog += d.toString(); });
+      const ladderUrl = (p) => `http://127.0.0.1:${LADDER_PORT}${p}`;
+
+      let ladderUp = false;
+      for (let i = 0; i < 60; i++) {
+        try { const r = await fetch(ladderUrl('/health')); if (r.ok) { ladderUp = true; break; } } catch {}
+        await sleep(200);
+      }
+      check('free ladder budget: a second router boots with freeLadderBudgetSeconds=3', ladderUp, ladderLog.slice(-400));
+
+      if (ladderUp) {
+        // Its own guard: a snapshot regression makes this request wait out the
+        // 25s default, so fail in 12s instead of hanging the suite on it.
+        const guard = new AbortController();
+        const guardTimer = setTimeout(() => guard.abort(), 12000);
+        const t0 = Date.now();
+        let status = 0;
+        let providerHeader = '';
+        let text = '';
+        try {
+          const r = await fetch(ladderUrl('/v1/chat/completions'), {
+            method: 'POST', signal: guard.signal,
+            headers: { 'content-type': 'application/json', 'x-router-provider': 'ladder-free' },
+            body: JSON.stringify({ model: 'big-pickle', stream: false, messages: [{ role: 'user', content: 'ping' }] }),
+          });
+          status = r.status;
+          providerHeader = r.headers.get('x-router-provider') || '';
+          text = await r.text();
+        } catch (err) {
+          text = `no answer: ${err.message}`;
+        } finally {
+          clearTimeout(guardTimer);
+        }
+        const elapsed = Date.now() - t0;
+        let content = '';
+        try { content = JSON.parse(text).choices[0].message.content; } catch { /* reported below */ }
+        if (status !== 200 || elapsed >= 12000) console.log(`DIAG ladder: status=${status} elapsed=${elapsed}ms hits=${hang.hits} log=${ladderLog.slice(-600)}`);
+        // 3s of ladder + the fallback hop, far below the 25s default. The lower
+        // bound proves the request really spent the budget instead of failing fast.
+        check('free ladder budget: the dial is honoured per request - the 3s ladder answers well inside the 25s default',
+          elapsed < 9000 && elapsed >= 2500, `elapsed=${elapsed}ms status=${status} body=${text.slice(0, 160)}`);
+        check('free ladder budget: the shortened ladder hands the request to the configured fallback provider',
+          status === 200 && providerHeader === 'ladder-fallback' && content === 'pong',
+          `status=${status} provider=${providerHeader} elapsed=${elapsed}ms body=${text.slice(0, 160)}`);
+        check('free ladder budget: the hanging upstream was really attempted (the bound is a ladder deadline, not a fast local error)',
+          hang.hits >= 1, `hits=${hang.hits} elapsed=${elapsed}ms`);
+      }
+    } finally {
+      if (ladderChild) ladderChild.kill('SIGTERM');
+      for (const sock of hang.sockets) { try { sock.destroy(); } catch { /* already gone */ } }
+      await new Promise((r) => { hangMock.close(() => r()); setTimeout(r, 1000); });
+      fs.rmSync(ladderTmp, { recursive: true, force: true });
+    }
+  }
+
   console.log('\n==================== RESULTS ====================');
   console.log(results.join('\n'));
   console.log(`\n  ${pass} passed, ${fail} failed`);
