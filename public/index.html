@@ -895,6 +895,7 @@
       <button class="btn" @click="openModels(pd)"><i data-lucide="list" class="h-3.5 w-3.5"></i>Models</button>
       <button class="btn" x-show="pd && pd.managed" @click="renewIdentity(pd)" title="Reinstall the client now: new identity, session, project handle and client version, cooldown cleared"><i data-lucide="dna" class="h-3.5 w-3.5"></i>Reinstall client</button>
       <button class="btn btn-primary" x-show="pd && (pd.type === 'opencode-free' || pd.type === 'opencode')" @click="openSignin(pd)" title="Sign in to OpenCode Console: a signed-in account is its own daily allowance, not another anonymous identity"><i data-lucide="log-in" class="h-3.5 w-3.5"></i>Sign in</button>
+      <button class="btn" x-show="pd && pd.managed" @click="recycleLanes(pd)" title="Recycle: drop the client, move every lane to a fresh exit IP, install a new identity - then ask the edge what it says"><i data-lucide="recycle" class="h-3.5 w-3.5"></i>Recycle IP + client</button>
       <button class="btn" x-show="pd && !pd.managed" @click="openAccount(pd, null)"><i data-lucide="user-plus" class="h-3.5 w-3.5"></i>Add account</button>
       <button class="btn" @click="openProvider(pd)"><i data-lucide="settings" class="h-3.5 w-3.5"></i>Settings</button>
       <button class="btn btn-danger" @click="deleteProvider(pd)"><i data-lucide="trash-2" class="h-3.5 w-3.5"></i></button>
@@ -1608,6 +1609,22 @@ function app() {
     // Reinstall the client: a new identity that presents a different session,
     // project handle and client version, with any cooldown cleared. Every lane
     // is rebuilt - the free tier runs several so a spent one never blocks.
+    // The operator's own recipe in one call: drop the client, move the IP, install
+    // a new identity - then report what the edge answered, so the result is a fact.
+    async recycleLanes(p) {
+      try {
+        const r = await this.api('/provider/' + encodeURIComponent(p.id) + '/recycle', { method: 'POST', body: { allLanes: true, reason: 'dashboard' } });
+        const pr = r.probe || {};
+        const verdict = pr.status === 200
+          ? `the edge answered 200 on ${pr.model || 'the requested model'}`
+          : (pr.retryAfterSeconds
+            ? `the edge still says ${pr.status}, reset at ${pr.resetsAt} (${Math.round(pr.retryAfterSeconds / 3600)}h)`
+            : `the edge says ${pr.status} ${pr.message || ''}`);
+        this.toast(`${p.id}: ${r.recycled.length} lane(s) recycled - new IP + new identity; ${verdict}`, pr.status === 200 ? 'ok' : 'warn');
+        await this.load(true);
+        await this.loadProxies(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
     async renewIdentity(p) {
       try {
         const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/reinstall', { method: 'POST', body: {} });

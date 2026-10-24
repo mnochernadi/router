@@ -2397,6 +2397,73 @@ function lendIdentity(provider, tried) {
 // The historical name: the request path, the admin API and the tests use it.
 const renewManagedIdentity = reinstallManagedClient;
 
+/**
+ * The operator's own recipe, in one call: drop the client, move the IP, install a
+ * new client with a new identity.
+ *
+ * That sequence *is* the ladder's shape and it clears what a ladder can clear - a
+ * limit accounted per lane, per exit address or per session, which is what a live
+ * day's allowance produces (measured: the same request answered 200 from a fresh
+ * exit in the minute the old one answered 429). It cannot clear the anonymous
+ * *day* bucket: tested today through 15 v2ray exits with a fresh session, project
+ * and build each, and once more with no client state and no credential at all -
+ * every one answered 429 counting to the same `2026-10-25T00:00:00Z`. Recycling is
+ * still the right move at the instant that bucket resets, which is why the free
+ * tier does it by itself when the parked window expires.
+ */
+function recycleLane(provider, account, reason) {
+  const lane = laneKeyOf(account);
+  let burned = '';
+  let next = null;
+  if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
+    // 1) mark the address this lane is on as spent...
+    burned = (proxies.state.lanes[provider.id] || {})[lane] || '';
+    if (burned) proxies.noteResult(burned, false, { burn: true });
+    // 2) ...and move the lane to a different one (`rotateLane` refuses to hand the
+    //    current pin back, so the new address is genuinely a different exit).
+    next = proxies.rotateLane(provider, lane, reason);
+  }
+  // 3) drop the client and install a new identity on that fresh address: new
+  //    session, new project handle, next build, cooldown cleared.
+  const fresh = reinstallManagedClient(provider, account, reason);
+  return { account: fresh, lane: Number(lane), burnedExit: burned, exit: next ? (next.exitIp || next.id || '') : '' };
+}
+
+/** One signed request to the provider, so a recycle can report what the edge said. */
+async function probeProviderOnce(provider, account, model = 'deepseek-v4.1-flash-free') {
+  let built;
+  try {
+    built = buildUpstream(provider, account, {
+      body: { model, messages: [{ role: 'user', content: 'say ok' }] },
+      model, method: 'POST', stream: false, suffix: '/chat/completions',
+      style: (PROVIDER_TYPES[provider.type] || {}).style, responseStyle: 'openai', translate: false, aggregate: true,
+    });
+  } catch (err) {
+    return { status: 0, error: err.message };
+  }
+  try {
+    const res = await fetch(built.url, {
+      method: 'POST', headers: built.headers, body: JSON.stringify(built.payload), signal: AbortSignal.timeout(30_000),
+    });
+    const retryAfterSeconds = Math.round(retryAfterMs(res.headers) / 1000) || 0;
+    let message = '';
+    if (res.status >= 400) {
+      const text = await res.text();
+      try { message = JSON.parse(text).error.message; } catch { message = text.slice(0, 140); }
+    } else {
+      try { if (res.body && res.body.cancel) await res.body.cancel(); } catch { /* noop */ }
+    }
+    return {
+      status: res.status,
+      retryAfterSeconds,
+      resetsAt: retryAfterSeconds ? new Date(Date.now() + retryAfterSeconds * 1000).toISOString() : '',
+      message: String(message).slice(0, 180),
+    };
+  } catch (err) {
+    return { status: 0, error: err.message };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Sign-in: add a principal, not another fake identity
 // ---------------------------------------------------------------------------
@@ -2886,7 +2953,16 @@ async function handleProxy(req, res, url) {
     // and that request would spend the fresh allowance on them.
     freeDry.reclaimed = freeDry.until;
     kickPool(`free allowance reset for ${provider.id}`);
-    console.warn(`[proxy] ${provider.id}: free allowance window has reset - refreshing the exit pool for the new day`);
+    // The bucket just refilled: present a brand-new client on a brand-new address
+    // for it, which is the operator's own recipe (drop the client, move the IP,
+    // install a new identity) fired at the one instant it can actually help.
+    // Answers still on the way from yesterday's spend cannot clear it earlier.
+    let recycled = 0;
+    for (const laneAcc of provider.accounts || []) {
+      if (laneAcc.enabled === false) continue;
+      try { recycleLane(provider, laneAcc, 'daily allowance reset'); recycled += 1; } catch { /* keep the lane */ }
+    }
+    console.warn(`[proxy] ${provider.id}: free allowance window has reset - recycled ${recycled} lane(s) onto fresh addresses with new identities for the new day`);
   }
 
   for (let attempt = 1; !freeCeilingDry && !dayCeiling && attempt <= maxAttempts; attempt += 1) {
@@ -4105,6 +4181,27 @@ async function handleAdmin(req, res, url) {
         } : null,
         reinstalls: state.totals.reinstalls || 0,
       });
+    }
+
+    // Their own recipe as one call: drop the client, move the IP, install a new
+    // identity - and say what the edge answered, so the result is never a guess.
+    if (method === 'POST' && b === 'provider' && c && d === 'recycle') {
+      const provider = findProvider(c);
+      if (!provider) return sendJson(res, 404, { error: { message: 'provider not found', type: 'not_found' } });
+      const payload = await readJsonBody(req).catch(() => ({}));
+      const targets = payload.allLanes
+        ? (provider.accounts || []).filter((a) => a.enabled !== false)
+        : [(provider.accounts || []).find((a) => a.enabled !== false)].filter(Boolean);
+      if (!targets.length) return sendJson(res, 409, { error: { message: `provider "${provider.id}" has no enabled identity to recycle`, type: 'no_accounts' } });
+      const done = targets.map((acc) => {
+        const r = recycleLane(provider, acc, `manual recycle (${payload.reason || 'dashboard'})`);
+        return { lane: r.lane, account: r.account.name, burnedExit: r.burnedExit, exit: r.exit };
+      });
+      await saveConfig();
+      const probe = payload.probe === false ? null : await probeProviderOnce(provider, targets[0]);
+      if (probe && probe.status === 200) clearFreeDry(provider.id);
+      console.warn(`[proxy] ${provider.id}: recycled ${done.length} lane(s) - new IP + new identity; edge said ${probe ? `${probe.status}${probe.retryAfterSeconds ? ` retry-after ${probe.retryAfterSeconds}s` : ''}` : '(not probed)'}`);
+      return sendJson(res, 200, { ok: true, recycled: done, probe });
     }
 
     if (method === 'POST' && b === 'provider' && c && d === 'rotate-exit') {
