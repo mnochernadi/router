@@ -22,6 +22,7 @@
 
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 /** The strings the CLI prints when the free allowance (or the gate) says no. */
@@ -84,7 +85,10 @@ class OpenCodeCliDriver {
    */
   constructor({ binPath, homeDir, args = [], mode = 'spawn', serveUrl = '', log = () => {} } = {}) {
     this.binPath = binPath;
-    this.homeDir = homeDir;
+    // Serve mode needs no HOME of its own, but the log watcher and the spawn mode do,
+    // so there is always one (a sane temporary default rather than `undefined`, which
+    // made `path.join` throw).
+    this.homeDir = homeDir ? String(homeDir) : path.join(os.tmpdir(), 'opencode-cli-home');
     this.args = args;
     // 'serve' talks to a long-lived `opencode serve` (fast: measured ~1.5s per
     // answer) and 'spawn' runs a fresh `opencode run` per request (~4-13s, needs
@@ -101,20 +105,65 @@ class OpenCodeCliDriver {
   }
 
   /**
+   * Watch the client's own log for the limit line.
+   *
+   * A limited client does not fail fast: it retries with backoff, so a request that
+   * is being refused looks exactly like a hung request (measured: a message call sat
+   * for 60s+ while the log was already full of `Free usage limit reached`). Its log
+   * is the truth, so the transport reads it and cuts the call short.
+   *
+   * @returns {function} stop watching
+   */
+  watchLimitInLog(onLimit, { intervalMs = 500 } = {}) {
+    let file = null;
+    try {
+      const dir = path.join(this.homeDir, '.local', 'share', 'opencode', 'log');
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
+      if (!files.length) return () => {};
+      file = files
+        .map((f) => ({ f: path.join(dir, f), m: fs.statSync(path.join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.m - a.m)[0].f;
+    } catch { return () => {}; }
+    let offset = 0;
+    try { offset = fs.statSync(file).size; } catch { offset = 0; }
+    const timer = setInterval(() => {
+      try {
+        const stat = fs.statSync(file);
+        if (stat.size < offset) offset = 0; // rotated
+        if (stat.size === offset) return;
+        const fd = fs.openSync(file, 'r');
+        const buf = Buffer.alloc(stat.size - offset);
+        fs.readSync(fd, buf, 0, buf.length, offset);
+        fs.closeSync(fd);
+        offset = stat.size;
+        if (LIMIT_RE.test(buf.toString('utf8'))) {
+          clearInterval(timer);
+          this.log('[cli-driver] the client log already says the allowance is spent - cutting the call short');
+          onLimit();
+        }
+      } catch { /* the log moved on; the call deadline still applies */ }
+    }, intervalMs);
+    if (timer.unref) timer.unref();
+    return () => clearInterval(timer);
+  }
+
+  /**
    * Answer through a running `opencode serve`.
    *
    * Two route traps, both measured: session creation wraps its reply in
    * `{"data":{...}}`, and the message route is `/session/<id>/message` - the
    * `/api/session/<id>/message` spelling returns the web UI's HTML with a 200.
    */
-  async runViaServe({ model, prompt, timeoutMs = 180_000 } = {}) {
+  async runViaServe({ model, prompt, timeoutMs = 180_000, perAttemptMs = 45_000 } = {}) {
     const started = Date.now();
-    const post = async (path, body, ms) => {
-      const res = await fetch(`${this.serveUrl}${path}`, {
+    const post = async (path_, body, ms, signal = null) => {
+      const deadline = AbortSignal.timeout(ms);
+      const combined = signal ? AbortSignal.any([deadline, signal]) : deadline;
+      const res = await fetch(`${this.serveUrl}${path_}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(ms),
+        signal: combined,
       });
       const text = await res.text();
       let json = null;
@@ -133,7 +182,23 @@ class OpenCodeCliDriver {
           ms: Date.now() - started,
         };
       }
-      const msg = await post(`/session/${sid}/message`, { parts: [{ type: 'text', text: prompt }] }, timeoutMs);
+      const ctl = new AbortController();
+      let cutShort = false;
+      const stopWatch = this.watchLimitInLog(() => { cutShort = true; ctl.abort(); });
+      let msg;
+      try {
+        msg = await post(`/session/${sid}/message`, { parts: [{ type: 'text', text: prompt }] }, Math.min(timeoutMs, perAttemptMs), ctl.signal);
+      } catch (err) {
+        if (cutShort) {
+          return {
+            ok: false, text: '', limit: true, auth: false, code: -1, signal: '',
+            stderr: '', error: 'free allowance spent (the client log said so while the call was still retrying)', ms: Date.now() - started,
+          };
+        }
+        throw err;
+      } finally {
+        stopWatch();
+      }
       const combined = `${msg.text}\n${JSON.stringify(msg.json || {})}`;
       const limit = LIMIT_RE.test(combined);
       const auth = !limit && AUTH_RE.test(combined);
@@ -249,6 +314,17 @@ class OpenCodeCliDriver {
       dbg(`spawn pid=${child.pid || '?'} args="${args.join(' ')}" cwd=${this.homeDir}`);
       child.on('spawn', () => dbg(`spawned pid=${child.pid}`));
       child.on('exit', (code, signal) => dbg(`exit code=${code} signal=${signal || '-'}`));
+      // The CLI retries with backoff after a limit instead of exiting, so the limit
+      // line is the signal to stop waiting: kill the child the moment it appears.
+      let cutShort = false;
+      const noteChunk = (text) => {
+        if (cutShort || !text) return;
+        if (LIMIT_RE.test(text)) {
+          cutShort = true;
+          dbg('the limit line appeared - killing the child instead of waiting out its retries');
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        }
+      };
       let stdout = '';
       let stderr = '';
       let finished = false;
@@ -289,14 +365,17 @@ class OpenCodeCliDriver {
         const text = chunk.toString('utf8');
         stdout += text;
         dbg(`stdout ${Buffer.byteLength(text)}B`);
+        noteChunk(text);
         if (onDelta) {
           const clean = stripAnsi(text);
           if (clean.trim()) { try { onDelta(clean); } catch { /* caller gone */ } }
         }
       });
       child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString('utf8');
-        dbg(`stderr ${stripAnsi(chunk.toString('utf8')).slice(0, 120)}`);
+        const text = chunk.toString('utf8');
+        stderr += text;
+        dbg(`stderr ${stripAnsi(text).slice(0, 120)}`);
+        noteChunk(text);
       });
       child.on('error', (err) => { stderr += `spawn error: ${err.message}`; done({ code: -1, signal: 'spawn-error' }); });
       child.on('close', (code, signal) => done({ code, signal }));

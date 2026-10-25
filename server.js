@@ -2587,6 +2587,21 @@ function cliIdentityPool(provider) {
 }
 
 /**
+ * One attempt's ceiling.
+ *
+ * Not the provider's 300s: a limited client retries with backoff, so a long ceiling
+ * turns a refusal into a client-side timeout. The transport detects the limit itself
+ * (the client's log in serve mode, its output in spawn mode) and usually finishes an
+ * attempt in seconds; this is only the backstop.
+ */
+function cliAttemptTimeoutMs(provider) {
+  const raw = Number(config.cliAttemptTimeoutMs);
+  const cap = Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+  const own = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : cap;
+  return Math.max(15_000, Math.min(own, cap));
+}
+
+/**
  * One exit as an HTTPS_PROXY URL.
  *
  * `pick()` hands back a wrapper (`{ mode, exit, proxy }`) while `rotate()` hands back
@@ -2658,7 +2673,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
 
   const controller = new AbortController();
   res.on('close', () => { if (!res.writableEnded) controller.abort(); });
-  const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 300_000;
+  const timeoutMs = cliAttemptTimeoutMs(provider);
 
   /**
    * The ladder for this transport.
