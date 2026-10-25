@@ -33,6 +33,10 @@ MODE="auto"          # auto | docker | systemd
 WITH_NGINX="auto"    # auto | yes | no
 WITH_FIREWALL=1
 WITH_XRAY=0
+# The genuine opencode CLI, used as a keyless provider transport (`opencode-cli`).
+# The free tier's gate accepts only that binary, so the router runs it.
+WITH_OPENCODE_CLI=0
+OPENCODE_CLI_VERSION="${ROUTER_OPENCODE_CLI_VERSION:-1.19.4}"
 # Xray 25.9.10 added VLESS Encryption and now refuses a plain (no-TLS) VLESS
 # outbound whose server is a bare public IP, which is exactly what most public
 # V2Ray subscriptions hand out. One rejected outbound aborts the whole config,
@@ -125,6 +129,9 @@ while [ $# -gt 0 ]; do
     --no-nginx)    WITH_NGINX="no"; shift ;;
     --no-firewall) WITH_FIREWALL=0; shift ;;
     --with-xray)   WITH_XRAY=1; shift ;;
+    --with-opencode-cli) WITH_OPENCODE_CLI=1; shift ;;
+    --opencode-cli-version) OPENCODE_CLI_VERSION="${2:-}"; shift 2 ;;
+    --opencode-cli-version=*) OPENCODE_CLI_VERSION="${1#*=}"; shift ;;
     --xray-version) XRAY_VERSION="${2:-}"; shift 2 ;;
     --xray-version=*) XRAY_VERSION="${1#*=}"; shift ;;
     --uninstall)   UNINSTALL=1; shift ;;
@@ -357,6 +364,7 @@ install_systemd() {
   # Key first: config.json, the env file and the final summary all use it.
   resolve_admin_key
   if [ "$WITH_XRAY" = 1 ]; then install_xray; fi
+  if [ "$WITH_OPENCODE_CLI" = 1 ]; then install_opencode_cli; fi
   write_env_file
 
   run mkdir -p "$STATE_DIR"
@@ -400,7 +408,13 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$STATE_DIR
-MemoryMax=128M
+# The router itself stays flat at ~65 MB, but a provider may run the genuine
+# opencode CLI as its transport (provider type `opencode-cli`), and that is a bun
+# binary: measured ~180 MB RSS while answering. A 128M cap starved it into state
+# `D` (memory reclaim) with no output at all, which looked exactly like a hang.
+# The box this is installed on is expected to have >=1 GB.
+MemoryMax=512M
+MemoryHigh=384M
 LimitNOFILE=65535
 
 [Install]
@@ -549,6 +563,38 @@ EOF
 # Xray-core (optional): powers the V2Ray exit pool used for IP rotation
 # ---------------------------------------------------------------------------
 XRAY_BIN="${ROUTER_XRAY:-xray}"
+# The genuine opencode CLI (npm's opencode-linux-x64 bundle), for the `opencode-cli`
+# provider transport. It is the only client the free tier's gate accepts, so it is
+# installed into the router's own bin/ next to xray - nothing else on the box is
+# touched, and an existing copy is reused.
+install_opencode_cli() {
+  local arch tgz url
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=x64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *)             arch=x64 ;;
+  esac
+  if [ -x "$INSTALL_DIR/bin/opencode" ]; then
+    ok "opencode CLI already at $INSTALL_DIR/bin/opencode ($("$INSTALL_DIR/bin/opencode" --version 2>/dev/null | head -1))"
+    return 0
+  fi
+  tgz="opencode-linux-${arch}-${OPENCODE_CLI_VERSION}.tgz"
+  url="https://registry.npmjs.org/opencode-linux-${arch}/-/opencode-linux-${arch}-${OPENCODE_CLI_VERSION}.tgz"
+  say "downloading the opencode CLI $OPENCODE_CLI_VERSION ($arch) - the client the free tier accepts"
+  run mkdir -p "$INSTALL_DIR/bin"
+  if [ "$DRY_RUN" = 1 ]; then
+    run sh -c "curl -fsSL -o /tmp/$tgz $url"
+    run sh -c "tar -xzf /tmp/$tgz -C /tmp package/bin/opencode && install -m 0755 /tmp/package/bin/opencode $INSTALL_DIR/bin/opencode"
+    return 0
+  fi
+  curl -fsSL -o "/tmp/$tgz" "$url" || die "could not download the opencode CLI ($url)"
+  rm -rf /tmp/oc-cli-pkg && mkdir -p /tmp/oc-cli-pkg
+  tar -xzf "/tmp/$tgz" -C /tmp/oc-cli-pkg package/bin/opencode || die "the opencode CLI tarball had no package/bin/opencode"
+  install -m 0755 /tmp/oc-cli-pkg/package/bin/opencode "$INSTALL_DIR/bin/opencode"
+  rm -rf /tmp/oc-cli-pkg "/tmp/$tgz"
+  ok "opencode CLI installed at $INSTALL_DIR/bin/opencode ($("$INSTALL_DIR/bin/opencode" --version 2>/dev/null | head -1))"
+  warn "a provider of type opencode-cli needs ~400M of memory; the service ships MemoryMax=512M for that reason"
+}
 install_xray() {
   local xa
   case "$(uname -m)" in

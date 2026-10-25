@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenCode free-tier local API (genuine client) for llm-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The genuine OpenCode client, serving its session API on loopback only.
+# The free allowance is granted to this principal; forged headers are refused.
+Environment=HOME=/var/lib/oc-serve
+Environment=OPENCODE_DISABLE_AUTOUPDATE=1
+WorkingDirectory=/var/lib/oc-serve/project
+ExecStart=/opt/oc/bin/opencode serve --port 47999 --hostname 127.0.0.1
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

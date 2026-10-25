@@ -92,3 +92,54 @@ to rotate. Sign-in is an OAuth device flow to `/auth/device/token`
 timeline 2026-10-24: no traffic 00:00–05:00Z, first `429` 05:51:24Z, day spent
 05:51:47Z → usable window ≈ 00:00–06:00Z. Evidence and the live exit table:
 `.tools/FREE-TIER-REALCLIENT-PROOF.md`.
+
+### 3.3 CORRECTION, 2026-10-25 — the genuine client works; the forged shape is what is refused
+
+§3.2 is true for 2026-10-24 and false as a general conclusion. Re-measured
+2026-10-25 09:37–09:49Z:
+
+* **The genuine client answers.** `opencode-linux-x64@1.19.4`, fresh `HOME`, 0
+  credentials → **10/10 successful completions** of `deepseek-v4.1-flash-free`,
+  1.9–11 s each, `tokens.output=2`, text `OK`. Six via `opencode run`, three via the
+  `opencode serve` session API, one initial CLI probe.
+* **Every forged shape is refused.** Host egress, all 15 pooled exits, all nine
+  `*-free` models → `429 FreeUsageLimitError`, every `retry-after` landing on
+  `2026-10-26T00:00:00Z`. `minimax-m3.1-flash-free` is `410 ModelDeprecated`.
+* **The deployed router earned zero successes.** `journalctl -u llm-router` since
+  `2026-10-25 00:00Z` contains **no `200`**. At `00:00:17Z` `oc-window-open.timer`
+  recycled 4 lanes onto fresh exits with new identities; at `00:00:18Z` — one second
+  later — the router logged *"free tier is spent for the day (1440m to the reset)"*.
+  The 40-request `/admin/api/proxies/test` burst in that script is **not** the cause:
+  the very first probe after the reset was already refused.
+
+So the allowance is **not** keyed on the connection the way §3.1 concludes. It is
+granted to the genuine-client principal and withheld from the forged-header principal,
+and the 00:00 UTC reset restored it to the former only. The 2026-10-24 `429` from the
+real client was a genuinely spent bucket, not evidence that the client is refused.
+
+**Working path, installed and verified 2026-10-25:**
+
+```bash
+# create a session pinned to the free model
+SID=$(curl -s -X POST http://127.0.0.1:47999/api/session \
+  -H 'content-type: application/json' \
+  -d '{"model":{"id":"deepseek-v4.1-flash-free","providerID":"opencode"}}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["id"])')
+
+# message it -- note: NO /api prefix on this route
+curl -s -X POST "http://127.0.0.1:47999/session/$SID/message" \
+  -H 'content-type: application/json' \
+  -d '{"parts":[{"type":"text","text":"say OK"}]}'
+# -> {"info":{...,"modelID":"deepseek-v4.1-flash-free"},"parts":[{...,"text":"OK"}]}
+```
+
+Backed by `oc-serve.service` (`deploy/oc-serve.service`), enabled, bound to
+`127.0.0.1:47999`, binary at `/opt/oc/bin/opencode`, `HOME=/var/lib/oc-serve`.
+`GET /api/health` → `{"healthy":true}`. Two route traps: session creation wraps its
+reply in `{"data":{...}}`, and the message route is `/session/{id}/message` while
+`/api/session/{id}/message` returns the web UI HTML with `200`.
+
+The router does not use this yet — wiring `llm-router` to it needs a provider style,
+because the serve API is OpenCode's own session API and not OpenAI-shaped. Until that
+lands, `:8787` keeps returning `429` and the free tier is reachable only at
+`127.0.0.1:47999`. Full evidence: `.tools/LIVE-VERDICT-2026-10-25.md`.

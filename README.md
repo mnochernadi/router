@@ -132,6 +132,37 @@ The same reason is shown on the account row and in the Activity tab, so you can 
 
 Translation covers system-message extraction, text and image parts, `max_tokens`, `temperature`, `top_p`, `stop`, usage mapping and finish reasons. Anthropic and Gemini streams are re-emitted as OpenAI `chat.completion.chunk` events terminated by `data: [DONE]`.
 
+### `opencode-cli`: the free tier's gate is on the *client*
+
+The anonymous free tier is gated on the client that asks, not on the request. Measured on one box, in the same minute, with the exact request the real CLI sends (`POST /inference/openai/v1/chat/completions`, `Authorization: Bearer public`, its own `User-Agent: opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`, `x-opencode-project: global`, the same 32KB body):
+
+| Client | Result |
+|---|---|
+| the genuine `opencode` binary | **200** |
+| node fetch (HTTP/1.1), node `http2` | `429 FreeUsageLimitError` |
+| bun 1.4.4 `fetch` (the same runtime) | `429` |
+| curl, curl-impersonate `chrome136` / `chrome116` / `firefox144` / `safari184` | `429` |
+| the same request behind a TLS MITM | `429` |
+| no credential at all | `429`, same reset instant |
+
+Every refusal counts down to the same absolute instant (`00:00 UTC`), the bucket the API reports. So path, headers, UA, project handle, session, model, body size, bearer and the IP are all irrelevant; the only keyless way through is to let the genuine binary make the call. That is what this provider type does:
+
+```json
+{ "id": "opencode-cli", "type": "opencode-cli", "cliPath": "/opt/llm-router/bin/opencode", "cliArgs": ["--pure"] }
+```
+
+* The driver runs `opencode run --model opencode/<id>` with a HOME of its own (`<state dir>/oc-cli-home`), feeds the prompt on **stdin** (a 21KB agent prompt answers the same as the argument form, without an `ARG_MAX` ceiling), and strips the CLI's ANSI chrome.
+* **It needs memory.** The CLI is a bun binary: measured ~180 MB RSS and a ~400 MB cgroup peak while answering. The service unit therefore ships `MemoryMax=512M` (it was 128M) - with the old cap the child sat in state `D` (memory reclaim) producing no output, which looks exactly like a hang.
+* **The child gets a minimal environment.** The CLI is a server as well as a client and boots local services of its own, so inheriting the router's `PORT=8787`/`HOST=0.0.0.0` made it hang on the port the router is already using. The driver passes only HOME/XDG/TERM/`NO_COLOR`, PATH/LANG/TZ and the TLS bundle paths, plus the exit proxy when the pool is in use.
+* **It does not lift the free allowance.** The CLI has its own daily one. When it reports the limit the router parks the transport and answers `429` with the `00:00 UTC` clock in `Retry-After`, so the client sleeps instead of hot-looping, and the next request after the reset runs the binary again by itself.
+* **It is agent-shaped**, not a raw API: the CLI supplies its own system prompt and tools, the caller's messages are passed as the prompt text, tool-calls are not returned to the caller, and each request costs a process spawn (measured 4-13s end to end).
+
+```bash
+sudo /opt/llm-router/install.sh --with-opencode-cli     # fetch it into /opt/llm-router/bin
+curl http://127.0.0.1:8787/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"opencode-cli/big-pickle","messages":[{"role":"user","content":"hi"}]}'
+```
+
 ## OpenCode (what 9Router calls OpenCode Free, done properly)
 
 One OpenCode account fronts **four different wire formats**, and OpenCode only lists the endpoint per model. The router picks it for you from the model id — no separate providers, no manual endpoint juggling:

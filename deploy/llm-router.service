@@ -29,7 +29,12 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/llm-router
-MemoryMax=128M
+# The router itself stays flat at ~65 MB, but a provider may run the genuine
+# opencode CLI as its transport (provider type `opencode-cli`), and that is a bun
+# binary: measured ~180 MB RSS while answering. 128M starved it into state `D`
+# (memory reclaim) with no output at all, which looks exactly like a hang.
+MemoryMax=512M
+MemoryHigh=384M
 LimitNOFILE=65535
 
 [Install]
