@@ -2513,6 +2513,20 @@ function msToNextUtcMidnight() {
   return Math.max(60_000, next - Date.now());
 }
 
+/**
+ * How long the CLI transport cools down after the genuine client reports its limit.
+ *
+ * Not the day: measured 2026-10-25, an identity that reported `Free usage limit
+ * reached` after five requests answered again about ten minutes later, while every
+ * forged shape in the same window counted down to 00:00 UTC. The genuine client's
+ * allowance therefore behaves like a short window that refills, so parking it until
+ * midnight would throw away the rest of the day for nothing.
+ */
+function cliLimitCooldownMs() {
+  const minutes = Number(config.cliLimitCooldownMinutes);
+  return Math.max(60_000, (Number.isFinite(minutes) && minutes >= 0 ? minutes : 12) * 60_000);
+}
+
 /** The default location of the router's own copy of the CLI. */
 function defaultCliPath() {
   return String(process.env.ROUTER_OPENCODE_CLI || config.cliPath || '/opt/llm-router/bin/opencode');
@@ -2633,15 +2647,17 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   }
 
   if (result.limit || result.auth) {
-    const wait = msToNextUtcMidnight();
+    const wait = result.auth ? msToNextUtcMidnight() : cliLimitCooldownMs();
     parkCliTier(wait, result.error);
     state.totals.failed += 1;
     if (!res.headersSent) {
       const secs = Math.max(1, Math.round(wait / 1000));
       return sendJson(res, 429, {
         error: {
-          message: `the opencode CLI reports its free allowance is spent (${result.error || 'free usage limit reached'}); it returns at ${new Date(now() + wait).toISOString()}`,
-          type: 'router_free_day_ceiling',
+          message: result.auth
+            ? `the opencode CLI reports no usable credential; it needs a sign-in or a key, and the transport stays parked until ${new Date(now() + wait).toISOString()}`
+            : `the opencode CLI reports its free allowance is spent (${result.error || 'free usage limit reached'}); this window refills, so the transport cools down for ${Math.round(wait / 60_000)} minute(s) and resumes by itself`,
+          type: result.auth ? 'router_cli_auth' : 'router_free_window',
           retryAfterSeconds: secs,
         },
       }, { 'retry-after': String(secs) });

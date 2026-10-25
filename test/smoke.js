@@ -1847,9 +1847,9 @@ async function memOf() {
       const limited = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: '__LIMIT__ please' }] });
       const limitBody = JSON.parse(limited.text);
       const limitRa = Number(limited.headers.get('retry-after'));
-      check('cli transport: the CLI\'s own limit becomes a 429 with the reset clock',
-        limited.status === 429 && limitBody.error?.type === 'router_free_day_ceiling'
-        && Number.isFinite(limitRa) && limitRa > 60,
+      check('cli transport: the CLI\'s own limit becomes a 429 with a short refill window, not the day',
+        limited.status === 429 && limitBody.error?.type === 'router_free_window'
+        && Number.isFinite(limitRa) && limitRa > 60 && limitRa <= 24 * 3600,
         `${limited.status} ra=${limited.headers.get('retry-after')} body=${limited.text.slice(0, 160)}`);
 
       const afterLimit = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: 'hello again' }] });
