@@ -343,17 +343,24 @@ class OpenCodeCliDriver {
       dbg(`spawn pid=${child.pid || '?'} args="${args.join(' ')}" cwd=${this.homeDir}`);
       child.on('spawn', () => dbg(`spawned pid=${child.pid}`));
       child.on('exit', (code, signal) => dbg(`exit code=${code} signal=${signal || '-'}`));
-      // The CLI retries with backoff after a limit instead of exiting, so the limit
-      // line is the signal to stop waiting: kill the child the moment it appears.
+      // The CLI retries with backoff after a limit instead of exiting, and when the
+      // window is spent it often prints *nothing* at all - the banner and then silence
+      // (measured: a spawn sat 60s with only the banner on stdout). Its own log always
+      // records the refusal, so both channels are watched and either one cuts the call
+      // short; without the log channel a spent window looked like a local deadline.
       let cutShort = false;
+      const cut = (why) => {
+        if (cutShort) return;
+        cutShort = true;
+        dbg(`${why} - killing the child instead of waiting out its retries`);
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      };
       const noteChunk = (text) => {
         if (cutShort || !text) return;
-        if (LIMIT_RE.test(text)) {
-          cutShort = true;
-          dbg('the limit line appeared - killing the child instead of waiting out its retries');
-          try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        }
-      };      let stdout = '';
+        if (LIMIT_RE.test(text)) cut('the limit line appeared');
+      };
+      const stopLogWatch = this.watchLimitInLog(() => cut('the client log says the allowance is spent'));
+      let stdout = '';
       let stderr = '';
       let finished = false;
       // A kill this box asked for is not the upstream's answer. Remember which one it
@@ -372,6 +379,7 @@ class OpenCodeCliDriver {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        try { stopLogWatch(); } catch { /* noop */ }
         this.running -= 1;
         const combined = `${stdout}\n${stderr}`;
         // `cutShort` matters: the line can arrive split across chunks, in which case
