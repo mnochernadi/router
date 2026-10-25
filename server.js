@@ -2588,10 +2588,17 @@ function msToNextUtcMidnight() {
  */
 function cliLimitCooldownMs() {
   const minutes = Number(config.cliLimitCooldownMinutes);
-  // Measured 2026-10-25: the anonymous window refills in about ten minutes, so a long
-  // cooldown throws away usable time. Four minutes is the default; the ladder retries
-  // on its own and a still-spent window simply parks again.
-  return Math.max(60_000, (Number.isFinite(minutes) && minutes >= 0 ? minutes : 4) * 60_000);
+  // Measured 2026-10-25: the window refills in about ten minutes of quiet, and every
+  // retry spends it again - retrying every four minutes with four attempts kept the
+  // window permanently empty. Ten minutes matches the refill; the ladder is kept short
+  // (see cliLadderMaxAttempts) so the request after the wait gets the whole window.
+  return Math.max(60_000, (Number.isFinite(minutes) && minutes >= 0 ? minutes : 10) * 60_000);
+}
+
+/** How many attempts one request may make. Two is enough: a spent day refuses them all. */
+function cliLadderMaxAttempts() {
+  const raw = Number(config.cliLadderMaxAttempts);
+  return Math.max(1, Math.min(8, Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2));
 }
 
 /** The default location of the router's own copy of the CLI. */
@@ -2900,6 +2907,10 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     const identity = (startIdentity + i) % pool + 1;
     attempts.push({ mode: 'spawn', identity, rotateExit: i > 0 || driver.mode !== 'serve' });
   }
+  // Keep the walk short: a spent day refuses every identity, and each attempt spends
+  // the very window the next request needs.
+  const maxAttempts = cliLadderMaxAttempts();
+  if (attempts.length > maxAttempts) attempts.length = maxAttempts;
 
   let result = null;
   let used = attempts[0];
