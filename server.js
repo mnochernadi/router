@@ -2623,6 +2623,35 @@ function cliExitEnv(picked) {
   return `http://${proxy.host}:${proxy.port}`;
 }
 
+/**
+ * The next exit for the CLI transport, taken only from the exits whose inbound
+ * actually exists.
+ *
+ * `activeExits()` can carry far more entries than the manager started: measured here,
+ * 400 ids against 15 started inbounds. `portForExit()` maps an exit to
+ * `basePort + its index`, so any entry past the started range points at a port nobody
+ * listens on - and a CLI handed that proxy does not fail, it *waits*, which looks
+ * exactly like the hang this transport has already been chased through twice.
+ */
+function cliExitChoice(provider, { rotate = false } = {}) {
+  if (!proxies || !proxies.state.settings.enabled || provider.proxy !== 'rotate') return null;
+  const all = proxies.activeExits();
+  const max = Number(proxies.state.settings.maxActive) || 0;
+  const live = max > 0 ? all.slice(0, max) : all;
+  if (!live.length) return null;
+  const key = provider.id || 'default';
+  const cursors = state.cliExitIndex || {};
+  const at = rotate ? ((Number(cursors[key]) || 0) + 1) % live.length : (Number(cursors[key]) || 0) % live.length;
+  const exit = live[at];
+  const port = proxies.portForExit(exit);
+  if (!port) return null;
+  if (rotate) {
+    state.cliExitIndex = { ...cursors, [key]: at };
+    persistState();
+  }
+  return { url: `http://127.0.0.1:${port}`, exit: exit.id, ip: exit.exitIp || 'unknown' };
+}
+
 function cliStreamChunk(model, text, finish = null) {
   return `data: ${JSON.stringify({
     id: 'chatcmpl-cli',
@@ -2710,12 +2739,11 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     // Each attempt gets its own exit when the pool is live: a new identity from the
     // same address is only half of "a new client".
     const env = {};
-    if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
-      const picked = attempt.rotateExit
-        ? proxies.rotate('a new identity for the free tier', provider.id)
-        : proxies.pick(provider);
-      const url = cliExitEnv(picked);
-      if (url) env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = url;
+    const choice = cliExitChoice(provider, { rotate: attempt.rotateExit });
+    if (choice) {
+      env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = choice.url;
+      attempt.exit = choice.exit;
+      attempt.exitIp = choice.ip;
     }
     const attemptDriver = attempt.mode === 'serve' ? driver : cliSpawnDriver(provider, attempt.identity);
     if (!attemptDriver.available()) continue;
@@ -2728,7 +2756,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     // thing. Both rotate; a plain failure (spawn error) does not burn identities.
     const retryable = result.limit || /timeout|aborted|unreachable|killed|ECONN/i.test(String(result.error || ''));
     if (!retryable) break;
-    console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''} came back ${result.limit ? 'limited' : result.error} after ${result.ms}ms - rotating identity and exit`);
+    console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''}${attempt.exit ? ` via exit ${attempt.exit} (${attempt.exitIp})` : ''} came back ${result.limit ? 'limited' : result.error} after ${result.ms}ms - rotating identity and exit`);
   }
   if (rotated) {
     state.cliIdentity = { next: ((startIdentity + rotated) % pool) };
@@ -2741,6 +2769,10 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   if (used && used.identity) {
     headers['x-router-identity'] = String(used.identity);
     streamHeaders['x-router-identity'] = String(used.identity);
+  }
+  if (used && used.exit) {
+    headers['x-router-exit'] = String(used.exit);
+    streamHeaders['x-router-exit'] = String(used.exit);
   }
 
   if (result.limit || result.auth) {
