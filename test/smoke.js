@@ -1874,6 +1874,94 @@ async function memOf() {
     }
   }
 
+  // 28b. A kill the router inflicts on itself is not the upstream allowance. Here the
+  //      client is up and merely never answers, so the router's own attempt deadline
+  //      ends the call. That must surface as a local `504 router_cli_deadline`, park
+  //      nothing, and leave the very next request served - otherwise a slow model reads
+  //      as a phantom daily ceiling and every client is told to come back in 12 minutes.
+  {
+    const hangTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-router-cli-hang-'));
+    let hangChild = null;
+    const probe = net.createServer();
+    try {
+      await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+      const HANG_PORT = probe.address().port;
+      await new Promise((r) => probe.close(() => r()));
+      const fake = path.join(REPO, 'test', 'fixtures', 'fake-opencode-cli.js');
+      const hangCfg = {
+        adminKey: 'test-admin-key', host: '127.0.0.1', port: HANG_PORT, cooldownHours: 12,
+        cooldownStatuses: [429, 402, 403], retryStatuses: [500, 502, 503, 504],
+        defaultProvider: '', cors: true, proxyKeys: [],
+        exclusiveProvider: 'opencode-cli',
+        // The shortest attempt ceiling the router will honour, and one identity, so the
+        // test costs a single deadline instead of a ladder of them.
+        cliAttemptTimeoutMs: 15_000,
+        cliLadderBudgetMs: 20_000,
+        providers: [{
+          id: 'opencode-cli', name: 'CLI transport', type: 'opencode-cli',
+          strategy: 'round-robin', timeoutMs: 15_000, proxy: 'direct',
+          cliIdentityPool: 1,
+          cliPath: process.execPath, cliArgs: [fake],
+          accounts: [],
+        }],
+      };
+      const hangConfig = path.join(hangTmp, 'config.json');
+      fs.writeFileSync(hangConfig, JSON.stringify(hangCfg, null, 2));
+      hangChild = spawn(process.execPath, [path.join(REPO, 'server.js')], {
+        cwd: REPO,
+        env: { ...process.env, ROUTER_CONFIG: hangConfig, ROUTER_STATE: path.join(hangTmp, 'state.json'), PORT: String(HANG_PORT), HOST: '127.0.0.1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let hangLog = '';
+      hangChild.stdout.on('data', (d) => { hangLog += d.toString(); });
+      hangChild.stderr.on('data', (d) => { hangLog += d.toString(); });
+      const hangUrl = (p) => `http://127.0.0.1:${HANG_PORT}${p}`;
+      const hangChat = async (body) => {
+        const r = await fetch(hangUrl('/v1/chat/completions'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        return { status: r.status, headers: r.headers, text: await r.text() };
+      };
+
+      let up = false;
+      for (let i = 0; i < 40 && !up; i += 1) {
+        try { up = (await fetch(hangUrl('/health'))).ok; } catch { await sleep(150); }
+      }
+      check('cli deadline: the deadlined router boots', up === true, hangLog.slice(-300) || hangChild.exitCode);
+
+      const hung = await hangChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: '__HANG__ please' }] });
+      let hangBody = {};
+      try { hangBody = JSON.parse(hung.text); } catch { /* not json */ }
+      check('cli deadline: a client the router had to kill reads as a local deadline, not the free window',
+        hung.status === 504 && hangBody.error?.type === 'router_cli_deadline'
+        && /deadline/i.test(String(hangBody.error?.message || '')),
+        `${hung.status} ${hung.text.slice(0, 220)}`);
+
+      // Nothing may be parked: walk the whole state payload for a live cli cooldown.
+      const snapAfterHang = await (await fetch(hangUrl('/admin/api/state'), { headers: ADMIN })).json();
+      const liveCooldowns = [];
+      (function walk(node) {
+        if (!node || typeof node !== 'object') return;
+        for (const [k, v] of Object.entries(node)) {
+          if ((k === 'cooldownSeconds' || k === 'cooldownUntil' || k === 'until') && Number(v) > 0) liveCooldowns.push(`${k}=${v}`);
+          else if (v && typeof v === 'object') walk(v);
+        }
+      }(snapAfterHang));
+      check('cli deadline: a deadline kill parks nothing (the free tier is still available)',
+        liveCooldowns.length === 0, liveCooldowns.join(' ') || 'no live cooldown');
+
+      const afterHang = await hangChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: 'hello again' }] });
+      check('cli deadline: the next request after a deadline kill is served, not refused',
+        afterHang.status === 200 && afterHang.text.includes('FAKE OK'),
+        `${afterHang.status} ${afterHang.text.slice(0, 200)}`);
+    } finally {
+      if (hangChild) hangChild.kill('SIGTERM');
+      fs.rmSync(hangTmp, { recursive: true, force: true });
+    }
+  }
+
   // 29. The `opencode serve` transport: the same genuine client, reached through a
   //     long-lived server instead of a fresh spawn per request. Unit-tested against
   //     a fake server here (fast, offline); the router path is the same handler the

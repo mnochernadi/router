@@ -2638,7 +2638,15 @@ function cliDriverFor(provider) {
  */
 function cliIdentityHome(provider, identity) {
   const base = String(provider.cliHome || path.join(DATA_DIR, 'oc-cli-home'));
-  return identity ? `${base}-id${identity}` : base;
+  if (!identity) return base;
+  return identity === 'signed' ? `${base}-signed` : `${base}-id${identity}`;
+}
+
+/** Is this identity already a bootstrapped installation? */
+function cliIdentityIsWarm(provider, identity) {
+  try {
+    return fs.existsSync(path.join(cliIdentityHome(provider, identity), '.local', 'share', 'opencode', 'opencode.db'));
+  } catch { return false; }
 }
 
 /** A spawn-mode driver bound to one identity's HOME. */
@@ -2672,14 +2680,25 @@ function cliIdentityPool(provider) {
 async function warmCliIdentities(provider) {
   const pool = cliIdentityPool(provider);
   const model = String(provider.warmModel || config.cliWarmModel || 'deepseek-v4.1-flash-free');
+  const signedIn = (provider.accounts || []).find((a) => a.signedIn && a.apiKey && a.enabled !== false);
+  const authContent = cliAuthContent(signedIn);
+  const wantExit = provider.proxy === 'rotate' && !!proxies && proxies.state.settings.enabled;
   for (let i = 1; i <= pool; i += 1) {
     const home = cliIdentityHome(provider, i);
     if (fs.existsSync(path.join(home, '.local', 'share', 'opencode', 'opencode.db'))) continue;
     const driver = cliSpawnDriver(provider, i);
     if (!driver.available()) return;
+    // The warm-up talks to the same edge, so it leaves through an exit too - a
+    // bootstrap from the server's own address is exactly the packet that must not
+    // exist. No exit means no warm-up; the identity stays cold instead of leaking.
+    const picked = cliProxyEnv(provider, { rotate: true });
+    if (wantExit && !picked.choice) {
+      console.warn('[cli] no live exit - skipping the identity warm-up rather than using the server address');
+      return;
+    }
     const t0 = now();
     // eslint-disable-next-line no-await-in-loop
-    const r = await driver.run({ model, prompt: 'warm-up: reply with just ok', timeoutMs: 240_000 });
+    const r = await driver.run({ model, prompt: 'warm-up: reply with just ok', timeoutMs: 240_000, env: picked.env || {}, authContent });
     console.warn(`[cli] warmed identity ${i} in ${now() - t0}ms (${r.ok ? 'answered' : r.limit ? 'limited' : r.error || 'failed'})`);
   }
 }
@@ -2739,6 +2758,49 @@ function cliExitChoice(provider, { rotate = false } = {}) {
     persistState();
   }
   return { url: `http://127.0.0.1:${port}`, exit: exit.id, ip: exit.exitIp || 'unknown' };
+}
+
+/**
+ * The credential the genuine client should speak with, if a principal exists.
+ *
+ * `OPENCODE_AUTH_CONTENT` is the client's own channel for this. The anonymous tier
+ * addresses a literal `public` credential, so a signed-in principal is a *different*
+ * bucket - the only client-side thing that resets an exhausted day.
+ */
+function cliAuthContent(account) {
+  if (!account || !account.signedIn || !account.apiKey) return '';
+  const rec = {
+    opencode: {
+      type: 'oauth',
+      refresh: String(account.refreshToken || ''),
+      access: String(account.apiKey),
+      expires: Number(account.tokenExpiresAt) || Date.now() + 3600_000,
+    },
+  };
+  if (account.orgId) rec.opencode.accountId = String(account.orgId);
+  return JSON.stringify(rec);
+}
+
+/**
+ * The proxy environment for one CLI attempt.
+ *
+ * The exit is not optional: the whole point of this transport is that the edge sees a
+ * v2ray address, never the server's own. When no live exit can be handed over, the
+ * request is refused here rather than sent from the server's address.
+ */
+function cliProxyEnv(provider, { rotate = false } = {}) {
+  const choice = cliExitChoice(provider, { rotate });
+  if (!choice) return { env: null, choice: null };
+  return {
+    env: {
+      HTTPS_PROXY: choice.url,
+      HTTP_PROXY: choice.url,
+      ALL_PROXY: choice.url,
+      // The local calls (and the router itself) must not be pushed through the exit.
+      NO_PROXY: '127.0.0.1,localhost',
+    },
+    choice,
+  };
 }
 
 function cliStreamChunk(model, text, finish = null) {
@@ -2820,7 +2882,13 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
   })();
   const ladderStart = Date.now();
+  const signedIn = (provider.accounts || []).find((a) => a.signedIn && a.apiKey && a.enabled !== false);
+  const authContent = cliAuthContent(signedIn);
+  const wantExit = provider.proxy === 'rotate' && !!proxies && proxies.state.settings.enabled;
   const attempts = [];
+  // A signed-in principal goes first: it is a different bucket (free models stay free
+  // for it), which is the only client-side thing that resets an exhausted day.
+  if (authContent) attempts.push({ mode: 'spawn', identity: 'signed', label: 'signed-in', rotateExit: false, auth: authContent });
   if (driver.mode === 'serve') attempts.push({ mode: 'serve', identity: null, rotateExit: false });
   for (let i = 0; i < pool; i += 1) {
     const identity = (startIdentity + i) % pool + 1;
@@ -2831,6 +2899,8 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   let used = attempts[0];
   let rotated = 0;
   let exhaustedRetryable = false;
+  let ranAnything = false;
+  let noExit = false;
   for (const attempt of attempts) {
     // A fresh identity is a *cold* installation: its first run pays for the client's
     // own bootstrap (measured ~1 minute), so the walk is time-boxed - the client gets
@@ -2841,20 +2911,46 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
       console.warn(`[cli] ladder budget of ${budgetMs}ms is spent - not minting another identity for this request`);
       break;
     }
-    const attemptMs = attempt === attempts[0] ? timeoutMs : Math.max(8_000, Math.min(timeoutMs, budgetMs - elapsed));
-    // Each attempt gets its own exit when the pool is live: a new identity from the
-    // same address is only half of "a new client".
-    const env = {};
-    const choice = cliExitChoice(provider, { rotate: attempt.rotateExit });
-    if (choice) {
-      env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = choice.url;
-      attempt.exit = choice.exit;
-      attempt.exitIp = choice.ip;
+    // A cold identity still has to bootstrap the client before it can answer
+    // (measured about a minute - see warmCliIdentities), so the ladder's own budget
+    // would kill it before its first token and the kill would look like a limit.
+    // Cold attempts get the full attempt ceiling instead.
+    const cold = attempt.mode === 'spawn' && attempt.identity && !cliIdentityIsWarm(provider, attempt.identity);
+    const attemptMs = attempt === attempts[0] || cold
+      ? timeoutMs
+      : Math.max(8_000, Math.min(timeoutMs, budgetMs - elapsed));
+    if (cold) console.warn(`[cli] identity ${attempt.identity} is cold - giving it the full ${timeoutMs}ms ceiling instead of the ladder budget`);
+    // Each attempt gets its own exit: the edge must see a v2ray address, never the
+    // server's own. When no live exit can be handed over, the attempt is skipped -
+    // and if nothing could run at all, the request is refused rather than leaked.
+    let env = {};
+    let choice = null;
+    if (attempt.mode === 'spawn') {
+      const picked = cliProxyEnv(provider, { rotate: attempt.rotateExit });
+      choice = picked.choice;
+      if (choice) {
+        env = picked.env;
+        attempt.exit = choice.exit;
+        attempt.exitIp = choice.ip;
+      } else if (wantExit) {
+        noExit = true;
+        console.warn('[cli] no live exit is available - refusing to send this request from the server address');
+        continue;
+      }
     }
     const attemptDriver = attempt.mode === 'serve' ? driver : cliSpawnDriver(provider, attempt.identity);
     if (!attemptDriver.available()) continue;
+    ranAnything = true;
     if (attempt !== attempts[0]) rotated += 1;
-    result = await attemptDriver.run({ model: baseModel, prompt, timeoutMs: attemptMs, env, signal: controller.signal, onDelta: null });
+    result = await attemptDriver.run({
+      model: baseModel,
+      prompt,
+      timeoutMs: attemptMs,
+      env,
+      signal: controller.signal,
+      onDelta: null,
+      authContent: attempt.auth || '',
+    });
     used = attempt;
     if (result.ok || result.auth) break;
     // A limit is not the only signature of a spent window: a client that is being
@@ -2869,6 +2965,15 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     state.cliIdentity = { next: ((startIdentity + rotated) % pool) };
     persistState();
   }
+  if (!ranAnything && noExit) {
+    state.totals.failed += 1;
+    return sendJson(res, 503, {
+      error: {
+        message: 'no live v2ray exit is available and this transport never puts the server address on the wire - refresh the pool in the dashboard Network tab',
+        type: 'router_no_exit',
+      },
+    });
+  }
   // Say which client actually answered: the transport, and the identity it used.
   const transportName = used && used.mode === 'serve' ? 'opencode-serve' : 'opencode-cli';
   headers['x-router-transport'] = transportName;
@@ -2880,6 +2985,30 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   if (used && used.exit) {
     headers['x-router-exit'] = String(used.exit);
     streamHeaders['x-router-exit'] = String(used.exit);
+  }
+
+  // A kill this box inflicted on itself (the ladder's deadline) is not the upstream
+  // allowance. Parking on it turns a slow model into a phantom daily ceiling and
+  // hides the real cause behind a "free window" message, so it answers as its own
+  // failure and parks nothing.
+  const deadlineKilled = !result.ok && !result.limit && !result.auth
+    && (result.killedBy === 'router-deadline' || /deadline/i.test(String(result.error || '')));
+  if (deadlineKilled) {
+    state.totals.failed += 1;
+    console.warn(`[cli] ${provider.id}/${baseModel}: killed by ${used && used.mode === 'serve' ? 'the serve' : 'the ladder'} deadline after ${result.ms}ms (identity ${used && used.identity ? used.identity : '-'}) - not the allowance, nothing parked`);
+    const secs = 30;
+    if (!res.headersSent) {
+      return sendJson(res, 504, {
+        error: {
+          message: `the opencode CLI was still working when this attempt's deadline ran out and the router killed it (${result.error}). That is a local deadline, not the free allowance - nothing is parked and the tier is still available. Retry, or raise cliAttemptTimeoutMs / cliLadderBudgetMs`,
+          type: 'router_cli_deadline',
+          retryAfterSeconds: secs,
+          transport: 'opencode-cli',
+        },
+      }, { 'retry-after': String(secs) });
+    }
+    if (!res.writableEnded) res.destroy();
+    return;
   }
 
   if (result.limit || result.auth || (!result.ok && exhaustedRetryable)) {
@@ -3006,16 +3135,26 @@ async function opencodeHttp(pathname, { method = 'GET', token = '', body = null,
   const headers = { accept: 'application/json', 'user-agent': openCodeUA({ id: 'signin' }, { id: 'signin' }) };
   if (body) headers['content-type'] = 'application/json';
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`${OPENCODE_CONSOLE}${pathname}`, {
+  const url = `${OPENCODE_CONSOLE}${pathname}`;
+  const payload = body ? JSON.stringify(body) : null;
+  // Console traffic goes through an exit as well. The whole point of this build is
+  // that the operator's own address is never the one the edge - or the console - sees,
+  // so there is no direct fallback here: without an exit this call is refused.
+  const picked = cliProxyEnv({ id: 'opencode-console', proxy: 'rotate' }, { rotate: true });
+  if (!picked.choice) throw new Error('no live v2ray exit: refusing to reach the OpenCode console from the server address');
+  const res = await proxiedRequest(url, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs),
+    body: payload,
+    proxy: { host: '127.0.0.1', port: Number(String(picked.choice.url).split(':').pop()) },
+    timeoutMs,
+    insecure: !!(proxies && proxies.state.settings.insecure),
   });
-  const text = await res.text();
+  const text = await new Response(res.body).text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* html error page */ }
-  return { ok: res.ok, status: res.status, json, text };
+  try { res.cancel(); } catch { /* noop */ }
+  return { ok: !!res.ok, status: res.status, json, text, exit: picked.choice.exit, exitIp: picked.choice.ip };
 }
 
 /** Store a signed-in principal as a new lane, with its own daily allowance. */
@@ -4415,7 +4554,7 @@ async function providerModelIds(provider) {
       // The free tier has no /models to GET: the client itself knows the list, so
       // ask it (`opencode models opencode`). Without this the router advertised an
       // empty catalogue and clients showed "no model available".
-      ids = await cliDriverFor(provider).listModels();
+      ids = await cliDriverFor(provider).listModels({ env: (cliProxyEnv(provider, { rotate: true }).env || {}) });
     } else {
       const spec = modelListRequest(provider, account);
       const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(6000) });

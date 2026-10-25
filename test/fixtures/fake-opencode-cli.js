@@ -32,6 +32,14 @@ process.stdin.on('end', () => {
   // the fixture can tell "the client that was already refused" from "a new one".
   const freshIdentity = /-id\d+$/.test(home);
 
+  // `__HANG__`: the client is alive but never answers, so the only thing that can end
+  // the call is the router's own attempt deadline. That kill must not be mistaken for
+  // a spent allowance.
+  if (input.includes('__HANG__')) {
+    setInterval(() => {}, 1000);
+    return;
+  }
+
   // `__LIMIT__`: everything is spent - every identity is refused, so the router
   // parks. `__ROTATE__`: only the first identity is spent - the rotated one answers,
   // which is what the router's new-identity ladder exists to exploit.

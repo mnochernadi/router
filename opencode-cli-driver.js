@@ -200,10 +200,21 @@ class OpenCodeCliDriver {
         if (cutShort) {
           return {
             ok: false, text: '', limit: true, auth: false, code: -1, signal: '',
+            killedBy: 'limit-line',
             stderr: '', error: 'free allowance spent (the client log said so while the call was still retrying)', ms: Date.now() - started,
           };
         }
-        throw err;
+        // The client hung up: that is the caller's business, not the allowance's.
+        if (signal && signal.aborted) throw err;
+        const attemptDeadlineMs = Math.min(timeoutMs, perAttemptMs);
+        return {
+          ok: false, text: '', limit: false, auth: false, code: -1, signal: '',
+          killedBy: 'router-deadline',
+          deadlineMs: attemptDeadlineMs,
+          stderr: err && err.message ? String(err.message).slice(0, 200) : '',
+          error: `the server did not answer inside this attempt's ${attemptDeadlineMs}ms deadline`,
+          ms: Date.now() - started,
+        };
       } finally {
         stopWatch();
       }
@@ -248,7 +259,7 @@ class OpenCodeCliDriver {
    * is what `/v1/models` and the dashboard show; without it the catalogue is empty
    * and every client complains that no model is available.
    */
-  listModels({ timeoutMs = 30_000, ttlMs = 10 * 60_000 } = {}) {
+  listModels({ timeoutMs = 30_000, ttlMs = 10 * 60_000, env = {} } = {}) {
     const hit = this._models;
     if (hit && Date.now() - hit.at < ttlMs && hit.ids.length) return Promise.resolve(hit.ids);
     return new Promise((resolve) => {
@@ -262,7 +273,8 @@ class OpenCodeCliDriver {
       try { fs.mkdirSync(this.homeDir, { recursive: true, mode: 0o700 }); } catch { /* exists */ }
       const child = spawn(this.binPath, [...this.args, 'models', 'opencode'], {
         cwd: this.homeDir,
-        env: cliEnv(this.homeDir),
+        // The catalogue comes from the network too, so it leaves through the exit.
+        env: cliEnv(this.homeDir, env),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '';
@@ -303,7 +315,7 @@ class OpenCodeCliDriver {
    *
    * @returns {Promise<{ok:boolean,text:string,limit:boolean,auth:boolean,code:number,error:string,ms:number}>}
    */
-  runViaSpawn({ model, prompt, onDelta = null, signal = null, timeoutMs = 300_000, env = {} } = {}) {
+  runViaSpawn({ model, prompt, onDelta = null, signal = null, timeoutMs = 300_000, env = {}, authContent = '' } = {}) {
     const started = Date.now();
     return new Promise((resolve) => {
       if (!this.available()) {
@@ -314,7 +326,16 @@ class OpenCodeCliDriver {
       const args = [...this.args, 'run', '--model', `opencode/${model}`];
       const child = spawn(this.binPath, args, {
         cwd: this.homeDir,
-        env: cliEnv(this.homeDir, env),
+        // `OPENCODE_AUTH_CONTENT` is the client's own credential channel (it sits in
+        // the binary next to `OPENCODE_CONSOLE_TOKEN`): with it the genuine client
+        // speaks for a *principal* instead of the anonymous `public` one, and a
+        // principal carries its own allowance. Every environment this transport
+        // passes also has to carry the exit proxy - the server's own address must
+        // never be the one the edge sees.
+        env: cliEnv(this.homeDir, {
+          ...(authContent ? { OPENCODE_AUTH_CONTENT: authContent } : {}),
+          ...env,
+        }),
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.running += 1;
@@ -335,10 +356,16 @@ class OpenCodeCliDriver {
       };      let stdout = '';
       let stderr = '';
       let finished = false;
+      // A kill this box asked for is not the upstream's answer. Remember which one it
+      // was, so the caller can park a spent allowance without parking a slow model.
+      let timedOut = false;
+      const deadlineMs = Math.max(5_000, timeoutMs);
       const timer = setTimeout(() => {
         if (finished) return;
+        timedOut = true;
+        dbg(`the attempt deadline of ${deadlineMs}ms ran out - killing the child`);
         try { child.kill('SIGKILL'); } catch { /* gone */ }
-      }, Math.max(5_000, timeoutMs));
+      }, deadlineMs);
       if (timer.unref) timer.unref();
 
       const done = (extra = {}) => {
@@ -363,9 +390,13 @@ class OpenCodeCliDriver {
           code: typeof extra.code === 'number' ? extra.code : -1,
           signal: extra.signal || '',
           stderr: detail.slice(0, 300),
+          killedBy: cutShort ? 'limit-line' : (timedOut ? 'router-deadline' : (extra.signal ? String(extra.signal) : (extra.code ? 'exit' : ''))),
+          deadlineMs,
           error: limit
             ? (detail || 'free allowance spent')
-            : (auth ? 'the CLI reports no usable credential' : (extra.signal ? `the CLI was killed (${extra.signal})` : (extra.code ? `the CLI exited ${extra.code}` : ''))),
+            : (auth ? 'the CLI reports no usable credential'
+              : (timedOut ? `the client did not answer inside this attempt's ${deadlineMs}ms deadline, so the router killed it`
+                : (extra.signal ? `the CLI was killed (${extra.signal})` : (extra.code ? `the CLI exited ${extra.code}` : '')))),
           ms: Date.now() - started,
         });
       };
