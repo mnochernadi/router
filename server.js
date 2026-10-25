@@ -4139,6 +4139,13 @@ function providerIsReachable(provider, def) {
   // Same condition the dispatcher uses: only an enabled account can serve a
   // request, so advertising models from a provider with none is a lie. The
   // keyless styles just need no key for discovery.
+  const style = (def || PROVIDER_TYPES[provider.type] || PROVIDER_TYPES.custom).style;
+  // The CLI transport is account-less by design - its "credential" is the genuine
+  // binary itself, which is exactly what makes it the one client the gate serves.
+  if (style === 'opencode-cli') {
+    const driver = cliDriverFor(provider);
+    return driver.available();
+  }
   return (provider.accounts || []).some((a) => a.enabled !== false);
 }
 
@@ -4152,6 +4159,11 @@ async function providerModelIds(provider) {
   try {
     if (provider.type === 'freebuff') {
       ids = (await freebuff.listModels({ provider, account })).map(String);
+    } else if ((PROVIDER_TYPES[provider.type] || {}).style === 'opencode-cli') {
+      // The free tier has no /models to GET: the client itself knows the list, so
+      // ask it (`opencode models opencode`). Without this the router advertised an
+      // empty catalogue and clients showed "no model available".
+      ids = await cliDriverFor(provider).listModels();
     } else {
       const spec = modelListRequest(provider, account);
       const upstream = await fetch(spec.url, { headers: spec.headers, signal: AbortSignal.timeout(6000) });

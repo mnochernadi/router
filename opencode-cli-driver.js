@@ -167,6 +167,51 @@ class OpenCodeCliDriver {
     return this.mode === 'serve' ? this.runViaServe(opts) : this.runViaSpawn(opts);
   }
 
+  /**
+   * The model ids the genuine client knows, cached.
+   *
+   * The free tier has no `/models` endpoint a router may GET: the client's own
+   * catalogue is the source of truth, so ask it (`opencode models opencode`). This
+   * is what `/v1/models` and the dashboard show; without it the catalogue is empty
+   * and every client complains that no model is available.
+   */
+  listModels({ timeoutMs = 30_000, ttlMs = 10 * 60_000 } = {}) {
+    const hit = this._models;
+    if (hit && Date.now() - hit.at < ttlMs && hit.ids.length) return Promise.resolve(hit.ids);
+    return new Promise((resolve) => {
+      if (!this.available() || this.mode === 'serve') {
+        // In serve mode the same catalogue is reachable through the server's own
+        // model list, but the binary ships next to it in practice; if it is absent
+        // we simply have nothing to advertise rather than inventing ids.
+        if (this.mode === 'serve' && this._serveModels) return resolve(this._serveModels);
+        if (!fs.existsSync(this.binPath)) return resolve([]);
+      }
+      try { fs.mkdirSync(this.homeDir, { recursive: true, mode: 0o700 }); } catch { /* exists */ }
+      const child = spawn(this.binPath, [...this.args, 'models', 'opencode'], {
+        cwd: this.homeDir,
+        env: cliEnv(this.homeDir),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, Math.max(5_000, timeoutMs));
+      if (timer.unref) timer.unref();
+      const finish = () => {
+        clearTimeout(timer);
+        const ids = [...new Set(stripAnsi(out)
+          .split('\n')
+          .map((l) => l.trim())
+          .map((l) => (/^opencode\/[A-Za-z0-9._-]+$/.test(l) ? l.replace(/^opencode\//, '') : ''))
+          .filter(Boolean))];
+        if (ids.length) this._models = { at: Date.now(), ids };
+        resolve(ids);
+      };
+      child.stdout.on('data', (c) => { out += c.toString('utf8'); });
+      child.stderr.on('data', (c) => { out += c.toString('utf8'); });
+      child.on('error', finish);
+      child.on('close', finish);
+    });
+  }
+
   version() {
     return new Promise((resolve) => {
       const child = spawn(this.binPath, [...this.args, '--version'], { stdio: ['ignore', 'pipe', 'pipe'] });

@@ -139,7 +139,31 @@ Backed by `oc-serve.service` (`deploy/oc-serve.service`), enabled, bound to
 reply in `{"data":{...}}`, and the message route is `/session/{id}/message` while
 `/api/session/{id}/message` returns the web UI HTML with `200`.
 
-The router does not use this yet — wiring `llm-router` to it needs a provider style,
-because the serve API is OpenCode's own session API and not OpenAI-shaped. Until that
-lands, `:8787` keeps returning `429` and the free tier is reachable only at
-`127.0.0.1:47999`. Full evidence: `.tools/LIVE-VERDICT-2026-10-25.md`.
+The router now uses it. Provider type `opencode-cli` with `cliMode: "serve"` and
+`cliServeUrl: "http://127.0.0.1:47999"` solves the two route traps in the driver
+(`opencode-cli-driver.js`) and presents the answer as an OpenAI `chat.completion` (or
+an SSE stream of the same text). `cliMode: "spawn"` runs `opencode run` per request
+instead, and a serve failure falls back to it automatically.
+
+Measured through `:8787` on 2026-10-25 09:56Z, `exclusiveProvider: "opencode-cli"`:
+three consecutive non-stream requests `200` in 1.73/1.29/1.38s with the model's own
+text, a stream `200` with the first byte at 1.47s and a proper `[DONE]`, router
+memory flat at 26M while `oc-serve` holds ~589M. Two bugs had to be fixed first, both
+of which looked exactly like a hang:
+
+* `MemoryMax=128M` on `llm-router.service` starved the bun child into state `D`
+  (memory reclaim, ~180M RSS) with no output at all. The unit now ships
+  `MemoryMax=512M` / `MemoryHigh=384M` (a drop-in does the same on this box).
+* the child inherited the service environment, including `PORT=8787`/`HOST=0.0.0.0`.
+  The CLI boots local services of its own and hung on the port the router already
+  owns. The driver now passes a minimal env (HOME/XDG/TERM/`NO_COLOR`, PATH/LANG/TZ,
+  plus the exit proxy when the pool is in use).
+
+`cliDry` in `state.json` is this transport's own window: the CLI's limit parks it and
+the router answers `429` with the `00:00 UTC` clock in `Retry-After`. It is kept
+separate from the anonymous API's `freeDry` on purpose — the genuine client is the one
+the gate serves when every forged shape is refused, so a spent forged window must not
+mask it (that bug cost a debugging round: `handleOpenCodeCli` answered `429` without
+ever running the binary).
+
+Full evidence: `.tools/LIVE-VERDICT-2026-10-25.md`.
