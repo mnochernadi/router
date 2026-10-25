@@ -2588,7 +2588,10 @@ function msToNextUtcMidnight() {
  */
 function cliLimitCooldownMs() {
   const minutes = Number(config.cliLimitCooldownMinutes);
-  return Math.max(60_000, (Number.isFinite(minutes) && minutes >= 0 ? minutes : 12) * 60_000);
+  // Measured 2026-10-25: the anonymous window refills in about ten minutes, so a long
+  // cooldown throws away usable time. Four minutes is the default; the ladder retries
+  // on its own and a still-spent window simply parks again.
+  return Math.max(60_000, (Number.isFinite(minutes) && minutes >= 0 ? minutes : 4) * 60_000);
 }
 
 /** The default location of the router's own copy of the CLI. */
@@ -2879,7 +2882,10 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   const startIdentity = Number(state.cliIdentity && state.cliIdentity.next) || 0;
   const budgetMs = (() => {
     const raw = Number(config.cliLadderBudgetMs);
-    return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+    // A warm identity answers in 4-10s, a cold one needs its bootstrap, and the walk
+    // may have to try several: 90s is the shape that actually finishes. The client's
+    // own patience is the real limit, and it gets an answer (or a 429) inside this.
+    return Number.isFinite(raw) && raw > 0 ? raw : 90_000;
   })();
   const ladderStart = Date.now();
   const signedIn = (provider.accounts || []).find((a) => a.signedIn && a.apiKey && a.enabled !== false);
@@ -2918,7 +2924,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     const cold = attempt.mode === 'spawn' && attempt.identity && !cliIdentityIsWarm(provider, attempt.identity);
     const attemptMs = attempt === attempts[0] || cold
       ? timeoutMs
-      : Math.max(8_000, Math.min(timeoutMs, budgetMs - elapsed));
+      : Math.max(25_000, Math.min(timeoutMs, budgetMs - elapsed));
     if (cold) console.warn(`[cli] identity ${attempt.identity} is cold - giving it the full ${timeoutMs}ms ceiling instead of the ladder budget`);
     // Each attempt gets its own exit: the edge must see a v2ray address, never the
     // server's own. When no live exit can be handed over, the attempt is skipped -
