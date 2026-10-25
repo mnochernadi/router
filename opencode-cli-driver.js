@@ -332,8 +332,7 @@ class OpenCodeCliDriver {
           dbg('the limit line appeared - killing the child instead of waiting out its retries');
           try { child.kill('SIGKILL'); } catch { /* already gone */ }
         }
-      };
-      let stdout = '';
+      };      let stdout = '';
       let stderr = '';
       let finished = false;
       const timer = setTimeout(() => {
@@ -348,7 +347,9 @@ class OpenCodeCliDriver {
         clearTimeout(timer);
         this.running -= 1;
         const combined = `${stdout}\n${stderr}`;
-        const limit = LIMIT_RE.test(combined);
+        // `cutShort` matters: the line can arrive split across chunks, in which case
+        // no single chunk matches the pattern even though the child was killed for it.
+        const limit = cutShort || LIMIT_RE.test(combined);
         const auth = !limit && AUTH_RE.test(combined);
         const text = cleanAnswer(stdout);
         // Keep the tail of whatever the CLI said: an unexplained failure is the one

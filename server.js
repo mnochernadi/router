@@ -2609,7 +2609,6 @@ function cliAttemptTimeoutMs(provider) {
   const own = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : cap;
   return Math.max(15_000, Math.min(own, cap));
 }
-
 /**
  * One exit as an HTTPS_PROXY URL.
  *
@@ -2727,7 +2726,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     // A limit is not the only signature of a spent window: a client that is being
     // refused retries with backoff, so a timeout or an aborted call means the same
     // thing. Both rotate; a plain failure (spawn error) does not burn identities.
-    const retryable = result.limit || /timeout|aborted|unreachable|ECONN/i.test(String(result.error || ''));
+    const retryable = result.limit || /timeout|aborted|unreachable|killed|ECONN/i.test(String(result.error || ''));
     if (!retryable) break;
     console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''} came back ${result.limit ? 'limited' : result.error} after ${result.ms}ms - rotating identity and exit`);
   }
