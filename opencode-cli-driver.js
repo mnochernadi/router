@@ -83,7 +83,7 @@ class OpenCodeCliDriver {
    * @param {string[]} [opts.args]   extra leading args (tests point this at a fake)
    * @param {function} [opts.log]
    */
-  constructor({ binPath, homeDir, args = [], mode = 'spawn', serveUrl = '', log = () => {} } = {}) {
+  constructor({ binPath, homeDir, home, args = [], mode = 'spawn', serveUrl = '', serveHome = '', log = () => {} } = {}) {
     this.binPath = binPath;
     // Serve mode needs no HOME of its own, but the log watcher and the spawn mode do,
     // so there is always one (a sane temporary default rather than `undefined`, which
@@ -95,6 +95,11 @@ class OpenCodeCliDriver {
     // ~400M peak). Both present the same genuine client to the gate.
     this.mode = mode === 'serve' ? 'serve' : 'spawn';
     this.serveUrl = String(serveUrl || '').replace(/\/+$/, '');
+    // In serve mode the client that logs is the *server's* process, and its HOME is
+    // its own (`/var/lib/oc-serve` for the shipped unit) - not the router's home
+    // directory. Watching the wrong home made the limit invisible and the call look
+    // like a plain timeout.
+    this.serveHome = serveHome ? String(serveHome) : this.homeDir;
     this.log = log;
     this.running = 0;
   }
@@ -116,8 +121,11 @@ class OpenCodeCliDriver {
    */
   watchLimitInLog(onLimit, { intervalMs = 500 } = {}) {
     let file = null;
+    // Serve mode: the logging process is the server, so its own HOME is the one that
+    // matters. Spawn mode: the child runs with `homeDir`.
+    const logHome = this.mode === 'serve' ? this.serveHome : this.homeDir;
     try {
-      const dir = path.join(this.homeDir, '.local', 'share', 'opencode', 'log');
+      const dir = path.join(logHome, '.local', 'share', 'opencode', 'log');
       const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
       if (!files.length) return () => {};
       file = files

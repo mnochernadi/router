@@ -2541,6 +2541,14 @@ function defaultCliServeUrl() {
   return String(process.env.ROUTER_OPENCODE_SERVE || config.cliServeUrl || 'http://127.0.0.1:47999');
 }
 
+/**
+ * The HOME of the `opencode serve` process, whose log names the truth about the
+ * allowance. The shipped unit runs it with `/var/lib/oc-serve`.
+ */
+function defaultCliServeHome() {
+  return String(process.env.ROUTER_OPENCODE_SERVE_HOME || config.cliServeHome || '/var/lib/oc-serve');
+}
+
 /** One driver, reused unless the provider points somewhere else. */
 function cliDriverFor(provider) {
   const binPath = String(provider.cliPath || defaultCliPath());
@@ -2548,10 +2556,11 @@ function cliDriverFor(provider) {
   const args = Array.isArray(provider.cliArgs) ? provider.cliArgs.map(String) : [];
   const mode = provider.cliMode === 'serve' || (provider.cliMode !== 'spawn' && provider.cliServeUrl) ? 'serve' : 'spawn';
   const serveUrl = String(provider.cliServeUrl || defaultCliServeUrl());
+  const serveHome = String(provider.cliServeHome || defaultCliServeHome());
   if (opencodeCli && opencodeCli.binPath === binPath && opencodeCli.homeDir === homeDir
-    && opencodeCli.mode === mode && opencodeCli.serveUrl === serveUrl
+    && opencodeCli.mode === mode && opencodeCli.serveUrl === serveUrl && opencodeCli.serveHome === serveHome
     && JSON.stringify(opencodeCli.args) === JSON.stringify(args)) return opencodeCli;
-  return new OpenCodeCliDriver({ binPath, homeDir, args, mode, serveUrl, log: (m) => console.warn(m) });
+  return new OpenCodeCliDriver({ binPath, homeDir, serveHome, args, mode, serveUrl, log: (m) => console.warn(m) });
 }
 
 /**
@@ -2715,8 +2724,12 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     result = await attemptDriver.run({ model: baseModel, prompt, timeoutMs, env, signal: controller.signal, onDelta: null });
     used = attempt;
     if (result.ok || result.auth) break;
-    if (!result.limit) break; // a real failure: do not burn identities on it
-    console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''} hit the free allowance after ${result.ms}ms - rotating identity and exit`);
+    // A limit is not the only signature of a spent window: a client that is being
+    // refused retries with backoff, so a timeout or an aborted call means the same
+    // thing. Both rotate; a plain failure (spawn error) does not burn identities.
+    const retryable = result.limit || /timeout|aborted|unreachable|ECONN/i.test(String(result.error || ''));
+    if (!retryable) break;
+    console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''} came back ${result.limit ? 'limited' : result.error} after ${result.ms}ms - rotating identity and exit`);
   }
   if (rotated) {
     state.cliIdentity = { next: ((startIdentity + rotated) % pool) };
