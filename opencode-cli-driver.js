@@ -82,16 +82,89 @@ class OpenCodeCliDriver {
    * @param {string[]} [opts.args]   extra leading args (tests point this at a fake)
    * @param {function} [opts.log]
    */
-  constructor({ binPath, homeDir, args = [], log = () => {} } = {}) {
+  constructor({ binPath, homeDir, args = [], mode = 'spawn', serveUrl = '', log = () => {} } = {}) {
     this.binPath = binPath;
     this.homeDir = homeDir;
     this.args = args;
+    // 'serve' talks to a long-lived `opencode serve` (fast: measured ~1.5s per
+    // answer) and 'spawn' runs a fresh `opencode run` per request (~4-13s, needs
+    // ~400M peak). Both present the same genuine client to the gate.
+    this.mode = mode === 'serve' ? 'serve' : 'spawn';
+    this.serveUrl = String(serveUrl || '').replace(/\/+$/, '');
     this.log = log;
     this.running = 0;
   }
 
   available() {
+    if (this.mode === 'serve') return !!this.serveUrl;
     try { return fs.existsSync(this.binPath); } catch { return false; }
+  }
+
+  /**
+   * Answer through a running `opencode serve`.
+   *
+   * Two route traps, both measured: session creation wraps its reply in
+   * `{"data":{...}}`, and the message route is `/session/<id>/message` - the
+   * `/api/session/<id>/message` spelling returns the web UI's HTML with a 200.
+   */
+  async runViaServe({ model, prompt, timeoutMs = 180_000 } = {}) {
+    const started = Date.now();
+    const post = async (path, body, ms) => {
+      const res = await fetch(`${this.serveUrl}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(ms),
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* not json */ }
+      return { status: res.status, json, text };
+    };
+    try {
+      const created = await post('/api/session', { model: { id: model, providerID: 'opencode' } }, 20_000);
+      const sid = created.json && created.json.data && created.json.data.id;
+      if (!sid) {
+        const limit = LIMIT_RE.test(created.text);
+        return {
+          ok: false, text: '', limit, auth: false, code: created.status, signal: '',
+          stderr: created.text.slice(0, 300),
+          error: limit ? 'free allowance spent' : `session create failed (HTTP ${created.status}): ${created.text.slice(0, 160)}`,
+          ms: Date.now() - started,
+        };
+      }
+      const msg = await post(`/session/${sid}/message`, { parts: [{ type: 'text', text: prompt }] }, timeoutMs);
+      const combined = `${msg.text}\n${JSON.stringify(msg.json || {})}`;
+      const limit = LIMIT_RE.test(combined);
+      const auth = !limit && AUTH_RE.test(combined);
+      const parts = msg.json && Array.isArray(msg.json.parts) ? msg.json.parts : [];
+      const text = parts
+        .filter((p) => p && p.text && (!p.type || p.type === 'text'))
+        .map((p) => String(p.text))
+        .join('')
+        .trim();
+      const detail = parts.map((p) => p.text || p.type).filter(Boolean).join(' | ').slice(0, 300);
+      return {
+        ok: !limit && !auth && text.length > 0,
+        text,
+        limit,
+        auth,
+        code: msg.status,
+        signal: '',
+        stderr: detail,
+        error: limit ? 'free allowance spent' : (auth ? 'the server reports no usable credential' : (text ? '' : `the server answered without text (HTTP ${msg.status})`)),
+        ms: Date.now() - started,
+      };
+    } catch (err) {
+      return {
+        ok: false, text: '', limit: false, auth: false, code: -1, signal: '',
+        stderr: err.message, error: `opencode serve unreachable at ${this.serveUrl}: ${err.message}`, ms: Date.now() - started,
+      };
+    }
+  }
+
+  run(opts = {}) {
+    return this.mode === 'serve' ? this.runViaServe(opts) : this.runViaSpawn(opts);
   }
 
   version() {
@@ -112,7 +185,7 @@ class OpenCodeCliDriver {
    *
    * @returns {Promise<{ok:boolean,text:string,limit:boolean,auth:boolean,code:number,error:string,ms:number}>}
    */
-  run({ model, prompt, onDelta = null, signal = null, timeoutMs = 300_000, env = {} } = {}) {
+  runViaSpawn({ model, prompt, onDelta = null, signal = null, timeoutMs = 300_000, env = {} } = {}) {
     const started = Date.now();
     return new Promise((resolve) => {
       if (!this.available()) {

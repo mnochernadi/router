@@ -1868,6 +1868,59 @@ async function memOf() {
     }
   }
 
+  // 29. The `opencode serve` transport: the same genuine client, reached through a
+  //     long-lived server instead of a fresh spawn per request. Unit-tested against
+  //     a fake server here (fast, offline); the router path is the same handler the
+  //     spawn tests above exercise.
+  {
+    const { OpenCodeCliDriver } = require('../opencode-cli-driver.js');
+    const fake = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        if (req.method === 'POST' && req.url === '/api/session') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ data: { id: 'ses_fake_serve' } }));
+        }
+        if (req.method === 'POST' && req.url === '/session/ses_fake_serve/message') {
+          const parsed = JSON.parse(body || '{}');
+          const text = (parsed.parts || []).map((p) => p.text || '').join(' ');
+          res.writeHead(200, { 'content-type': 'application/json' });
+          if (/__LIMIT__/.test(text)) {
+            return res.end(JSON.stringify({ info: { error: { message: 'Free usage limit reached' } }, parts: [] }));
+          }
+          return res.end(JSON.stringify({ info: { modelID: 'big-pickle' }, parts: [{ type: 'text', text: `SERVE OK: ${text.slice(0, 40)}` }] }));
+        }
+        // The trap: the prefixed spelling answers the web UI with a 200.
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<!doctype html><html></html>');
+      });
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+    const serveUrl = `http://127.0.0.1:${fake.address().port}`;
+    try {
+      const driver = new OpenCodeCliDriver({ mode: 'serve', serveUrl, log: () => {} });
+      check('serve transport: available() follows the URL, not a binary', driver.available() === true);
+
+      const ok = await driver.run({ model: 'big-pickle', prompt: 'hello serve' });
+      check('serve transport: an answer comes from the session message route',
+        ok.ok === true && ok.text.includes('SERVE OK') && ok.code === 200,
+        JSON.stringify({ ok: ok.ok, text: ok.text, code: ok.code, error: ok.error }));
+
+      const limited = await driver.run({ model: 'big-pickle', prompt: '__LIMIT__ now' });
+      check('serve transport: the limit is detected from the body, not from a status code',
+        limited.limit === true && limited.ok === false && limited.code === 200,
+        JSON.stringify({ limit: limited.limit, ok: limited.ok, code: limited.code }));
+
+      const dead = new OpenCodeCliDriver({ mode: 'serve', serveUrl: 'http://127.0.0.1:1', log: () => {} });
+      const unreachable = await dead.run({ model: 'big-pickle', prompt: 'hi' });
+      check('serve transport: an unreachable server is reported, never a silent hang',
+        unreachable.ok === false && /unreachable/.test(unreachable.error), unreachable.error);
+    } finally {
+      fake.close();
+    }
+  }
+
   console.log('\n==================== RESULTS ====================');
   console.log(results.join('\n'));
   console.log(`\n  ${pass} passed, ${fail} failed`);

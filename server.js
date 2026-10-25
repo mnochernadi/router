@@ -327,6 +327,10 @@ function normalizeProvider(p) {
     cliPath: p.cliPath ? String(p.cliPath) : undefined,
     cliHome: p.cliHome ? String(p.cliHome) : undefined,
     cliArgs: Array.isArray(p.cliArgs) && p.cliArgs.length ? p.cliArgs.map(String) : undefined,
+    // 'serve' prefers a long-lived `opencode serve`; 'spawn' runs a fresh binary
+    // per request. Both are the genuine client as far as the gate is concerned.
+    cliMode: p.cliMode === 'serve' || p.cliMode === 'spawn' ? p.cliMode : undefined,
+    cliServeUrl: p.cliServeUrl ? String(p.cliServeUrl) : undefined,
     // Time-boxed rotation: keep one account for N minutes, then switch. 0 = off.
     rotateEveryMinutes: Number(p.rotateEveryMinutes) > 0 ? Number(p.rotateEveryMinutes) : 0,
     // Free-tier identity lanes: how many identities run in parallel, each with
@@ -2514,14 +2518,26 @@ function defaultCliPath() {
   return String(process.env.ROUTER_OPENCODE_CLI || config.cliPath || '/opt/llm-router/bin/opencode');
 }
 
+/**
+ * The long-lived `opencode serve` this router may talk to instead of spawning the
+ * binary per request. Measured: ~1.5s per answer through the server against ~4-13s
+ * for a fresh spawn, and no ~400M memory spike per request.
+ */
+function defaultCliServeUrl() {
+  return String(process.env.ROUTER_OPENCODE_SERVE || config.cliServeUrl || 'http://127.0.0.1:47999');
+}
+
 /** One driver, reused unless the provider points somewhere else. */
 function cliDriverFor(provider) {
   const binPath = String(provider.cliPath || defaultCliPath());
   const homeDir = String(provider.cliHome || path.join(DATA_DIR, 'oc-cli-home'));
   const args = Array.isArray(provider.cliArgs) ? provider.cliArgs.map(String) : [];
+  const mode = provider.cliMode === 'serve' || (provider.cliMode !== 'spawn' && provider.cliServeUrl) ? 'serve' : 'spawn';
+  const serveUrl = String(provider.cliServeUrl || defaultCliServeUrl());
   if (opencodeCli && opencodeCli.binPath === binPath && opencodeCli.homeDir === homeDir
+    && opencodeCli.mode === mode && opencodeCli.serveUrl === serveUrl
     && JSON.stringify(opencodeCli.args) === JSON.stringify(args)) return opencodeCli;
-  return new OpenCodeCliDriver({ binPath, homeDir, args, log: (m) => console.warn(m) });
+  return new OpenCodeCliDriver({ binPath, homeDir, args, mode, serveUrl, log: (m) => console.warn(m) });
 }
 
 function cliStreamChunk(model, text, finish = null) {
@@ -2564,7 +2580,9 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     state.totals.failed += 1;
     return sendJson(res, 503, {
       error: {
-        message: `the OpenCode CLI is not installed at ${driver.binPath} - install it (install.sh --with-opencode-cli) or set cliPath on this provider`,
+        message: driver.mode === 'serve'
+          ? `the opencode serve transport has no URL configured (cliServeUrl) - set it, or use cliMode "spawn"`
+          : `the OpenCode CLI is not installed at ${driver.binPath} - install it (install.sh --with-opencode-cli) or set cliPath on this provider`,
         type: 'router_cli_missing',
       },
     });
@@ -2575,7 +2593,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   const headers = baseResponseHeaders(200, wantsStream ? 'text/event-stream' : 'application/json; charset=utf-8', provider);
   headers['x-router-account'] = 'cli';
   headers['x-router-model'] = baseModel;
-  headers['x-router-transport'] = 'opencode-cli';
+  headers['x-router-transport'] = driver.mode === 'serve' ? 'opencode-serve' : 'opencode-cli';
   const streamHeaders = { ...headers, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' };
 
   // The CLI honours HTTPS_PROXY (measured), so the exit pool still applies to it.
@@ -2589,7 +2607,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   res.on('close', () => { if (!res.writableEnded) controller.abort(); });
   const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 300_000;
 
-  const result = await driver.run({
+  let result = await driver.run({
     model: baseModel,
     prompt,
     timeoutMs,
@@ -2603,6 +2621,16 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
       }
       : null,
   });
+
+  // The long-lived server is the fast path, but it is a separate service: if it is
+  // down or wedged, fall back to spawning the binary rather than failing the caller.
+  if (!result.ok && !result.limit && !result.auth && !result.text && driver.mode === 'serve') {
+    const spawned = new OpenCodeCliDriver({ binPath: driver.binPath, homeDir: driver.homeDir, args: driver.args, mode: 'spawn', log: (m) => console.warn(m) });
+    if (spawned.available()) {
+      console.warn(`[cli] serve transport failed (${result.error}); falling back to a per-request spawn`);
+      result = await spawned.run({ model: baseModel, prompt, timeoutMs, env, signal: controller.signal, onDelta: null });
+    }
+  }
 
   if (result.limit || result.auth) {
     const wait = msToNextUtcMidnight();
@@ -4986,6 +5014,8 @@ function boot() {
     binPath: defaultCliPath(),
     homeDir: path.join(DATA_DIR, 'oc-cli-home'),
     args: Array.isArray(config.cliArgs) ? config.cliArgs.map(String) : [],
+    mode: config.cliMode === 'serve' ? 'serve' : 'spawn',
+    serveUrl: defaultCliServeUrl(),
     log: (m) => console.warn(m),
   });
   server.listen(config.port, config.host, () => {
