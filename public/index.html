@@ -887,6 +887,39 @@
       </div>
     </div>
 
+    <div class="mb-4 rounded-xl border border-accent/25 bg-accent/[0.05] p-3" x-show="pd && pd.cli" x-cloak>
+      <div class="mb-2 flex flex-wrap items-center gap-2">
+        <i data-lucide="terminal" class="h-4 w-4 text-accent"></i>
+        <span class="text-[11px] uppercase tracking-wider text-slate-300">Genuine-client transport</span>
+        <span class="pill bg-ink-800 text-slate-300" x-text="pd && pd.cli ? pd.cli.mode : ''"></span>
+        <span class="pill" :class="pd && pd.cli && pd.cli.serveOk ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'"
+          x-text="pd && pd.cli ? (pd.cli.serveOk ? 'serve healthy' : 'serve unreachable') : ''"></span>
+        <span class="pill" :class="pd && pd.cli && pd.cli.cooldownUntil ? 'bg-amber-500/10 text-amber-300' : 'bg-emerald-500/10 text-emerald-300'"
+          x-text="pd && pd.cli ? (pd.cli.cooldownUntil ? ('cooling ' + pd.cli.cooldownSeconds + 's') : 'ready') : ''"></span>
+        <button class="btn ml-auto" @click="resetCliCooldown(pd, false)" title="Clear the cooldown: the next request walks the identity ladder again">
+          <i data-lucide="play" class="h-3.5 w-3.5"></i>Retry now</button>
+        <button class="btn" @click="resetCliCooldown(pd, true)" title="Clear the cooldown and warm the identity pool in the background (a cold install takes a minute)">
+          <i data-lucide="flame" class="h-3.5 w-3.5"></i>Retry + warm</button>
+      </div>
+      <div class="mono grid gap-1 text-[11px] text-slate-400">
+        <span>serve <span class="text-slate-200" x-text="pd && pd.cli ? pd.cli.serveUrl : ''"></span>
+          · its home <span class="text-slate-200" x-text="pd && pd.cli ? pd.cli.serveHome : ''"></span></span>
+        <span>binary <span class="text-slate-200" x-text="pd && pd.cli ? pd.cli.cliPath : ''"></span>
+          <span class="pill ml-1" :class="pd && pd.cli && pd.cli.cliPathPresent ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'"
+            x-text="pd && pd.cli ? (pd.cli.cliPathPresent ? 'present' : 'missing') : ''"></span></span>
+        <span>identities <span class="text-slate-200" x-text="pd && pd.cli ? (pd.cli.warmCount + ' warm / ' + pd.cli.identityPool + ' in the pool') : ''"></span>
+          · ladder budget <span class="text-slate-200" x-text="pd && pd.cli ? (Math.round(pd.cli.ladderBudgetMs / 1000) + 's') : ''"></span>
+          · cooldown <span class="text-slate-200" x-text="pd && pd.cli ? (pd.cli.cooldownMinutes + 'm') : ''"></span>
+          · cooldowns so far <span class="text-slate-200" x-text="pd && pd.cli ? pd.cli.attempts : ''"></span></span>
+        <template x-for="id in (pd && pd.cli ? pd.cli.identities : [])" :key="id.index">
+          <span>identity <span class="text-slate-200" x-text="id.index"></span>
+            <span class="pill ml-1" :class="id.warm ? 'bg-emerald-500/10 text-emerald-300' : 'bg-slate-500/10 text-slate-400'" x-text="id.warm ? 'warm' : 'cold'"></span>
+            <span class="text-slate-500" x-text="id.home"></span></span>
+        </template>
+        <span x-show="pd && pd.cli && pd.cli.cooldownUntil">next automatic retry <span class="text-slate-200" x-text="pd && pd.cli ? new Date(pd.cli.cooldownUntil).toISOString() : ''"></span></span>
+      </div>
+    </div>
+
     <div class="mb-2 flex flex-wrap items-center gap-2">
       <span class="text-[11px] uppercase tracking-wider text-slate-500">Accounts</span>
       <button class="btn" x-show="pd && pd.proxy === 'rotate'" @click="nextExit(pd)"><i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i>Next IP</button>
@@ -1611,6 +1644,17 @@ function app() {
     // is rebuilt - the free tier runs several so a spent one never blocks.
     // The operator's own recipe in one call: drop the client, move the IP, install
     // a new identity - then report what the edge answered, so the result is a fact.
+    async resetCliCooldown(p, warm) {
+      if (!p) return;
+      try {
+        await this.api('/admin/api/provider/' + encodeURIComponent(p.id) + '/cli/reset', { method: 'POST', body: { warm: !!warm } });
+        this.toast(warm
+          ? `${p.id}: cooldown cleared and the identity pool is warming in the background`
+          : `${p.id}: cooldown cleared - the next request walks the identity ladder again`, 'ok');
+        await this.load(true);
+      } catch (err) { this.toast(err.message, 'err'); }
+    },
+
     async recycleLanes(p) {
       try {
         const r = await this.api('/proxies/provider/' + encodeURIComponent(p.id) + '/recycle', { method: 'POST', body: { allLanes: true, reason: 'dashboard' } });

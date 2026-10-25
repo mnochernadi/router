@@ -825,12 +825,70 @@ function accountSummary(provider, account) {
   };
 }
 
+// The `opencode serve` health, cached: the dashboard asks for state on every poll
+// and this transport is a process that is either there or not.
+const cliServeHealth = { at: 0, ok: false, url: '' };
+
+async function cliServeStatus(provider) {
+  const url = String(provider.cliServeUrl || defaultCliServeUrl());
+  if (Date.now() - cliServeHealth.at < 15_000 && cliServeHealth.url === url) return cliServeHealth.ok;
+  let ok = false;
+  try {
+    const res = await fetch(`${url.replace(/\/+$/, '')}/api/health`, { signal: AbortSignal.timeout(2500) });
+    ok = res.ok;
+  } catch { ok = false; }
+  cliServeHealth.at = Date.now();
+  cliServeHealth.url = url;
+  cliServeHealth.ok = ok;
+  return ok;
+}
+
+/**
+ * What the dashboard shows for a CLI-transport provider.
+ *
+ * The provider has no accounts and no base URL, so the generic card renders empty -
+ * which is exactly what an operator saw after this transport landed: "there is
+ * nothing in the dashboard". This block is the transport's own panel.
+ */
+function cliSummary(provider) {
+  const style = (PROVIDER_TYPES[provider.type] || {}).style;
+  if (style !== 'opencode-cli') return undefined;
+  const pool = cliIdentityPool(provider);
+  const identities = [];
+  for (let i = 1; i <= pool; i += 1) {
+    const home = cliIdentityHome(provider, i);
+    const warm = fs.existsSync(path.join(home, '.local', 'share', 'opencode', 'opencode.db'));
+    identities.push({ index: i, home, warm });
+  }
+  const mode = provider.cliMode === 'serve' || (provider.cliMode !== 'spawn' && provider.cliServeUrl) ? 'serve' : 'spawn';
+  return {
+    mode,
+    serveUrl: String(provider.cliServeUrl || defaultCliServeUrl()),
+    serveHome: String(provider.cliServeHome || defaultCliServeHome()),
+    serveOk: cliServeHealth.url === String(provider.cliServeUrl || defaultCliServeUrl()) ? cliServeHealth.ok : null,
+    cliPath: String(provider.cliPath || defaultCliPath()),
+    cliPathPresent: fs.existsSync(String(provider.cliPath || defaultCliPath())),
+    identityPool: pool,
+    identities,
+    warmCount: identities.filter((x) => x.warm).length,
+    cooldownUntil: cliDry.until > now() ? cliDry.until : 0,
+    cooldownSeconds: cliDry.until > now() ? Math.round((cliDry.until - now()) / 1000) : 0,
+    cooldownMinutes: Math.round(cliLimitCooldownMs() / 60_000),
+    ladderBudgetMs: (() => {
+      const raw = Number(config.cliLadderBudgetMs);
+      return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+    })(),
+    attempts: cliDry.hits || 0,
+  };
+}
+
 function providerSummary(provider) {
   const accounts = (provider.accounts || []).map((a) => accountSummary(provider, a));
   return {
     id: provider.id,
     name: provider.name,
     type: provider.type,
+    cli: cliSummary(provider),
     baseUrl: provider.baseUrl,
     strategy: provider.strategy,
     cooldownHours: clampHours(provider.cooldownHours ?? config.cooldownHours),
@@ -2707,9 +2765,10 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     const wait = Math.max(1, Math.round((parked - now()) / 1000));
     return sendJson(res, 429, {
       error: {
-        message: `the opencode CLI reports its free allowance is spent; it returns at ${new Date(parked).toISOString()}`,
-        type: 'router_free_day_ceiling',
+        message: `the free window is cooling down: every client identity the router can mint came back limited or silent, so the next automatic retry is at ${new Date(parked).toISOString()} (${Math.max(1, Math.round(wait / 60))} minute(s) away). Nothing is broken and nothing needs doing - the router resumes by itself`,
+        type: 'router_free_window',
         retryAfterSeconds: wait,
+        resetsAt: new Date(parked).toISOString(),
       },
     }, { 'retry-after': String(wait) });
   }
@@ -4485,6 +4544,23 @@ async function handleAdmin(req, res, url) {
   // with the other pool routes), so either URL the operator guesses works.
   if (method === 'POST' && a === 'provider' && b && c === 'recycle') {
     return handleRecycle(req, res, findProvider(b));
+  }
+
+  // ---- the CLI transport's own controls ------------------------------------
+  // "Retry now" from the dashboard: clear the cooldown so the next request walks
+  // the ladder again instead of waiting it out. Optionally re-warm the identities.
+  if (method === 'POST' && a === 'provider' && b && c === 'cli' && d === 'reset') {
+    const provider = findProvider(b);
+    if (!provider) return sendJson(res, 404, { error: { message: `no provider "${b}"` } });
+    const body = await readJsonBody(req).catch(() => ({}));
+    clearCliDry('dashboard retry');
+    cliDry.hits = 0;
+    state.cliDry = { until: 0, hits: 0 };
+    persistState();
+    if (body && body.warm) {
+      warmCliIdentities(provider).catch((err) => console.warn(`[cli] warm-up failed: ${err.message}`));
+    }
+    return sendJson(res, 200, { ok: true, provider: providerSummary(provider) });
   }
 
   // ---- sign-in: add a principal (its own daily allowance) ------------------
