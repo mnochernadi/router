@@ -2596,6 +2596,31 @@ function cliIdentityPool(provider) {
 }
 
 /**
+ * Warm the identity pool in the background.
+ *
+ * A fresh HOME is a *cold* installation: its first run pays for the client's own
+ * bootstrap (measured about a minute), which no request budget can afford - a cold
+ * identity therefore always timed out before it could answer. Warming happens once,
+ * at boot, one identity at a time and without an exit (the bootstrap is not slowed by
+ * a proxy); after that a rotated identity answers in seconds, which is what makes
+ * "new identity, new address, retry" actually deliver.
+ */
+async function warmCliIdentities(provider) {
+  const pool = cliIdentityPool(provider);
+  const model = String(provider.warmModel || config.cliWarmModel || 'deepseek-v4.1-flash-free');
+  for (let i = 1; i <= pool; i += 1) {
+    const home = cliIdentityHome(provider, i);
+    if (fs.existsSync(path.join(home, '.local', 'share', 'opencode', 'opencode.db'))) continue;
+    const driver = cliSpawnDriver(provider, i);
+    if (!driver.available()) return;
+    const t0 = now();
+    // eslint-disable-next-line no-await-in-loop
+    const r = await driver.run({ model, prompt: 'warm-up: reply with just ok', timeoutMs: 240_000 });
+    console.warn(`[cli] warmed identity ${i} in ${now() - t0}ms (${r.ok ? 'answered' : r.limit ? 'limited' : r.error || 'failed'})`);
+  }
+}
+
+/**
  * One attempt's ceiling.
  *
  * Not the provider's 300s: a limited client retries with backoff, so a long ceiling
@@ -2740,6 +2765,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   let result = null;
   let used = attempts[0];
   let rotated = 0;
+  let exhaustedRetryable = false;
   for (const attempt of attempts) {
     // A fresh identity is a *cold* installation: its first run pays for the client's
     // own bootstrap (measured ~1 minute), so the walk is time-boxed - the client gets
@@ -2770,6 +2796,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     // refused retries with backoff, so a timeout or an aborted call means the same
     // thing. Both rotate; a plain failure (spawn error) does not burn identities.
     const retryable = result.limit || /timeout|aborted|unreachable|killed|ECONN/i.test(String(result.error || ''));
+    if (retryable) exhaustedRetryable = true;
     if (!retryable) break;
     console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''}${attempt.exit ? ` via exit ${attempt.exit} (${attempt.exitIp})` : ''} came back ${result.limit ? 'limited' : result.error} after ${result.ms}ms - rotating identity and exit`);
   }
@@ -2790,7 +2817,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     streamHeaders['x-router-exit'] = String(used.exit);
   }
 
-  if (result.limit || result.auth) {
+  if (result.limit || result.auth || (!result.ok && exhaustedRetryable)) {
     const wait = result.auth ? msToNextUtcMidnight() : cliLimitCooldownMs();
     parkCliTier(wait, result.error);
     state.totals.failed += 1;
@@ -2800,7 +2827,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
         error: {
           message: result.auth
             ? `the opencode CLI reports no usable credential; it needs a sign-in or a key, and the transport stays parked until ${new Date(now() + wait).toISOString()}`
-            : `the opencode CLI reports its free allowance is spent (${result.error || 'free usage limit reached'}); this window refills, so the transport cools down for ${Math.round(wait / 60_000)} minute(s) and resumes by itself`,
+            : `every client identity the router can mint came back limited or silent (last: ${result.error || 'killed'}); this window refills, so the transport cools down for ${Math.round(wait / 60_000)} minute(s) and resumes by itself`,
           type: result.auth ? 'router_cli_auth' : 'router_free_window',
           retryAfterSeconds: secs,
         },
@@ -5220,6 +5247,16 @@ function boot() {
   // Scheduled upkeep: re-fetch the subscriptions, test what is new, fold the
   // working exits into the pool. Default every 12h; see the Network tab.
   proxies.startScheduler();
+  // A rotated identity only helps if it is warm by the time it is needed, and its
+  // first run is far too slow to fit in a request. Warm the CLI identity pool in the
+  // background, after the exits are up so the choice of exit is real.
+  for (const provider of config.providers) {
+    if ((PROVIDER_TYPES[provider.type] || {}).style !== 'opencode-cli') continue;
+    if (config.cliWarmIdentities === false) continue;
+    setTimeout(() => {
+      warmCliIdentities(provider).catch((err) => console.warn(`[cli] identity warm-up failed: ${err.message}`));
+    }, 5000).unref?.();
+  }
 }
 
 async function shutdown(signal) {
