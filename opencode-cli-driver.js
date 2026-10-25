@@ -34,6 +34,39 @@ function stripAnsi(text) {
   return String(text || '').replace(ANSI_RE, '').replace(/\r/g, '');
 }
 
+/**
+ * The environment the child gets.
+ *
+ * The CLI is a *server* application as well as a client: it boots its own local
+ * services (its debug log shows "booting location services", "watcher backend",
+ * "disposing instance"). Inheriting the router's service environment therefore
+ * handed it `PORT=8787` and `HOST=0.0.0.0` - the ports the router itself is
+ * listening on - and the child sat there without a byte of output while the router
+ * waited. Measured: the same binary, same HOME, same arguments answers in ~4s from a
+ * shell and under a plain systemd unit, and hung only when it inherited those
+ * variables.
+ *
+ * So the child gets a *minimal* environment: what a login-ish shell would provide,
+ * plus this transport's own HOME and anything the caller deliberately adds (the exit
+ * proxy). Nothing of the router's service configuration leaks in.
+ */
+function cliEnv(homeDir, extra = {}) {
+  const base = {
+    HOME: homeDir,
+    XDG_CONFIG_HOME: path.join(homeDir, '.config'),
+    XDG_DATA_HOME: path.join(homeDir, '.local', 'share'),
+    XDG_CACHE_HOME: path.join(homeDir, '.cache'),
+    XDG_STATE_HOME: path.join(homeDir, '.local', 'state'),
+    NO_COLOR: '1',
+    TERM: 'dumb',
+    CI: '1',
+  };
+  for (const key of ['PATH', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR']) {
+    if (process.env[key]) base[key] = process.env[key];
+  }
+  return { ...base, ...extra };
+}
+
 /** The assistant's words, with the CLI's banner and chrome removed. */
 function cleanAnswer(stdout) {
   const lines = stripAnsi(stdout).split('\n').map((l) => l.trimEnd());
@@ -90,15 +123,7 @@ class OpenCodeCliDriver {
       const args = [...this.args, 'run', '--model', `opencode/${model}`];
       const child = spawn(this.binPath, args, {
         cwd: this.homeDir,
-        env: {
-          ...process.env,
-          HOME: this.homeDir,
-          XDG_CONFIG_HOME: path.join(this.homeDir, '.config'),
-          XDG_DATA_HOME: path.join(this.homeDir, '.local', 'share'),
-          XDG_CACHE_HOME: path.join(this.homeDir, '.cache'),
-          NO_COLOR: '1',
-          ...env,
-        },
+        env: cliEnv(this.homeDir, env),
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.running += 1;
