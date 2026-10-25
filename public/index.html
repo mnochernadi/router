@@ -892,8 +892,8 @@
         <i data-lucide="terminal" class="h-4 w-4 text-accent"></i>
         <span class="text-[11px] uppercase tracking-wider text-slate-300">Genuine-client transport</span>
         <span class="pill bg-ink-800 text-slate-300" x-text="pd && pd.cli ? pd.cli.mode : ''"></span>
-        <span class="pill" :class="pd && pd.cli && pd.cli.serveOk ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'"
-          x-text="pd && pd.cli ? (pd.cli.serveOk ? 'serve healthy' : 'serve unreachable') : ''"></span>
+        <span class="pill" :class="pd && pd.cli && pd.cli.serveOk === true ? 'bg-emerald-500/10 text-emerald-300' : (pd && pd.cli && pd.cli.serveOk === false ? 'bg-rose-500/10 text-rose-300' : 'bg-ink-800 text-slate-400')"
+          x-text="pd && pd.cli ? (pd.cli.serveOk === true ? 'serve healthy' : (pd.cli.serveOk === false ? 'serve unreachable' : 'serve checking')) : ''"></span>
         <span class="pill" :class="pd && pd.cli && pd.cli.cooldownUntil ? 'bg-amber-500/10 text-amber-300' : 'bg-emerald-500/10 text-emerald-300'"
           x-text="pd && pd.cli ? (pd.cli.cooldownUntil ? ('cooling ' + pd.cli.cooldownSeconds + 's') : 'ready') : ''"></span>
         <button class="btn ml-auto" @click="resetCliCooldown(pd, false)" title="Clear the cooldown: the next request walks the identity ladder again">

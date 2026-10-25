@@ -842,7 +842,6 @@ async function cliServeStatus(provider) {
   cliServeHealth.ok = ok;
   return ok;
 }
-
 /**
  * What the dashboard shows for a CLI-transport provider.
  *
@@ -861,11 +860,18 @@ function cliSummary(provider) {
     identities.push({ index: i, home, warm });
   }
   const mode = provider.cliMode === 'serve' || (provider.cliMode !== 'spawn' && provider.cliServeUrl) ? 'serve' : 'spawn';
+  const serveUrl = String(provider.cliServeUrl || defaultCliServeUrl());
+  const known = cliServeHealth.url === serveUrl && cliServeHealth.at > 0;
+  // Keep the dashboard's answer fresh without making the state payload wait on a
+  // network call: refresh in the background, report what is known right now.
+  if (!known || Date.now() - cliServeHealth.at > 15_000) {
+    cliServeStatus(provider).catch(() => {});
+  }
   return {
     mode,
-    serveUrl: String(provider.cliServeUrl || defaultCliServeUrl()),
+    serveUrl,
     serveHome: String(provider.cliServeHome || defaultCliServeHome()),
-    serveOk: cliServeHealth.url === String(provider.cliServeUrl || defaultCliServeUrl()) ? cliServeHealth.ok : null,
+    serveOk: known ? cliServeHealth.ok : null,
     cliPath: String(provider.cliPath || defaultCliPath()),
     cliPathPresent: fs.existsSync(String(provider.cliPath || defaultCliPath())),
     identityPool: pool,
