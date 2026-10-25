@@ -2725,6 +2725,11 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
    */
   const pool = cliIdentityPool(provider);
   const startIdentity = Number(state.cliIdentity && state.cliIdentity.next) || 0;
+  const budgetMs = (() => {
+    const raw = Number(config.cliLadderBudgetMs);
+    return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+  })();
+  const ladderStart = Date.now();
   const attempts = [];
   if (driver.mode === 'serve') attempts.push({ mode: 'serve', identity: null, rotateExit: false });
   for (let i = 0; i < pool; i += 1) {
@@ -2736,6 +2741,16 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   let used = attempts[0];
   let rotated = 0;
   for (const attempt of attempts) {
+    // A fresh identity is a *cold* installation: its first run pays for the client's
+    // own bootstrap (measured ~1 minute), so the walk is time-boxed - the client gets
+    // an answer (or the cooldown) inside the budget, and the identity it touched is
+    // warm for the next request.
+    const elapsed = Date.now() - ladderStart;
+    if (attempt !== attempts[0] && elapsed >= budgetMs) {
+      console.warn(`[cli] ladder budget of ${budgetMs}ms is spent - not minting another identity for this request`);
+      break;
+    }
+    const attemptMs = attempt === attempts[0] ? timeoutMs : Math.max(8_000, Math.min(timeoutMs, budgetMs - elapsed));
     // Each attempt gets its own exit when the pool is live: a new identity from the
     // same address is only half of "a new client".
     const env = {};
@@ -2748,7 +2763,7 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
     const attemptDriver = attempt.mode === 'serve' ? driver : cliSpawnDriver(provider, attempt.identity);
     if (!attemptDriver.available()) continue;
     if (attempt !== attempts[0]) rotated += 1;
-    result = await attemptDriver.run({ model: baseModel, prompt, timeoutMs, env, signal: controller.signal, onDelta: null });
+    result = await attemptDriver.run({ model: baseModel, prompt, timeoutMs: attemptMs, env, signal: controller.signal, onDelta: null });
     used = attempt;
     if (result.ok || result.auth) break;
     // A limit is not the only signature of a spent window: a client that is being
