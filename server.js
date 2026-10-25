@@ -2554,6 +2554,52 @@ function cliDriverFor(provider) {
   return new OpenCodeCliDriver({ binPath, homeDir, args, mode, serveUrl, log: (m) => console.warn(m) });
 }
 
+/**
+ * The HOME of one client identity.
+ *
+ * A fresh HOME is a fresh installation of the genuine client - the only "new
+ * identity" this transport has, because the anonymous tier carries no token to
+ * rotate (the client sends the literal `public`). Measured 2026-10-25: a fresh
+ * identity answered while the previous one reported the limit, so identities are
+ * minted into a small pool and paired with a different exit when one runs dry.
+ */
+function cliIdentityHome(provider, identity) {
+  const base = String(provider.cliHome || path.join(DATA_DIR, 'oc-cli-home'));
+  return identity ? `${base}-id${identity}` : base;
+}
+
+/** A spawn-mode driver bound to one identity's HOME. */
+function cliSpawnDriver(provider, identity) {
+  return new OpenCodeCliDriver({
+    binPath: String(provider.cliPath || defaultCliPath()),
+    homeDir: cliIdentityHome(provider, identity),
+    args: Array.isArray(provider.cliArgs) ? provider.cliArgs.map(String) : [],
+    mode: 'spawn',
+    log: (m) => console.warn(m),
+  });
+}
+
+/** How many client identities this provider may mint (one HOME each). */
+function cliIdentityPool(provider) {
+  const raw = provider.cliIdentityPool !== undefined ? provider.cliIdentityPool : config.cliIdentityPool;
+  const n = Number(raw);
+  return Math.max(1, Math.min(8, Number.isFinite(n) && n > 0 ? Math.floor(n) : 3));
+}
+
+/**
+ * One exit as an HTTPS_PROXY URL.
+ *
+ * `pick()` hands back a wrapper (`{ mode, exit, proxy }`) while `rotate()` hands back
+ * the exit itself, so both shapes are accepted here rather than at every call site.
+ */
+function cliExitEnv(picked) {
+  if (!picked) return null;
+  const proxy = picked.proxy
+    || (proxies && picked.id !== undefined ? { host: '127.0.0.1', port: proxies.portForExit(picked) } : null);
+  if (!proxy || !proxy.host || !proxy.port) return null;
+  return `http://${proxy.host}:${proxy.port}`;
+}
+
 function cliStreamChunk(model, text, finish = null) {
   return `data: ${JSON.stringify({
     id: 'chatcmpl-cli',
@@ -2610,40 +2656,64 @@ async function handleOpenCodeCli(provider, body, model, req, res) {
   headers['x-router-transport'] = driver.mode === 'serve' ? 'opencode-serve' : 'opencode-cli';
   const streamHeaders = { ...headers, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' };
 
-  // The CLI honours HTTPS_PROXY (measured), so the exit pool still applies to it.
-  const env = {};
-  if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
-    const picked = proxies.pick(provider);
-    if (picked && picked.proxy) env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = `http://${picked.proxy.host}:${picked.proxy.port}`;
-  }
-
   const controller = new AbortController();
   res.on('close', () => { if (!res.writableEnded) controller.abort(); });
   const timeoutMs = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 300_000;
 
-  let result = await driver.run({
-    model: baseModel,
-    prompt,
-    timeoutMs,
-    env,
-    signal: controller.signal,
-    onDelta: wantsStream
-      ? (delta) => {
-        if (res.writableEnded) return;
-        if (!res.headersSent) res.writeHead(200, streamHeaders);
-        res.write(cliStreamChunk(baseModel, delta));
-      }
-      : null,
-  });
+  /**
+   * The ladder for this transport.
+   *
+   * Attempt 0 is whatever the provider prefers (the long-lived server when it is
+   * configured). If the genuine client reports its limit, the next attempts mint a
+   * *new identity* (a fresh HOME - a fresh installation, since the anonymous tier
+   * has no token to rotate) and hand it a *different exit* (the CLI honours
+   * HTTPS_PROXY), which is the closest thing to "a new client from a new address"
+   * that this tier can be given. Measured 2026-10-25: a fresh identity answered
+   * while the previous one reported the limit.
+   */
+  const pool = cliIdentityPool(provider);
+  const startIdentity = Number(state.cliIdentity && state.cliIdentity.next) || 0;
+  const attempts = [];
+  if (driver.mode === 'serve') attempts.push({ mode: 'serve', identity: null, rotateExit: false });
+  for (let i = 0; i < pool; i += 1) {
+    const identity = (startIdentity + i) % pool + 1;
+    attempts.push({ mode: 'spawn', identity, rotateExit: i > 0 || driver.mode !== 'serve' });
+  }
 
-  // The long-lived server is the fast path, but it is a separate service: if it is
-  // down or wedged, fall back to spawning the binary rather than failing the caller.
-  if (!result.ok && !result.limit && !result.auth && !result.text && driver.mode === 'serve') {
-    const spawned = new OpenCodeCliDriver({ binPath: driver.binPath, homeDir: driver.homeDir, args: driver.args, mode: 'spawn', log: (m) => console.warn(m) });
-    if (spawned.available()) {
-      console.warn(`[cli] serve transport failed (${result.error}); falling back to a per-request spawn`);
-      result = await spawned.run({ model: baseModel, prompt, timeoutMs, env, signal: controller.signal, onDelta: null });
+  let result = null;
+  let used = attempts[0];
+  let rotated = 0;
+  for (const attempt of attempts) {
+    // Each attempt gets its own exit when the pool is live: a new identity from the
+    // same address is only half of "a new client".
+    const env = {};
+    if (provider.proxy === 'rotate' && proxies && proxies.state.settings.enabled) {
+      const picked = attempt.rotateExit
+        ? proxies.rotate('a new identity for the free tier', provider.id)
+        : proxies.pick(provider);
+      const url = cliExitEnv(picked);
+      if (url) env.HTTPS_PROXY = env.HTTP_PROXY = env.ALL_PROXY = url;
     }
+    const attemptDriver = attempt.mode === 'serve' ? driver : cliSpawnDriver(provider, attempt.identity);
+    if (!attemptDriver.available()) continue;
+    if (attempt !== attempts[0]) rotated += 1;
+    result = await attemptDriver.run({ model: baseModel, prompt, timeoutMs, env, signal: controller.signal, onDelta: null });
+    used = attempt;
+    if (result.ok || result.auth) break;
+    if (!result.limit) break; // a real failure: do not burn identities on it
+    console.warn(`[cli] ${attempt.mode}${attempt.identity ? ` identity ${attempt.identity}` : ''} hit the free allowance after ${result.ms}ms - rotating identity and exit`);
+  }
+  if (rotated) {
+    state.cliIdentity = { next: ((startIdentity + rotated) % pool) };
+    persistState();
+  }
+  // Say which client actually answered: the transport, and the identity it used.
+  const transportName = used && used.mode === 'serve' ? 'opencode-serve' : 'opencode-cli';
+  headers['x-router-transport'] = transportName;
+  streamHeaders['x-router-transport'] = transportName;
+  if (used && used.identity) {
+    headers['x-router-identity'] = String(used.identity);
+    streamHeaders['x-router-identity'] = String(used.identity);
   }
 
   if (result.limit || result.auth) {

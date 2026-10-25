@@ -1844,6 +1844,12 @@ async function memOf() {
         streamed.status === 200 && streamed.text.includes('chat.completion.chunk') && streamed.text.trim().endsWith('data: [DONE]'),
         `${streamed.status} ${streamed.text.slice(-80)}`);
 
+      const rotated = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: '__ROTATE__ keep going' }] });
+      check('cli transport: a limit on one identity is answered by minting another (new HOME) and retrying',
+        rotated.status === 200 && rotated.text.includes('ROTATED OK')
+        && String(rotated.headers.get('x-router-identity') || '').length > 0,
+        `${rotated.status} identity=${rotated.headers.get('x-router-identity')} body=${rotated.text.slice(0, 140)}`);
+
       const limited = await cliChat({ model: 'opencode-cli/big-pickle', stream: false, messages: [{ role: 'user', content: '__LIMIT__ please' }] });
       const limitBody = JSON.parse(limited.text);
       const limitRa = Number(limited.headers.get('retry-after'));
