@@ -24,6 +24,22 @@ working dir `/opt/llm-router`, listening `0.0.0.0:8787`, config
 `/var/lib/llm-router/config.json`, state `/var/lib/llm-router/state.json`,
 admin key in `/etc/llm-router.env`.
 
+### 1.1 REMOVED FROM THE SERVER, 2026-10-29
+
+The operator had it deleted: `llm-router.service` + drop-in, `oc-window-open.timer`,
+`oc-reset-probe.timer`, `ctx-ladder.timer`, `/etc/cron.d/llm-router-sub`,
+`/opt/llm-router`, `/var/lib/llm-router`, `/root/ctx-test`, `/etc/llm-router.env`,
+`/usr/local/bin/oc-{window-open,reset-probe}.sh`, `/var/log/oc-free-reset.log`.
+Port 8787 is closed and no router process remains. Everything below §1.1 is therefore
+history, not a live description — keep it for the measurements, not for the topology.
+
+What survived on purpose, because it is the operator's client and not the router:
+`oc-serve.service` (loopback `:47999`), the `ocx` isolated client
+(`/opt/ocx-client.sh`, uid `ocx`, `ocx-net.service`), and a single-outbound exit
+`ocx-exit.service` (`/opt/ocx/xray.json`, `127.0.0.1:20801` → `51.77.217.70`) that
+replaced the router's 15-inbound xray pool. `oc-add-principal.sh` is kept as the
+sign-in reference.
+
 ## 2. Serving policy: opencode-free only
 
 The operator's rule: **only and only OpenCode Free.** The deployed config carries a
@@ -53,6 +69,21 @@ So: IP rotation, identity rotation and a new build buy nothing once the bucket i
 Re-verify any time with `bash .tools/live-final-matrix.sh` on the server (see
 `.tools/` for the SSH driver). `oc-reset-probe.timer` logs the recovery to
 `/var/log/oc-free-reset.log`.
+
+### 3.0 CORRECTION, 2026-10-26 — the bucket is global; only the clock resets it
+
+Measured 2026-10-25 23:30–23:35Z with the bucket spent, on six exits spanning four
+networks (OVH FR AS16276, 185.236.8.132 DE, DigiRDP AS204769, 213.202.208.199, and two
+`193.29.139.x`): **every one `429` with `retry-after` counting to the same
+`2026-10-26T00:00:00Z`.** The genuine client was run through the OVH exit as well and
+returned the same `AI_APICallError: Free usage limit reached`. So a spent day is spent
+for the anonymous principal *everywhere*, and no IP, exit, identity, build or reinstall
+buys a minute of it back. §3.1's "moves by IP" holds only while the day still has
+allowance.
+
+At the boundary the reset is total and immediate: 4/4 completions `rc=0` through an
+isolated client 35 s after `00:00:00Z`, and the router's own `opencode-cli` lane
+answered `200` in 5.4 s. Isolated client: `deploy/OCX-CLIENT.md`.
 
 ### 3.1 Two regimes — the rotation is not useless in the other one
 

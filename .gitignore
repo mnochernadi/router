@@ -27,3 +27,17 @@ Thumbs.db
 .vscode/
 .env
 .env.*
+
+# ocx-win lane: runtime state and the fetched binary
+.ocx-win/bin/
+.ocx-win/home/
+.ocx-win/data/
+.ocx-win/config/
+.ocx-win/cache/
+.ocx-win/proj/
+.ocx-win/subs/
+.ocx-win/xray.json
+.ocx-win/exits-ok.json
+.ocx-win/bad.json
+.ocx-win/pool.meta
+.ocx-win/*.log
